@@ -142,6 +142,44 @@ def end(report_state: "ReportState", exit_reason: str = "completed") -> None:
     )
 
 
+def viewer_opened(source: str, live: bool) -> None:
+    _send(
+        "viewer_opened",
+        {
+            **base_props(),
+            "source": source,
+            "live": live,
+        },
+    )
+
+
+def viewer_cta_clicked(cta: str, surface: str | None = None) -> None:
+    props = {
+        **base_props(),
+        "cta": cta[:64],
+    }
+    if surface:
+        props["surface"] = surface[:64]
+    _send("viewer_cta_clicked", props)
+
+
+_VIEWER_EMAIL_STEPS = frozenset(
+    {"email_submitted", "email_verified", "report_sent", "work_email_required"}
+)
+
+
+def viewer_email_event(step: str, purpose: str | None = None) -> None:
+    if step not in _VIEWER_EMAIL_STEPS:
+        return
+    _send(
+        f"viewer_{step}",
+        {
+            **base_props(),
+            **({"purpose": purpose} if purpose else {}),
+        },
+    )
+
+
 def error(error_type: str) -> None:
     props = {**base_props(), "error_type": error_type}
     _send("error", props)

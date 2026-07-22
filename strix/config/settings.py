@@ -76,6 +76,15 @@ class IntegrationSettings(BaseSettings):
     perplexity_api_key: str | None = Field(default=None, alias="PERPLEXITY_API_KEY")
 
 
+class ViewerSettings(BaseSettings):
+    model_config = _BASE_CONFIG
+
+    # Base URL of the Strix relay the local viewer proxies to for email
+    # verification and encrypted report delivery. The browser never talks to
+    # the relay directly; the local server is the only caller.
+    app_url: str = Field(default="https://app.strix.ai", alias="STRIX_APP_URL")
+
+
 class Settings(BaseSettings):
     model_config = _BASE_CONFIG
 
@@ -83,3 +92,4 @@ class Settings(BaseSettings):
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     integrations: IntegrationSettings = Field(default_factory=IntegrationSettings)
+    viewer: ViewerSettings = Field(default_factory=ViewerSettings)

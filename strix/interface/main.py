@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import shutil
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -724,7 +725,9 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
         args.scan_mode = persisted_scan_mode
 
 
-def display_completion_message(args: argparse.Namespace, results_path: Path) -> None:
+def display_completion_message(
+    args: argparse.Namespace, results_path: Path, web_url: str | None = None
+) -> None:
     console = Console()
     report_state = get_global_report_state()
 
@@ -762,6 +765,29 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
     results_text.append("  ")
     results_text.append(str(results_path), style="#60a5fa")
     panel_parts.extend(["\n", results_text])
+
+    if web_url:
+        web_text = Text()
+        web_text.append("\n")
+        web_text.append("View in web", style="dim")
+        web_text.append("  ")
+        # OSC-8 hyperlink: clickable in modern terminals, falls back to the URL.
+        web_text.append(web_url, style=f"#60a5fa link {web_url}")
+        panel_parts.extend(["\n", web_text])
+
+        reopen_text = Text()
+        reopen_text.append("\n")
+        reopen_text.append("Reopen", style="dim")
+        reopen_text.append("       ")
+        reopen_text.append(f"strix view {args.run_name}", style="#22c55e")
+        panel_parts.extend(["\n", reopen_text])
+    else:
+        view_text = Text()
+        view_text.append("\n")
+        view_text.append("View", style="dim")
+        view_text.append("         ")
+        view_text.append(f"strix view {args.run_name}", style="#22c55e")
+        panel_parts.extend(["\n", view_text])
 
     if not scan_completed:
         resume_text = Text()
@@ -849,6 +875,14 @@ def main() -> None:
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # `strix view [<run>]` is a viewer-only subcommand, dispatched before the
+    # scan argument parser (which requires a target) and before any scan setup.
+    if len(sys.argv) > 1 and sys.argv[1] == "view":
+        from strix.viewer.cli import run_view
+
+        run_view(sys.argv[2:])
+        return
 
     args = parse_arguments()
 
@@ -944,7 +978,40 @@ def main() -> None:
             scarf.end(report_state, exit_reason=exit_reason)
 
     results_path = run_dir_for(args.run_name)
-    display_completion_message(args, results_path)
+
+    # For an interactive run, host the local viewer so the completion panel can
+    # show a clickable "View in web" link. Skipped in non-interactive/CI runs
+    # (no TTY to serve and it would block the process).
+    viewer_httpd = None
+    web_url = None
+    if not args.non_interactive and sys.stdout.isatty():
+        from strix.viewer.server import authorized_url, bundle_is_built, serve
+
+        if bundle_is_built():
+            try:
+                viewer_httpd, base_url, token = serve(results_path, open_browser=False)
+                # The completion panel's "View in web" link must authorize the
+                # browser, so hand it the tokened URL rather than the bare host.
+                web_url = authorized_url(base_url, token)
+                posthog.viewer_opened(source="post_scan", live=False)
+            except Exception:
+                logger.debug("could not start local viewer", exc_info=True)
+                viewer_httpd, web_url = None, None
+
+    display_completion_message(args, results_path, web_url=web_url)
+
+    if viewer_httpd is not None:
+        console = Console()
+        console.print("[dim]Hosting the local viewer. Press Ctrl-C to stop.[/]")
+        console.print()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Viewer stopped.[/]")
+        finally:
+            viewer_httpd.shutdown()
+            viewer_httpd.server_close()
 
     if args.non_interactive:
         report_state = get_global_report_state()

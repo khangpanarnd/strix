@@ -205,8 +205,13 @@ RUN python3 -m venv /app/.venv && \
 COPY --chown=pentester:pentester strix/tools/proxy/caido_api.py /opt/strix-python/caido_api.py
 ENV PYTHONPATH=/opt/strix-python
 
-RUN echo 'export PATH="/home/pentester/go/bin:/home/pentester/.local/bin:/home/pentester/.npm-global/bin:$PATH"' >> /home/pentester/.bashrc && \
-    echo 'export PATH="/home/pentester/go/bin:/home/pentester/.local/bin:/home/pentester/.npm-global/bin:$PATH"' >> /home/pentester/.profile
+# Login shells (e.g. `bash -lc`) source /etc/profile, which on Debian/Kali
+# hard-resets PATH and drops the image's ENV PATH entries. Re-add the same
+# directories here — including /app/.venv/bin — so `python3`/`pip` resolve to
+# the venv (which ships requests, httpx, bs4, lxml, pyjwt, cryptography, and the
+# Caido SDK) instead of the externally-managed system interpreter.
+RUN echo 'export PATH="/home/pentester/go/bin:/home/pentester/.local/bin:/home/pentester/.npm-global/bin:/app/.venv/bin:$PATH"' >> /home/pentester/.bashrc && \
+    echo 'export PATH="/home/pentester/go/bin:/home/pentester/.local/bin:/home/pentester/.npm-global/bin:/app/.venv/bin:$PATH"' >> /home/pentester/.profile
 
 USER root
 COPY containers/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
