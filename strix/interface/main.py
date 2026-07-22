@@ -644,11 +644,15 @@ Examples:
             details = "; ".join(
                 f"{path} ({size / (1024 * 1024):.0f} MB)" for path, size in oversized
             )
-            parser.error(
-                f"Local target too large to stream into the sandbox: {details}. "
-                f"The limit is {max_local_copy_mb} MB "
-                "(set STRIX_MAX_LOCAL_COPY_MB to change it). Re-run with "
-                "--mount <path> to bind-mount the directory instead of copying it."
+            # Issue #725: do NOT refuse large local targets. They are
+            # bind-mounted read-only into the sandbox by default (applied at
+            # container-create time, no file-by-file copy), so a large tree no
+            # longer stalls the scan. Warn for visibility and proceed.
+            logger.warning(
+                "Large local target(s) detected: %s. Bind-mounting read-only "
+                "into the sandbox (no file-by-file copy); the scan starts "
+                "immediately. Set STRIX_MAX_LOCAL_COPY_MB to tune this check.",
+                details,
             )
 
     return args

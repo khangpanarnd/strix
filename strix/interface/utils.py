@@ -1225,11 +1225,16 @@ def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, 
         workspace_subdir = details.get("workspace_subdir")
 
         if target_info["type"] == "local_code" and "target_path" in details:
+            # Local directory targets bind-mount read-only by default (issue
+            # #725): the SDK LocalDir entry copies a tree into the sandbox
+            # file-by-file, which stalls for hours on large repos. A bind mount
+            # is applied at container-create time and is effectively instant.
+            # An explicit ``mount: False`` still forces the file-by-file copy.
             local_sources.append(
                 {
                     "source_path": details["target_path"],
                     "workspace_subdir": workspace_subdir,
-                    "mount": bool(details.get("mount", False)),
+                    "mount": bool(details.get("mount", True)),
                 }
             )
 
