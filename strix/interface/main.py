@@ -5,9 +5,9 @@ Strix Agent Interface
 
 import argparse
 import asyncio
+import os
 import shutil
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +33,13 @@ from strix.config.models import (
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.interface.cli import run_cli
 from strix.interface.tui import run_tui
+from strix.interface.update_check import (
+    is_binary_install,
+    notify_update,
+    prompt_update_if_available,
+    self_update,
+    start_background_check,
+)
 from strix.interface.utils import (
     assign_workspace_subdirs,
     build_final_stats_text,
@@ -449,6 +456,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Update strix to the latest version and exit. Self-updates the "
+        "standalone binary install; for pip/pipx/uv installs, prints the "
+        "matching upgrade command instead.",
+    )
+
+    parser.add_argument(
         "-t",
         "--target",
         type=str,
@@ -565,6 +580,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.update:
+        sys.exit(0 if self_update() else 1)
 
     if args.instruction and args.instruction_file:
         parser.error(
@@ -725,9 +743,7 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
         args.scan_mode = persisted_scan_mode
 
 
-def display_completion_message(
-    args: argparse.Namespace, results_path: Path, web_url: str | None = None
-) -> None:
+def display_completion_message(args: argparse.Namespace, results_path: Path) -> None:
     console = Console()
     report_state = get_global_report_state()
 
@@ -766,28 +782,12 @@ def display_completion_message(
     results_text.append(str(results_path), style="#60a5fa")
     panel_parts.extend(["\n", results_text])
 
-    if web_url:
-        web_text = Text()
-        web_text.append("\n")
-        web_text.append("View in web", style="dim")
-        web_text.append("  ")
-        # OSC-8 hyperlink: clickable in modern terminals, falls back to the URL.
-        web_text.append(web_url, style=f"#60a5fa link {web_url}")
-        panel_parts.extend(["\n", web_text])
-
-        reopen_text = Text()
-        reopen_text.append("\n")
-        reopen_text.append("Reopen", style="dim")
-        reopen_text.append("       ")
-        reopen_text.append(f"strix view {args.run_name}", style="#22c55e")
-        panel_parts.extend(["\n", reopen_text])
-    else:
-        view_text = Text()
-        view_text.append("\n")
-        view_text.append("View", style="dim")
-        view_text.append("         ")
-        view_text.append(f"strix view {args.run_name}", style="#22c55e")
-        panel_parts.extend(["\n", view_text])
+    view_text = Text()
+    view_text.append("\n")
+    view_text.append("View", style="dim")
+    view_text.append("         ")
+    view_text.append(f"strix view {args.run_name}", style="#22c55e")
+    panel_parts.extend(["\n", view_text])
 
     if not scan_completed:
         resume_text = Text()
@@ -818,6 +818,8 @@ def display_completion_message(
         "[#60a5fa]discord.gg/strix-ai[/]"
     )
     console.print()
+    if not args.non_interactive:
+        notify_update(console)
 
 
 def pull_docker_image() -> None:
@@ -888,6 +890,12 @@ def main() -> None:
 
     if args.config:
         apply_config_override(validate_config_file(args.config))
+
+    start_background_check()
+    if not args.non_interactive and prompt_update_if_available(Console()):
+        if is_binary_install() and sys.platform != "win32":
+            os.execv(sys.executable, sys.argv)  # noqa: S606  # nosec B606
+        sys.exit(0)
 
     check_docker_installed()
     pull_docker_image()
@@ -979,39 +987,7 @@ def main() -> None:
 
     results_path = run_dir_for(args.run_name)
 
-    # For an interactive run, host the local viewer so the completion panel can
-    # show a clickable "View in web" link. Skipped in non-interactive/CI runs
-    # (no TTY to serve and it would block the process).
-    viewer_httpd = None
-    web_url = None
-    if not args.non_interactive and sys.stdout.isatty():
-        from strix.viewer.server import authorized_url, bundle_is_built, serve
-
-        if bundle_is_built():
-            try:
-                viewer_httpd, base_url, token = serve(results_path, open_browser=False)
-                # The completion panel's "View in web" link must authorize the
-                # browser, so hand it the tokened URL rather than the bare host.
-                web_url = authorized_url(base_url, token)
-                posthog.viewer_opened(source="post_scan", live=False)
-            except Exception:
-                logger.debug("could not start local viewer", exc_info=True)
-                viewer_httpd, web_url = None, None
-
-    display_completion_message(args, results_path, web_url=web_url)
-
-    if viewer_httpd is not None:
-        console = Console()
-        console.print("[dim]Hosting the local viewer. Press Ctrl-C to stop.[/]")
-        console.print()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            console.print("\n[dim]Viewer stopped.[/]")
-        finally:
-            viewer_httpd.shutdown()
-            viewer_httpd.server_close()
+    display_completion_message(args, results_path)
 
     if args.non_interactive:
         report_state = get_global_report_state()
