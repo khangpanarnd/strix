@@ -47,7 +47,7 @@ class RuntimeSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
     image: str = Field(
-        default="ghcr.io/usestrix/strix-sandbox:1.0.0",
+        default="ghcr.io/usestrix/strix-sandbox:1.1.0",
         alias="STRIX_IMAGE",
     )
     backend: str = Field(default="docker", alias="STRIX_RUNTIME_BACKEND")
@@ -58,6 +58,10 @@ class RuntimeSettings(BaseSettings):
     max_local_copy_mb: int = Field(default=1024, alias="STRIX_MAX_LOCAL_COPY_MB")
     # Max screenshot/image tool outputs kept live per agent context (0 = none).
     max_context_images: int = Field(default=3, ge=0, alias="STRIX_MAX_CONTEXT_IMAGES")
+    # Emit a self-contained HTML findings report (report.html) on scan
+    # completion, alongside the markdown/CSV/JSON/SARIF outputs. Set to false
+    # (STRIX_HTML_REPORT=0) to disable.
+    html_report: bool = Field(default=True, alias="STRIX_HTML_REPORT")
 
 
 class TelemetrySettings(BaseSettings):

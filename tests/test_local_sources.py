@@ -106,17 +106,30 @@ def test_find_oversized_disabled_for_non_positive_limit(tmp_path: Path, disabled
     assert find_oversized_local_targets(targets, max_bytes=disabled) == []
 
 
-def test_collect_local_sources_propagates_mount_flag() -> None:
-    copied = _local_target("/copied")
-    copied["details"]["workspace_subdir"] = "copied"
+def test_collect_local_sources_defaults_local_code_to_mount() -> None:
+    # Issue #725: a local_code target with no explicit flag now bind-mounts by
+    # default (fast) rather than copying file-by-file.
+    default_target = _local_target("/default")
+    default_target["details"]["workspace_subdir"] = "default"
     mounted = _local_target("/mounted", mount=True)
     mounted["details"]["workspace_subdir"] = "mounted"
 
-    sources = collect_local_sources([copied, mounted])
+    sources = collect_local_sources([default_target, mounted])
 
     by_path = {s["source_path"]: s for s in sources}
-    assert by_path["/copied"]["mount"] is False
+    assert by_path["/default"]["mount"] is True
     assert by_path["/mounted"]["mount"] is True
+
+
+def test_collect_local_sources_respects_explicit_copy() -> None:
+    # An explicit ``mount: False`` preserves the file-by-file copy escape hatch.
+    copied = _local_target("/copied")
+    copied["details"]["workspace_subdir"] = "copied"
+    copied["details"]["mount"] = False
+
+    sources = collect_local_sources([copied])
+
+    assert sources[0]["mount"] is False
 
 
 def test_collect_local_sources_repository_is_never_mounted() -> None:
