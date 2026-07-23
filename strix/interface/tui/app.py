@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+import queue
 import signal
 import sys
 import threading
@@ -35,6 +36,7 @@ from strix.config import load_settings
 from strix.config.models import is_recommended_or_frontier_model
 from strix.core.hooks import BudgetExceededError
 from strix.core.runner import run_strix_scan
+from strix.interface.tui.event_pump import DEFAULT_MAX_DRAIN, drain_queue
 from strix.interface.tui.live_view import TuiLiveView
 from strix.interface.tui.messages import send_user_message_to_agent
 from strix.interface.tui.renderers import render_tool_widget
@@ -796,6 +798,10 @@ class StrixTUIApp(App):  # type: ignore[misc]
         self._displayed_events: list[str] = []
 
         self._scan_thread: threading.Thread | None = None
+        # Scan thread enqueues SDK events here (non-blocking); a UI-loop timer
+        # drains them in bounded batches so a high event rate during streaming
+        # cannot block the scan thread or starve UI input handling.
+        self._sdk_event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._viewer_httpd: Any = None
         self._viewer_url: str | None = None
         self._scan_loop: asyncio.AbstractEventLoop | None = None
@@ -966,6 +972,9 @@ class StrixTUIApp(App):  # type: ignore[misc]
         self._start_scan_thread()
 
         self.set_interval(0.5, self._update_ui)
+        # Fast, bounded drain of the SDK event queue keeps the UI responsive to
+        # input even under a high scan event rate.
+        self.set_interval(0.05, self._drain_sdk_events)
 
     def _update_ui(self) -> None:
         if self.show_splash:
@@ -1508,10 +1517,18 @@ class StrixTUIApp(App):  # type: ignore[misc]
         self._scan_thread.start()
 
     def _capture_sdk_event(self, agent_id: str, event: Any) -> None:
-        try:
-            self.call_from_thread(self._record_sdk_event, agent_id, event)
-        except RuntimeError:
-            self._record_sdk_event(agent_id, event)
+        # Non-blocking hand-off: enqueue and return immediately so the scan
+        # thread never blocks on the UI thread per event. The UI-loop timer
+        # (_drain_sdk_events) ingests batches in order. Replaces the previous
+        # per-event blocking call_from_thread that flooded the UI pump.
+        self._sdk_event_queue.put_nowait((agent_id, event))
+
+    def _drain_sdk_events(self) -> None:
+        drain_queue(
+            self._sdk_event_queue,
+            lambda item: self._record_sdk_event(item[0], item[1]),
+            max_items=DEFAULT_MAX_DRAIN,
+        )
 
     def _record_sdk_event(self, agent_id: str, event: Any) -> None:
         self.live_view.ingest_sdk_event(agent_id, event)
@@ -1688,6 +1705,10 @@ class StrixTUIApp(App):  # type: ignore[misc]
 
     def _send_user_message(self, message: str) -> None:
         if not self.selected_agent_id:
+            self.notify(
+                "Select an agent in the tree first, then send your message.",
+                severity="warning",
+            )
             return
 
         logger.info(
