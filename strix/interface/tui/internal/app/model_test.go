@@ -103,6 +103,21 @@ func bootstrapEnvelope(t *testing.T, collection string, revision int, items ...a
 	return protocol.Envelope{Version: protocol.Version, Type: "collection_bootstrap", Payload: rawJSON(t, payload)}
 }
 
+func TestStateSnapshotClearsNilError(t *testing.T) {
+	model := New(nil)
+	errText := "provider rejected"
+	model.handleEnvelope(stateEnvelope(t, 1, protocol.Snapshot{ScanState: "failed", Error: &errText}))
+	if model.errorText != errText {
+		t.Fatalf("error was not installed: %q", model.errorText)
+	}
+
+	model.handleEnvelope(stateEnvelope(t, 2, protocol.Snapshot{ScanState: "running"}))
+
+	if model.errorText != "" {
+		t.Fatalf("nil snapshot error did not clear errorText: %q", model.errorText)
+	}
+}
+
 func TestBackendDisconnectBecomesFatalUnlessUserIsQuitting(t *testing.T) {
 	model := New(nil)
 	updated, cmd := model.Update(wireErrMsg{err: fmt.Errorf("socket closed")})
@@ -160,6 +175,27 @@ func TestCollectionBootstrapChunksAndVersionedDelta(t *testing.T) {
 	}
 }
 
+func TestAgentCollectionDeltaClearsErrorMessage(t *testing.T) {
+	model := New(nil)
+	failed := protocol.Agent{ID: "root", Name: "Strix", Status: "failed", ErrorMessage: "provider rejected"}
+	model.handleEnvelope(bootstrapEnvelope(t, "agents", 1, failed))
+
+	resumed := protocol.Agent{ID: "root", Name: "Strix", Status: "waiting"}
+	delta := protocol.CollectionDelta{
+		Collection: "agents", BaseRevision: 1, Revision: 2, Cursor: 0, NextCursor: 1, Done: true,
+		Operations: []protocol.CollectionOperation{{Op: "upsert", Item: rawJSON(t, resumed)}},
+	}
+	model.handleEnvelope(protocol.Envelope{Version: protocol.Version, Type: "collection_delta", Payload: rawJSON(t, delta)})
+
+	if len(model.snapshot.Agents) != 1 {
+		t.Fatalf("agents were not retained: %#v", model.snapshot.Agents)
+	}
+	agent := model.snapshot.Agents[0]
+	if agent.Status != "waiting" || agent.ErrorMessage != "" {
+		t.Fatalf("agent error was not cleared: %#v", agent)
+	}
+}
+
 func TestCollectionMismatchRequestsOneResync(t *testing.T) {
 	connection := &recordingConn{}
 	model := New(newClient(connection))
@@ -181,6 +217,42 @@ func TestCollectionMismatchRequestsOneResync(t *testing.T) {
 	}
 	if model.collectionRevisions["events"] != 4 {
 		t.Fatal("mismatched delta mutated collection revision")
+	}
+}
+
+func TestFailedResyncResultBeforeSentMsgRearmsResync(t *testing.T) {
+	connection := &recordingConn{}
+	model := New(newClient(connection))
+	model.collectionRevisions["events"] = 4
+	bad := protocol.CollectionDelta{
+		Collection: "events", BaseRevision: 2, Revision: 3, Cursor: 0, NextCursor: 0, Done: true,
+	}
+
+	cmd := model.handleEnvelope(protocol.Envelope{Version: protocol.Version, Type: "collection_delta", Payload: rawJSON(t, bad)})
+	if cmd == nil {
+		t.Fatal("revision mismatch did not request a resync")
+	}
+	sent, ok := cmd().(sentMsg)
+	if !ok || sent.err != nil || sent.requestID == "" {
+		t.Fatalf("resync send = %#v", sent)
+	}
+
+	failed := protocol.CommandResult{
+		OK:      false,
+		Command: "collection.resync",
+		Error:   &protocol.CommandError{Code: "command_failed", Message: "resync failed"},
+	}
+	model.handleEnvelope(protocol.Envelope{
+		Version: protocol.Version, Type: "command_result", RequestID: sent.requestID, Payload: rawJSON(t, failed),
+	})
+	updated, _ := model.Update(sent)
+	model = updated.(Model)
+
+	if model.resyncRequested["events"] {
+		t.Fatal("failed resync result left resync suppressed")
+	}
+	if retry := model.handleEnvelope(protocol.Envelope{Version: protocol.Version, Type: "collection_delta", Payload: rawJSON(t, bad)}); retry == nil {
+		t.Fatal("resync was not rearmed after failure")
 	}
 }
 
@@ -527,7 +599,8 @@ func TestVulnerabilityCopySupportsKeyboardAndMouse(t *testing.T) {
 	}
 
 	model := newModel()
-	updated, _ := model.updateModal(tea.KeyMsg{Type: tea.KeyLeft})
+	// Tab moves between the buttons; the arrows step between reports.
+	updated, _ := model.updateModal(tea.KeyMsg{Type: tea.KeyTab})
 	model = updated.(Model)
 	updated, cmd := model.updateModal(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
@@ -560,8 +633,8 @@ func TestVulnerabilityCopySupportsKeyboardAndMouse(t *testing.T) {
 		X: copyX, Y: copyY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress,
 	})
 	model = updated.(Model)
-	if cmd == nil || model.modalChoice != 0 {
-		t.Fatalf("mouse Copy was not activated: choice=%d cmd=%v", model.modalChoice, cmd)
+	if cmd == nil || model.reportFocus != reportCopy {
+		t.Fatalf("mouse Copy was not activated: focus=%q cmd=%v", model.reportFocus, cmd)
 	}
 	cmd()
 	if len(copied) != 2 {
@@ -598,7 +671,7 @@ func TestVulnerabilityListSupportsWheelAndPageNavigation(t *testing.T) {
 		})
 	}
 	_, _, chatWidth, _ := model.layout()
-	_, _, agentHeight := model.sidebarHeights()
+	_, _, _, agentHeight := model.sidebarHeights()
 	pageItems := model.vulnerabilityPageItems()
 
 	updated, _ := model.updateMouse(tea.MouseMsg{
@@ -817,11 +890,19 @@ func TestRunningViewerShowsCompleteWrappedURL(t *testing.T) {
 	if want := strings.Count(model.viewerView(model.viewerContentWidth()), "\n") + 3; model.viewerHeight() != want {
 		t.Fatalf("viewer height = %d, want %d", model.viewerHeight(), want)
 	}
+
+	raw := model.viewerView(18)
+	if got, want := strings.Count(raw, ansi.SetHyperlink(url)), len(urlLines); got != want {
+		t.Fatalf("every wrapped line should link to the full URL: got %d links for %d lines in %q", got, want, raw)
+	}
+	if got := strings.Count(raw, ansi.ResetHyperlink()); got != len(urlLines) {
+		t.Fatalf("hyperlinks not closed: %d resets for %d lines", got, len(urlLines))
+	}
 }
 
 func TestVerticalScrollbarThumbTracksScrollOffset(t *testing.T) {
-	top := strings.Split(ansi.Strip(verticalScrollbar(6, 24, 6, 0, thumbAgents)), "\n")
-	bottom := strings.Split(ansi.Strip(verticalScrollbar(6, 24, 6, 18, thumbAgents)), "\n")
+	top := strings.Split(ansi.Strip(verticalScrollbar(6, 24, 6, 0, thumbResting)), "\n")
+	bottom := strings.Split(ansi.Strip(verticalScrollbar(6, 24, 6, 18, thumbResting)), "\n")
 
 	// The track is blank, so only the thumb is drawn.
 	if top[0] != "█" || top[5] != " " {
@@ -830,10 +911,10 @@ func TestVerticalScrollbarThumbTracksScrollOffset(t *testing.T) {
 	if bottom[0] != " " || bottom[5] != "█" {
 		t.Fatalf("bottom scrollbar is incorrect: %#v", bottom)
 	}
-	if full := verticalScrollbar(4, 4, 4, 0, thumbAgents); full != "" {
+	if full := verticalScrollbar(4, 4, 4, 0, thumbResting); full != "" {
 		t.Fatalf("non-overflowing scrollbar should be hidden: %q", full)
 	}
-	withoutBar := ansi.Strip(withVerticalScrollbar("content", 12, 2, 2, 2, 0, thumbAgents))
+	withoutBar := ansi.Strip(withVerticalScrollbar("content", 12, 2, 2, 2, 0, thumbResting))
 	if strings.ContainsAny(withoutBar, "█") {
 		t.Fatalf("non-overflowing panel rendered a scrollbar: %q", withoutBar)
 	}
@@ -841,7 +922,7 @@ func TestVerticalScrollbarThumbTracksScrollOffset(t *testing.T) {
 
 // The bar takes exactly one column, so a scrolling panel keeps the rest.
 func TestVerticalScrollbarOccupiesOneColumn(t *testing.T) {
-	rows := strings.Split(withVerticalScrollbar("content", 12, 2, 24, 2, 0, thumbTrace), "\n")
+	rows := strings.Split(withVerticalScrollbar("content", 12, 2, 24, 2, 0, thumbResting), "\n")
 	for _, row := range rows {
 		if width := ansi.StringWidth(row); width != 12 {
 			t.Fatalf("scrolling panel row width = %d, want 12", width)
@@ -861,6 +942,31 @@ func TestPanelPaddingResetsLeakingLineBackground(t *testing.T) {
 	}
 	if width := ansi.StringWidth(body); width != 12 {
 		t.Fatalf("fixed panel body width = %d, want 12", width)
+	}
+}
+
+func TestFillBackgroundRestoresBaseForegroundAfterReset(t *testing.T) {
+	const textFG = "\x1b[38;2;212;212;212m"
+	view := "\x1b[38;2;167;139;250m◈ \x1b[0m\x1b[2mspawning\x1b[0m"
+	filled := fillBackground(view)
+	baseStyle := blackBG + textFG
+
+	if !strings.HasPrefix(filled, baseStyle) {
+		t.Fatalf("frame does not set its base colors: %q", filled)
+	}
+	if got, want := strings.Count(filled, "\x1b[0m"+baseStyle), 2; got != want {
+		t.Fatalf("base colors restored after %d resets, want %d: %q", got, want, filled)
+	}
+}
+
+func TestFillBackgroundRestoresBaseColorsAfterBareReset(t *testing.T) {
+	view := "\x1b[38;2;115;115;115mModel\x1b[m   padding\x1b[0m"
+	filled := fillBackground(view)
+	if !strings.Contains(filled, "\x1b[m"+baseFrameColors+"   padding") {
+		t.Fatalf("base colors not restored after bare reset: %q", filled)
+	}
+	if strings.Contains(filled, "\x1b[m   ") {
+		t.Fatalf("cells after a bare reset show the terminal background: %q", filled)
 	}
 }
 
@@ -908,7 +1014,7 @@ func TestMainScrollbarsSupportClickAndDrag(t *testing.T) {
 	model.viewport.SetContent(model.viewportContent)
 	showSidebar, _, chatWidth, chatHeight := model.layout()
 	viewerHeight := model.viewerHeight()
-	_, vulnHeight, agentHeight := model.sidebarHeights()
+	_, vulnHeight, _, agentHeight := model.sidebarHeights()
 	if !showSidebar {
 		t.Fatal("test requires sidebar")
 	}
@@ -949,6 +1055,61 @@ func TestMainScrollbarsSupportClickAndDrag(t *testing.T) {
 	model = updated.(Model)
 	if model.draggingScrollbar != scrollbarFindings || model.vulnOffset == 0 {
 		t.Fatalf("findings scrollbar click failed: drag=%v offset=%d", model.draggingScrollbar, model.vulnOffset)
+	}
+}
+
+func TestMcpRosterScrollsByKeyWheelAndScrollbar(t *testing.T) {
+	model := New(nil)
+	model.width, model.height = 150, 35
+	model.ready = true
+	conns := make([]protocol.Connection, 0, 12)
+	for i := 0; i < 12; i++ {
+		conns = append(conns, protocol.Connection{Name: fmt.Sprintf("conn-%02d", i), ToolCount: 2})
+	}
+	model.snapshot.Connections = conns
+
+	showSidebar, _, chatWidth, _ := model.layout()
+	if !showSidebar {
+		t.Fatal("test requires sidebar")
+	}
+	viewerHeight := model.viewerHeight()
+	_, vulnHeight, mcpHeight, agentHeight := model.sidebarHeights()
+	mcpTop := viewerHeight + agentHeight + vulnHeight
+	bottom := model.clampMcpOffset(1 << 30)
+	if bottom == 0 {
+		t.Fatalf("a roster of %d should overflow the panel", len(conns))
+	}
+
+	// Wheel over the panel focuses it and advances the window.
+	updated, _ := model.updateMouse(tea.MouseMsg{
+		X: chatWidth + 2, Y: mcpTop + 1, Button: tea.MouseButtonWheelDown,
+	})
+	model = updated.(Model)
+	if model.focus != focusMcp || model.mcpOffset != 3 {
+		t.Fatalf("wheel scroll did not focus and advance roster: focus=%v offset=%d", model.focus, model.mcpOffset)
+	}
+
+	// Page down pins to the bottom; up steps back one.
+	updated, _ = model.updateMain(tea.KeyMsg{Type: tea.KeyPgDown})
+	model = updated.(Model)
+	if model.mcpOffset != bottom {
+		t.Fatalf("page down did not reach the roster bottom: offset=%d want=%d", model.mcpOffset, bottom)
+	}
+	updated, _ = model.updateMain(tea.KeyMsg{Type: tea.KeyUp})
+	model = updated.(Model)
+	if model.mcpOffset != bottom-1 {
+		t.Fatalf("up did not step the roster back one: offset=%d want=%d", model.mcpOffset, bottom-1)
+	}
+
+	// Clicking the scrollbar thumb captures it and moves the window.
+	model.mcpOffset = 0
+	updated, _ = model.updateMouse(tea.MouseMsg{
+		X: model.width - 3, Y: mcpTop + mcpHeight - 2,
+		Button: tea.MouseButtonLeft, Action: tea.MouseActionPress,
+	})
+	model = updated.(Model)
+	if model.draggingScrollbar != scrollbarMcp || model.mcpOffset == 0 {
+		t.Fatalf("mcp scrollbar click failed: drag=%v offset=%d", model.draggingScrollbar, model.mcpOffset)
 	}
 }
 
@@ -1284,5 +1445,33 @@ func TestNarrowTerminalKeepsTheFrameIntact(t *testing.T) {
 				t.Fatalf("at width %d row %d is %d columns", width, i, got)
 			}
 		}
+	}
+}
+
+func TestCtrlZSuspendsFromEveryScreen(t *testing.T) {
+	for name, prepare := range map[string]func(*Model){
+		"splash": func(m *Model) { m.showSplash = true },
+		"modal":  func(m *Model) { m.showSplash = false; m.openModal(modalHelp) },
+		"main":   func(m *Model) { m.showSplash = false },
+	} {
+		model := New(nil)
+		prepare(&model)
+		_, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+		if cmd == nil {
+			t.Fatalf("%s: ctrl+z returned no command", name)
+		}
+		if _, ok := cmd().(tea.SuspendMsg); !ok {
+			t.Fatalf("%s: ctrl+z did not suspend", name)
+		}
+	}
+}
+
+func TestResumeReenablesMouse(t *testing.T) {
+	_, cmd := New(nil).Update(tea.ResumeMsg{})
+	if cmd == nil {
+		t.Fatal("resume returned no command")
+	}
+	if msg := cmd(); msg != tea.EnableMouseCellMotion() {
+		t.Fatalf("resume did not re-enable mouse tracking: %#v", msg)
 	}
 }

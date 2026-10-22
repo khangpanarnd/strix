@@ -73,6 +73,7 @@ const (
 	focusChat
 	focusAgents
 	focusVulnerabilities
+	focusMcp
 )
 
 type scrollbarTarget int
@@ -82,12 +83,14 @@ const (
 	scrollbarTrace
 	scrollbarAgents
 	scrollbarFindings
+	scrollbarMcp
 )
 
 type Model struct {
 	client                 *Client
 	width, height          int
 	snapshot               protocol.Snapshot
+	windowTitle            string
 	input                  textarea.Model
 	viewport               viewport.Model
 	viewportContent        string
@@ -98,6 +101,9 @@ type Model struct {
 	filtered               []string
 	cursor                 int
 	collapsedAgents        map[string]bool
+	collapsedPanels        map[sidebarPanel]bool
+	zoomedPanel            sidebarPanel
+	sidebarHidden          bool
 	expandedEvents         map[string]bool
 	blockCache             map[string]renderedBlock
 	eventSpans             []eventSpan
@@ -109,7 +115,9 @@ type Model struct {
 	selectedVuln           int
 	agentOffset            int
 	vulnOffset             int
+	mcpOffset              int
 	modalChoice            int
+	reportFocus            string
 	ready                  bool
 	quitting               bool
 	showSplash             bool
@@ -157,12 +165,16 @@ const (
 	treeCursorBg = lipgloss.Color("#0178d4")
 )
 
-// Scrollbar thumbs. Each panel keeps its own, and the track stays blank so a
-// scrollable panel does not gain a visible rule down its edge.
+// Scrollbar thumbs. The track stays blank so a scrollable panel does not gain a
+// visible rule down its edge, and the thumb brightens while it is dragged, which
+// is the feedback Textual gave through scrollbar-color-active.
+//
+// One resting color for every panel, rather than the three the stylesheet named.
+// The chat pane's was #1a1a1a on black, which is invisible - the bar could not be
+// found, let alone grabbed (#1005).
 const (
-	thumbTrace    = lipgloss.Color("#1a1a1a")
-	thumbAgents   = lipgloss.Color("#404040")
-	thumbFindings = lipgloss.Color("#333333")
+	thumbResting = lipgloss.Color("#3f3f46")
+	thumbActive  = lipgloss.Color("#9ca3af")
 )
 
 // Composer placeholders. The launch screen falls back to the short prompt when
@@ -270,7 +282,7 @@ func New(client *Client) Model {
 	input.Focus()
 	return Model{
 		client: client, input: input, viewport: viewport.New(80, 20), vulnViewport: viewport.New(80, 20),
-		collapsedAgents: map[string]bool{}, expandedEvents: map[string]bool{}, blockCache: map[string]renderedBlock{}, showSplash: true, splashStarted: time.Now(), followOutput: true,
+		collapsedAgents: map[string]bool{}, collapsedPanels: map[sidebarPanel]bool{}, zoomedPanel: panelNone, expandedEvents: map[string]bool{}, blockCache: map[string]renderedBlock{}, showSplash: true, splashStarted: time.Now(), followOutput: true,
 		collectionRevisions: map[string]int{}, collectionAssemblies: map[string]*collectionAssembly{}, resyncRequested: map[string]bool{}, resyncRequests: map[string]string{},
 		seenMessages: map[string]bool{},
 	}
@@ -351,7 +363,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resyncRequested[msg.collection] = false
 			}
 		} else if msg.command == "collection.resync" && msg.requestID != "" && msg.collection != "" {
-			m.resyncRequests[msg.requestID] = msg.collection
+			if m.resyncRequested[msg.collection] {
+				m.resyncRequests[msg.requestID] = msg.collection
+			}
 		}
 	case selectionCopiedMsg:
 		text := "Copied to clipboard"
@@ -374,7 +388,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.vulnerabilityCopyError = msg.err.Error()
 		}
 		return m, nil
+	case tea.ResumeMsg:
+		// Suspend turns mouse tracking off with the rest of the terminal state,
+		// but the restore brings back only the alt screen, so turn it back on.
+		return m, tea.EnableMouseCellMotion
 	case tea.KeyMsg:
+		// Raw mode clears ISIG, so ctrl+z arrives as a key instead of SIGTSTP.
+		// Suspend on every screen, the way a shell job would.
+		if msg.Type == tea.KeyCtrlZ {
+			return m, tea.Suspend
+		}
 		if m.showSplash {
 			switch msg.String() {
 			case "ctrl+c", "ctrl+q", "q", "esc":

@@ -51,7 +51,7 @@ Prototype pollution corrupts shared object prototypes (`Object.prototype`, `Arra
 **Common Sinks**
 - `lodash.merge`, `lodash.defaultsDeep`, `deep-extend`, `merge-options`
 - Express/query parsers accepting nested objects
-- YAML `load()` (not `safeLoad`) with prototype keys
+- YAML merge-key handling with prototype keys: identify the js-yaml version/schema and check applicable upstream advisories. Test whether `<<` merges alter the parsed result's prototype, then trace inherited values into a sensitive consumer; global `Object.prototype` modification is not required. Verify the installed API rather than assuming `load` versus `safeLoad` determines safety ([merge advisory](https://github.com/nodeca/js-yaml/security/advisories/GHSA-mh29-5h37-fv8m)).
 - JSON.parse → merge into existing object without null prototype
 
 **RCE Gadget Chains (Node.js)**
@@ -80,7 +80,7 @@ Gadget availability depends on package versions — enumerate `node_modules` in 
 1. **Identify merge points** — Search for extend/merge/defaults/deep copy on user-controlled objects
 2. **Baseline probe** — Inject benign pollution marker:
    ```json
-   {"__proto__": {"strixPolluted": "yes"}}
+   {"__proto__": {"pollutionCanary": "yes"}}
    ```
    Verify via response behavior, error messages, or follow-up request reading shared state
 3. **Shape variants** — Test `__proto__`, `constructor.prototype`, nested bracket notation
@@ -121,7 +121,7 @@ Gadget availability depends on package versions — enumerate `node_modules` in 
 
 ## Pro Tips
 
-1. Always verify pollution with a unique canary key (`strixPolluted_<random>`) before attempting RCE gadgets
+1. Always verify pollution with a unique canary key (`pollutionCanary_<random>`) before attempting RCE gadgets
 2. In white-box scans, grep for `merge`, `extend`, `defaultsDeep`, `assign` with user input
 3. Check both request parsing and response template config merges (second-order)
 4. Node gadget chains are version-specific — confirm package version before claiming RCE

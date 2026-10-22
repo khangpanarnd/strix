@@ -6,9 +6,28 @@ import logging
 from typing import Any
 
 from agents.usage import Usage, deserialize_usage, serialize_usage
+from pydantic import BaseModel, TypeAdapter, ValidationError
+
+from strix.report.pricing import resolve_litellm_model
 
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderUsage(BaseModel):
+    """Running totals for one upstream provider OpenRouter routed calls to."""
+
+    requests: int = 0
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    cost: float = 0.0
+    # Calls that didn't find the agent's whole previous prompt cached, and the
+    # previous-prompt tokens they had to pay for again.
+    cache_misses: int = 0
+    missed_tokens: int = 0
+
+
+_PROVIDER_USAGE = TypeAdapter(dict[str, ProviderUsage])
 
 
 class LLMUsageLedger:
@@ -18,7 +37,13 @@ class LLMUsageLedger:
         self._total_usage = Usage()
         self._agent_usage: dict[str, Usage] = {}
         self._agent_metadata: dict[str, dict[str, str]] = {}
-        self._total_cost = 0.0
+        self._observed_cost = 0.0
+        self._estimated_cost = 0.0
+        self._has_observed_cost = False
+        # Keyed by upstream provider name, e.g. "Z.AI" or "DeepInfra".
+        self._providers: dict[str, ProviderUsage] = {}
+        # Each agent's last prompt size, which its next call should find cached.
+        self._last_input_tokens: dict[str, int] = {}
         # When True, tokens are still tracked but cost stays $0 — the run is on a
         # model subscription, so there is no metered per-token charge to report.
         self.zero_cost = False
@@ -44,10 +69,10 @@ class LLMUsageLedger:
         if model:
             metadata["model"] = model
 
-        if not self.zero_cost and not _is_litellm_routed(model):
+        if not self.zero_cost:
             estimated = _estimate_litellm_cost(usage, model)
             if estimated:
-                self._total_cost += estimated
+                self._estimated_cost += estimated
 
         return True
 
@@ -55,15 +80,46 @@ class LLMUsageLedger:
         if self.zero_cost:
             return
         if isinstance(cost, int | float) and cost > 0:
-            self._total_cost += float(cost)
+            self._observed_cost += float(cost)
+            self._has_observed_cost = True
+
+    def record_provider(
+        self,
+        provider: str,
+        *,
+        agent_id: str | None,
+        input_tokens: int,
+        cached_tokens: int,
+        cost: float,
+        cache_block_tokens: int,
+    ) -> None:
+        tally = self._providers.setdefault(provider, ProviderUsage())
+        tally.requests += 1
+        tally.input_tokens += input_tokens
+        tally.cached_tokens += cached_tokens
+        if agent_id:
+            previous = self._last_input_tokens.get(agent_id, 0)
+            # The previous prompt is a prefix of this one, so all of it but a
+            # partial last block should read back cached. A shrinking prompt means
+            # compaction rewrote it, so a miss is expected.
+            missed = previous - cached_tokens
+            if input_tokens >= previous and missed >= cache_block_tokens:
+                tally.cache_misses += 1
+                tally.missed_tokens += missed
+            self._last_input_tokens[agent_id] = input_tokens
+        if not self.zero_cost:
+            tally.cost = _round_cost(tally.cost + cost)
 
     @property
     def total_cost(self) -> float:
-        return _round_cost(self._total_cost)
+        if self.zero_cost:
+            return 0.0
+        return _round_cost(self._observed_cost if self._has_observed_cost else self._estimated_cost)
 
     def to_record(self) -> dict[str, Any]:
         record = serialize_usage(self._total_usage)
-        record["cost"] = _round_cost(self._total_cost)
+        record["cost"] = self.total_cost
+        record["providers"] = {name: tally.model_dump() for name, tally in self._providers.items()}
         record["agents"] = []
 
         agent_tokens = {aid: _resolve_total_tokens(u) for aid, u in self._agent_usage.items()}
@@ -72,7 +128,7 @@ class LLMUsageLedger:
             usage = self._agent_usage[agent_id]
             metadata = self._agent_metadata.get(agent_id, {})
             agent_cost = (
-                self._total_cost * (agent_tokens[agent_id] / total_tokens) if total_tokens else 0.0
+                self.total_cost * (agent_tokens[agent_id] / total_tokens) if total_tokens else 0.0
             )
 
             agent_record = serialize_usage(usage)
@@ -92,10 +148,18 @@ class LLMUsageLedger:
         self._total_usage = Usage()
         self._agent_usage.clear()
         self._agent_metadata.clear()
-        self._total_cost = 0.0
+        self._observed_cost = 0.0
+        self._estimated_cost = 0.0
+        self._has_observed_cost = False
+        self._providers = {}
 
         if not isinstance(raw_usage, dict):
             return
+
+        try:
+            self._providers = _PROVIDER_USAGE.validate_python(raw_usage.get("providers") or {})
+        except ValidationError:
+            logger.exception("Failed to hydrate llm_usage providers from run.json")
 
         try:
             self._total_usage = deserialize_usage(raw_usage)
@@ -103,7 +167,9 @@ class LLMUsageLedger:
             logger.exception("Failed to hydrate aggregate llm_usage from run.json")
             self._total_usage = Usage()
 
-        self._total_cost = _float_or_zero(raw_usage.get("cost"))
+        persisted_cost = _float_or_zero(raw_usage.get("cost"))
+        self._observed_cost = persisted_cost
+        self._estimated_cost = persisted_cost
 
         for raw_agent in raw_usage.get("agents") or []:
             if not isinstance(raw_agent, dict):
@@ -134,15 +200,6 @@ def _resolve_total_tokens(usage: Usage) -> int:
     prompt = _int_or_zero(getattr(usage, "input_tokens", 0))
     completion = _int_or_zero(getattr(usage, "output_tokens", 0))
     return prompt + completion
-
-
-def _is_litellm_routed(model: str | None) -> bool:
-    if not model:
-        return False
-    name = model.strip().lower()
-    if "/" not in name:
-        return False
-    return not name.startswith("openai/")
 
 
 def _usage_has_activity(usage: Usage) -> bool:
@@ -201,24 +258,23 @@ def _estimate_litellm_entry_cost(entry: Any, model: str) -> float | None:
 
     candidates = [model]
     if "/" in model:
-        candidates.append(model.split("/", 1)[-1])
+        candidates.append(model.rsplit("/", 1)[-1])
 
-    cost: Any = None
     for candidate in candidates:
+        resolved = resolve_litellm_model(candidate)
+        if not resolved:
+            continue
         try:
             cost = completion_cost(
-                completion_response={"model": candidate, "usage": usage_payload},
-                model=model,
+                completion_response={"model": resolved, "usage": usage_payload},
+                model=resolved,
             )
-            break
         except Exception:  # nosec B112  # noqa: BLE001, S112
             continue
-
-    if cost is None:
-        logger.debug("LiteLLM cost estimate unavailable for model %s", model)
-        return None
-
-    return cost if isinstance(cost, int | float) and cost >= 0 else None
+        if cost > 0:
+            return float(cost)
+    logger.debug("LiteLLM cost estimate unavailable for model %s", model)
+    return None
 
 
 def _litellm_model_name(model: str | None) -> str | None:
