@@ -137,8 +137,9 @@ class _ViewerState:
         # exchanged for a session cookie only when presented on the initial page
         # load. It is the request-level authorization the review asked for:
         # reachability of the port (e.g. when bound with ``--host``) is not
-        # enough to steer a live scan, trigger a report, or browse history --
-        # the token is never handed to a caller who merely reaches ``/``.
+        # enough to read run data, steer a live scan, trigger a report, or
+        # browse history -- the token is never handed to a caller who merely
+        # reaches ``/``.
         self.session_token = secrets.token_urlsafe(32)
         # Finalized in ``serve()`` once the port is known (the server binds
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
@@ -257,6 +258,13 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/auth/status":
                 self._handle_auth_status()
+                return
+
+            # All remaining GET endpoints expose run metadata or scan output.
+            # Require the capability even for the run used to launch the viewer;
+            # reachability of an exposed --host port must not grant data access.
+            if not self._has_session():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
 
             run_values = query.get("run")
@@ -389,7 +397,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except auth.RelayError as exc:
                 self._send_relay_error(exc)
                 return
-            # The password is returned only to the local (127.0.0.1) browser.
+            # The password is returned only to a session-authorized browser.
             self._send_json(
                 HTTPStatus.OK,
                 {"ok": True, "password": password, "filename": filename},

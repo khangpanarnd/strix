@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
+import io
 import logging
 import os
 import sys
+import tarfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,9 +20,15 @@ from agents.sandbox.manifest import Environment, Manifest
 from strix.config import load_settings
 from strix.runtime.backends import backend_supports_bind_mounts, get_backend
 from strix.runtime.caido_bootstrap import bootstrap_caido
+from strix.runtime.caido_handle import CaidoBootstrapHandle
+from strix.runtime.deferred_session import DeferredSandboxClient, DeferredSandboxSession
 
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+    from agents.sandbox.session import BaseSandboxSession
+
     from strix.runtime.status import StatusSink
 
 
@@ -33,6 +45,13 @@ _SESSION_CACHE: dict[str, dict[str, Any]] = {}
 _WORKSPACE_ROOT = "/workspace"
 
 _PROTECTED_METADATA_NAMES = (".git", ".agents", ".codex")
+
+# Extra files travel as one tar archive: a single upload plus one extraction
+# inside the sandbox, instead of several round trips per file.
+_EXTRA_FILE_ARCHIVE_REL = ".strix-extra-files.tar"
+_EXTRA_FILE_ARCHIVE = f"{_WORKSPACE_ROOT}/{_EXTRA_FILE_ARCHIVE_REL}"
+_EXTRA_FILE_EXTRACT_TIMEOUT_S = 120
+_EXTRA_FILE_MODE = 0o644
 
 
 def _host_identity_env() -> dict[str, str]:
@@ -56,8 +75,9 @@ def build_bind_mounts(local_sources: list[dict[str, Any]]) -> list[dict[str, Any
             continue
         resolved = Path(host_path).expanduser().resolve()
         target = f"{_WORKSPACE_ROOT}/{ws_subdir}"
-        bind_mounts.append({"source": str(resolved), "target": target, "read_only": False})
-        if src.get("protect_metadata"):
+        read_only = bool(src.get("read_only"))
+        bind_mounts.append({"source": str(resolved), "target": target, "read_only": read_only})
+        if src.get("protect_metadata") and not read_only:
             bind_mounts.extend(_metadata_mounts(resolved, target))
     return bind_mounts
 
@@ -71,6 +91,140 @@ def build_manifest_entries(local_sources: list[dict[str, Any]]) -> dict[str | Pa
             continue
         entries[ws_subdir] = LocalDir(src=Path(host_path).expanduser().resolve())
     return entries
+
+
+def _extra_file_rel_path(workspace_path: str) -> str | None:
+    """Validate an extra-file target path and return it relative to /workspace.
+
+    Only absolute paths under the workspace root are accepted; anything else
+    (including ``..`` traversal segments) is rejected so callers cannot place
+    orchestrator-provided content outside the sandbox workspace.
+    """
+    prefix = f"{_WORKSPACE_ROOT}/"
+    if not workspace_path.startswith(prefix):
+        return None
+    rel = workspace_path[len(prefix) :].strip("/")
+    if not rel or any(part in ("", ".", "..") for part in rel.split("/")):
+        return None
+    # Control characters would let a path break out of the single line it is
+    # rendered on in the agent task, so the path is rejected rather than escaped.
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in rel):
+        return None
+    return rel
+
+
+def _source_root_rels(local_sources: list[dict[str, Any]] | None) -> list[str]:
+    """Workspace-relative roots the local sources occupy (e.g. ``["repo"]``)."""
+    if not local_sources:
+        return []
+    return [
+        str(src.get("workspace_subdir") or "").strip("/")
+        for src in local_sources
+        if src.get("workspace_subdir") and src.get("source_path")
+    ]
+
+
+def _collides_with_source_root(rel: str, source_roots: list[str]) -> bool:
+    """True when an extra-file path would land on or inside a source tree.
+
+    An exact match would replace the whole source tree with one file (a
+    manifest ``entries`` key collision); a path nested under a source root
+    would race the source upload; a path that is an ancestor of a source root
+    would shadow the directory the source materializes into.
+    """
+    for root in source_roots:
+        if not root:
+            continue
+        if rel == root or rel.startswith(f"{root}/") or root.startswith(f"{rel}/"):
+            return True
+    return False
+
+
+def _extra_file_content(extra_file: dict[str, Any]) -> bytes | None:
+    content = extra_file.get("content")
+    if isinstance(content, bytes | bytearray):
+        return bytes(content)
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    return None
+
+
+def build_extra_file_archive(
+    extra_files: list[dict[str, Any]],
+    local_sources: list[dict[str, Any]] | None = None,
+) -> bytes | None:
+    """Pack extra files into one tar archive rooted at ``/workspace``.
+
+    Each item is ``{"workspace_path": "/workspace/<rel>", "content": bytes|str}``
+    and becomes a regular-file member at ``<rel>``. Extracting the archive as
+    the sandbox user (see ``stage_extra_files``) leaves every file owned by
+    that user, so the agent can edit it and create siblings. Invalid items —
+    including paths that collide with a ``local_sources`` tree or with an
+    earlier extra file — are skipped with a warning. Returns ``None`` when no
+    valid file remains.
+    """
+    source_roots = _source_root_rels(local_sources)
+    placed: list[str] = [_EXTRA_FILE_ARCHIVE_REL]
+    buffer = io.BytesIO()
+    mtime = int(time.time())
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for extra_file in extra_files:
+            rel, content = _validated_extra_file(extra_file, source_roots + placed)
+            if rel is None or content is None:
+                continue
+            placed.append(rel)
+            info = tarfile.TarInfo(name=rel)
+            info.size = len(content)
+            info.mode = _EXTRA_FILE_MODE
+            info.mtime = mtime
+            archive.addfile(info, io.BytesIO(content))
+    if len(placed) == 1:
+        return None
+    return buffer.getvalue()
+
+
+def _validated_extra_file(
+    extra_file: dict[str, Any], taken: list[str]
+) -> tuple[str | None, bytes | None]:
+    rel = _extra_file_rel_path(str(extra_file.get("workspace_path") or ""))
+    content = _extra_file_content(extra_file)
+    if rel is None or content is None:
+        logger.warning(
+            "Skipping invalid extra file entry (workspace_path=%r)",
+            extra_file.get("workspace_path"),
+        )
+        return None, None
+    if _collides_with_source_root(rel, taken):
+        logger.warning(
+            "Skipping extra file colliding with a local source tree or an "
+            "earlier extra file (workspace_path=%r)",
+            extra_file.get("workspace_path"),
+        )
+        return None, None
+    return rel, content
+
+
+async def stage_extra_files(session: BaseSandboxSession, archive: bytes) -> None:
+    """Upload ``archive`` and unpack it under ``/workspace`` as the sandbox user.
+
+    ``--no-same-owner`` keeps ownership with the extracting user even where
+    the session runs as root, so the agent user can always write the files.
+    """
+    await session.write(Path(_EXTRA_FILE_ARCHIVE), io.BytesIO(archive))
+    result = await session.exec(
+        "sh",
+        "-c",
+        'tar --no-same-owner -xf "$1" -C "$2" && rm -f -- "$1"',
+        "sh",
+        _EXTRA_FILE_ARCHIVE,
+        _WORKSPACE_ROOT,
+        timeout=_EXTRA_FILE_EXTRACT_TIMEOUT_S,
+    )
+    if not result.ok():
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"unpacking extra files in the sandbox failed (exit {result.exit_code}): {stderr}"
+        )
 
 
 def _metadata_mounts(tree: Path, target: str) -> list[dict[str, Any]]:
@@ -106,17 +260,34 @@ def _gitdir_from_pointer(git_file: Path) -> Path | None:
     return None
 
 
+async def _resolve_extra_file_archive(
+    extra_files: list[dict[str, Any]] | Awaitable[list[dict[str, Any]] | None] | None,
+    local_sources: list[dict[str, Any]],
+) -> bytes | None:
+    files = await extra_files if inspect.isawaitable(extra_files) else extra_files
+    return build_extra_file_archive(files, local_sources) if files else None
+
+
 async def create_or_reuse(
     scan_id: str,
     *,
     image: str,
     local_sources: list[dict[str, Any]],
+    extra_files: list[dict[str, Any]] | Awaitable[list[dict[str, Any]] | None] | None = None,
     status_sink: StatusSink | None = None,
+    defer: bool = False,
 ) -> dict[str, Any]:
     """Return the existing session bundle for ``scan_id`` or create a new one.
 
     Each ``local_sources`` entry exposes its host ``source_path`` at
     ``/workspace/<workspace_subdir>`` inside the container.
+
+    Each ``extra_files`` entry (``{"workspace_path": "/workspace/<rel>",
+    "content": bytes | str}``) lands as a regular, agent-writable file at its
+    ``workspace_path`` on every backend: the files are uploaded as one archive
+    and unpacked inside the sandbox right after bring-up. ``extra_files`` may
+    also be an awaitable resolving to that list: provisioning starts at once and
+    the files are awaited only when the sandbox is ready to receive them.
     """
 
     def report(phase: str) -> None:
@@ -165,24 +336,69 @@ async def create_or_reuse(
         backend_name,
         image,
     )
-    report("Starting sandbox container")
-    client, session = await backend(
-        image=image,
-        manifest=manifest,
-        exposed_ports=(_CONTAINER_CAIDO_PORT,),
-        bind_mounts=bind_mounts,
-    )
 
-    report("Setting up the proxy")
-    caido_endpoint = await session.resolve_exposed_port(_CONTAINER_CAIDO_PORT)
-    scheme = "https" if caido_endpoint.tls else "http"
-    host_caido_url = f"{scheme}://{caido_endpoint.host}:{caido_endpoint.port}"
-    logger.debug("Caido host endpoint resolved: %s", host_caido_url)
+    async def _bring_up() -> tuple[Any, Any]:
+        report("Starting sandbox container")
+        client, session = await _create_or_discard(
+            backend(
+                image=image,
+                manifest=manifest,
+                exposed_ports=(_CONTAINER_CAIDO_PORT,),
+                bind_mounts=bind_mounts,
+            )
+        )
+        try:
+            extra_file_archive = await _resolve_extra_file_archive(extra_files, local_sources)
+            if extra_file_archive is not None:
+                report("Placing workspace files")
+                await stage_extra_files(session, extra_file_archive)
+        except BaseException:
+            await _discard_session(client, session)
+            raise
+        return client, session
 
-    caido_client = await bootstrap_caido(
-        session,
-        host_url=host_caido_url,
-        container_url=container_caido_url,
+    async def _caido_url(session: Any) -> str:
+        report("Setting up the proxy")
+        caido_endpoint = await session.resolve_exposed_port(_CONTAINER_CAIDO_PORT)
+        scheme = "https" if caido_endpoint.tls else "http"
+        host_caido_url = f"{scheme}://{caido_endpoint.host}:{caido_endpoint.port}"
+        logger.debug("Caido host endpoint resolved: %s", host_caido_url)
+        return host_caido_url
+
+    def _caido(session: Any, host_caido_url: str) -> Any:
+        return bootstrap_caido(
+            session,
+            host_url=host_caido_url,
+            container_url=container_caido_url,
+        )
+
+    if defer:
+        bring_up = asyncio.create_task(_bring_up(), name=f"sandbox-bring-up-{scan_id}")
+        deferred = DeferredSandboxSession(
+            bring_up,
+            manifest=manifest,
+            exposed_ports=(_CONTAINER_CAIDO_PORT,),
+        )
+
+        async def _caido_when_up() -> Any:
+            session = await deferred.resolve()
+            return await _caido(session, await _caido_url(session))
+
+        bundle = {
+            "client": DeferredSandboxClient(deferred),
+            "session": deferred,
+            "caido_client": CaidoBootstrapHandle(
+                asyncio.create_task(_caido_when_up(), name=f"caido-bootstrap-{scan_id}")
+            ),
+        }
+        _SESSION_CACHE[scan_id] = bundle
+        logger.info("Sandbox session for scan %s deferred and cached", scan_id)
+        return bundle
+
+    client, session = await _bring_up()
+    host_caido_url = await _caido_url(session)
+    caido_client = CaidoBootstrapHandle(
+        asyncio.create_task(_caido(session, host_caido_url), name=f"caido-bootstrap-{scan_id}")
     )
 
     bundle = {
@@ -193,6 +409,34 @@ async def create_or_reuse(
     _SESSION_CACHE[scan_id] = bundle
     logger.info("Sandbox session for scan %s ready and cached", scan_id)
     return bundle
+
+
+_DISCARD_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _create_or_discard(create: Awaitable[tuple[Any, Any]]) -> tuple[Any, Any]:
+    pending = asyncio.ensure_future(create)
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        discard = asyncio.create_task(_discard_when_created(pending))
+        _DISCARD_TASKS.add(discard)
+        discard.add_done_callback(_DISCARD_TASKS.discard)
+        raise
+
+
+async def _discard_when_created(create: asyncio.Future[tuple[Any, Any]]) -> None:
+    with contextlib.suppress(BaseException):
+        client, session = await create
+        await _discard_session(client, session)
+
+
+async def _discard_session(client: Any, session: Any) -> None:
+    """Best-effort teardown of a session that never made it into the cache."""
+    try:
+        await client.delete(session)
+    except Exception:  # noqa: BLE001
+        logger.warning("Discarding a half-started sandbox session failed", exc_info=True)
 
 
 async def cleanup(scan_id: str) -> None:

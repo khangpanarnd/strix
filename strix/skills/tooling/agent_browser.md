@@ -1,6 +1,7 @@
 ---
 name: agent_browser
 description: agent-browser CLI for headless Chrome via shell. Snapshot-and-ref workflow, click/fill/extract, screenshots, multi-tab, multi-session, network mocking. Pre-installed in the sandbox; invoke via exec_command.
+template: jinja
 ---
 
 
@@ -57,6 +58,26 @@ agent-browser screenshot
 
 The browser stays running across commands so these feel like a single
 session. Use `agent-browser close` (or `close --all`) when you're done.
+
+The default session is **shared with every other agent in the sandbox** — if
+another agent navigates it, your page and your refs are gone from under you. So
+claim your own by passing `--session <your-agent-name>` on **every** command:
+
+```bash
+agent-browser --session recon-3 open https://example.com
+agent-browser --session recon-3 snapshot -i
+agent-browser --session recon-3 close        # when done with the target
+```
+
+The examples in the rest of this skill omit `--session` to keep them readable;
+keep passing yours. Each session is a separate Chromium (~340 MB) on a shared
+box, so hold one rather than several, and close it when you're finished.
+
+A browser left idle for 3 minutes is reclaimed automatically to free memory for
+the other agents; the next command relaunches it, but the page, tabs, refs and
+cookies are gone. If you're authenticated and about to go do something else for a
+while, save the state first (see
+[Persist session across runs](#persist-session-across-runs)).
 
 ## Reading a page
 
@@ -240,8 +261,9 @@ only for simple expressions.
 
 ### Screenshot
 
-`agent-browser screenshot` writes a PNG to disk in the sandbox. The
-shell command alone does **not** put the image into your context —
+`agent-browser screenshot` writes a PNG to disk in the sandbox.
+{% if supports_images %}
+The shell command alone does **not** put the image into your context —
 chain it with the SDK ``view_image`` tool to actually see it:
 
 ```bash
@@ -255,6 +277,12 @@ the full path on stdout — pass that to ``view_image``). If you need a
 specific filename, keep it inside that directory or a sibling hidden
 dir under ``/workspace``. Never write screenshots to ``/tmp`` —
 ``view_image`` rejects anything outside the workspace root.
+{% else %}
+You are running on a text-only model and cannot view images. Screenshots
+are only useful to you as a saved file (for example, login evidence).
+Drive the page from `snapshot -i` refs, `eval` for any DOM/JS state you
+need to read, and `text @ref` / `get text` for content extraction.
+{% endif %}
 
 ```bash
 agent-browser screenshot                        # path printed on stdout
@@ -263,6 +291,7 @@ agent-browser screenshot --full                 # full scroll height
 agent-browser screenshot --annotate             # numbered labels + legend keyed to snapshot refs
 ```
 
+{% if supports_images %}
 `--annotate` is designed for multimodal models: each label `[N]` maps
 to ref `@eN`. Take the annotated screenshot, then ``view_image`` it,
 and you can correlate visual layout with snapshot refs.
@@ -274,10 +303,10 @@ layout questions, captchas, custom widgets where the accessibility
 tree is incomplete).
 
 If ``view_image`` errors back at you (rejected image, "vision not
-supported", or similar), you are running on a text-only model — stop
-calling it and stop taking screenshots. Drive the page entirely from
-`snapshot -i` refs, `eval` for any DOM/JS state you need to read, and
-`text @ref` / `get text` for content extraction.
+supported", or similar), you can drive the page from `snapshot -i`
+refs, `eval` for any DOM/JS state you need to read, and `text @ref`
+or `get text` for content extraction.
+{% endif %}
 
 ### Handle multiple pages via tabs
 
@@ -306,6 +335,16 @@ agent-browser --session b fill @e1 "bob@test.com"
 
 `AGENT_BROWSER_SESSION=myapp` sets the default session for the current
 shell.
+
+Use a session named after yourself for your own work — that's what keeps a
+concurrent agent from navigating the page out from under you. Every session is a
+separate Chromium though, so hold one at a time rather than a collection, and
+close each one when its flow is finished:
+
+```bash
+agent-browser --session a close
+agent-browser --session b close
+```
 
 ### Mock network requests
 
@@ -368,8 +407,11 @@ agent-browser dialog dismiss          # cancel
 ## Readiness & recovery
 
 The first `agent-browser open` in a session launches the headless-Chrome
-daemon; later commands reuse it. Distinguish the two failure modes and react
-differently — do **not** blindly re-run the same failing command in a loop:
+daemon; later commands reuse it. A daemon left idle for 3 minutes shuts itself
+down to free memory for the other agents, so an `open` after a long gap is a
+fresh browser rather than a resumed one — expect to re-navigate, and re-`state
+load` if you were logged in. Distinguish the failure modes and react differently
+— do **not** blindly re-run the same failing command in a loop:
 
 - **Daemon / connection failure** (`Failed to connect`, `connection refused`,
   socket missing, `browser not running`): the daemon isn't up or has died. Run

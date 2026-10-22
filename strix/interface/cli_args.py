@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from strix.config import apply_config_override
 from strix.config.settings import DEFAULT_MAX_TURNS
-from strix.core.paths import run_dir_for, runtime_state_dir
+from strix.core.paths import RUNS_DIR_NAME, run_dir_for, runtime_state_dir
 from strix.interface.scan_setup import attach_workspace_mount, build_targets_info
 from strix.interface.update_check import self_update
 from strix.interface.utils import (
     check_mountable_dir,
     collect_local_sources,
+    resolve_workspace_files,
     validate_config_file,
 )
+from strix.report.runs import list_run_summaries
+
+
+# Severities ``--fail-on`` accepts, most severe first.
+FAIL_ON_SEVERITIES = ("critical", "high", "medium", "low", "info")
 
 
 def get_version() -> str:
@@ -92,6 +99,18 @@ Examples:
   # Custom instructions (from file)
   strix --target example.com --instruction-file ./instructions.txt
   strix --target https://app.com --instruction-file /path/to/detailed_instructions.md
+
+  # Extra files placed in the sandbox workspace
+  strix --target ./my-project --workspace-file ./wordlist.txt
+  strix --target https://app.com --workspace-file ./openapi.yaml:specs/openapi.yaml
+
+Strix Cloud:
+  strix cloud login
+  strix cloud scans start --source . --yes --wait
+  strix cloud                      # list every cloud resource
+
+  Run a pentest in Strix Cloud     https://app.strix.ai
+  Try Strix Enterprise             https://strix.ai/demo
         """,
     )
 
@@ -150,12 +169,40 @@ Examples:
     )
 
     parser.add_argument(
+        "--workspace-file",
+        type=str,
+        action="append",
+        metavar="PATH[:DEST]",
+        help="Place a file from this machine into the sandbox workspace before the scan "
+        "starts, for example a wordlist, an API specification, or notes. Repeat the option "
+        "for more files. DEST is the path inside /workspace and defaults to the file name "
+        "(for example '--workspace-file ./wordlist.txt:lists/wordlist.txt'). Strix copies "
+        "the file into the sandbox, outside every target directory. The agent can edit the "
+        "copy. The file on this machine does not change.",
+    )
+
+    parser.add_argument(
         "-n",
         "--non-interactive",
         action="store_true",
         help=(
             "Run in non-interactive mode (no TUI, exits on completion). "
             "Default is interactive mode with TUI."
+        ),
+    )
+
+    parser.add_argument(
+        "--fail-on",
+        dest="fail_on",
+        type=str.lower,
+        choices=FAIL_ON_SEVERITIES,
+        default=None,
+        metavar="SEVERITY",
+        help=(
+            "Headless mode only: exit 2 only when a finding is at or above this severity "
+            "(critical, high, medium, low, info). Lower findings are still written to every "
+            "report artifact. A finding with an unrecognized severity always counts. "
+            "Default: any finding exits 2."
         ),
     )
 
@@ -203,6 +250,30 @@ Examples:
     )
 
     parser.add_argument(
+        "--mcp-config",
+        type=str,
+        metavar="PATH",
+        help="Path to an MCP servers JSON file to use instead of ~/.strix/mcp-servers.json.",
+    )
+
+    parser.add_argument(
+        "--mcp-server",
+        dest="mcp_server",
+        action="append",
+        metavar="NAME",
+        help="Use only this MCP connection for the run, by its config name "
+        "(repeatable). Every other configured connection is skipped.",
+    )
+
+    parser.add_argument(
+        "--mcp-exclude",
+        dest="mcp_exclude",
+        action="append",
+        metavar="NAME",
+        help="Skip this MCP connection for the run, by its config name (repeatable).",
+    )
+
+    parser.add_argument(
         "--max-budget",
         "--max-budget-usd",
         dest="max_budget_usd",
@@ -228,13 +299,17 @@ Examples:
     )
 
     parser.add_argument(
+        "-r",
         "--resume",
         type=str,
+        nargs="?",
+        const="",
         metavar="RUN_NAME",
         help=(
             "Resume a prior scan by its run name (the dir under ./strix_runs/). "
             "Picks up the root + every non-terminal subagent's full LLM history "
-            "and agent topology. Skips fresh run-name generation."
+            "and agent topology. Skips fresh run-name generation. Without a "
+            "name, opens a picker of the prior runs."
         ),
     )
 
@@ -242,6 +317,7 @@ Examples:
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.
     args.needs_setup = False
+    args.resume_picker = False
     args.targets_info = []
     args.local_sources = []
     args.diff_scope = {"active": False}
@@ -250,8 +326,27 @@ Examples:
     if args.config:
         apply_config_override(validate_config_file(args.config))
 
+    if args.mcp_config:
+        mcp_config_path = Path(args.mcp_config).expanduser()
+        if not mcp_config_path.is_file():
+            parser.error(f"--mcp-config file not found: {args.mcp_config}")
+        # The MCP loader reads this env var as its config-path override, so
+        # setting it here makes the flag win over the default location.
+        os.environ["STRIX_MCP_CONFIG"] = str(mcp_config_path)
+
+    # The MCP loader reads these as its per-run include/exclude selection.
+    if args.mcp_server:
+        os.environ["STRIX_MCP_ONLY"] = ",".join(args.mcp_server)
+    if args.mcp_exclude:
+        os.environ["STRIX_MCP_EXCLUDE"] = ",".join(args.mcp_exclude)
+
     if args.update:
         sys.exit(0 if self_update() else 1)
+
+    if args.fail_on and not args.non_interactive and terminal_attached():
+        # Without a terminal main() switches to headless anyway, so the
+        # flag is only out of place when the TUI would actually open.
+        parser.error("--fail-on only applies to headless runs; add -n/--non-interactive.")
 
     if args.instruction and args.instruction_file:
         parser.error(
@@ -268,28 +363,39 @@ Examples:
         except Exception as e:
             parser.error(f"Failed to read instruction file '{instruction_path}': {e}")
 
-    args.user_explicit_instruction = args.instruction if args.resume else None
+    try:
+        args.workspace_files = resolve_workspace_files(getattr(args, "workspace_file", None))
+    except ValueError as error:
+        parser.error(f"--workspace-file: {error}")
+
+    args.user_explicit_instruction = args.instruction if args.resume is not None else None
     # What the user actually asked for, kept apart from args.instruction because
     # prepare_run prepends the diff-scope preamble to that. This is the text the
     # transcript shows as their opening message.
     args.user_instruction = args.instruction or None
 
-    if args.resume:
+    if args.resume is not None:
         if args.target or args.target_list:
             parser.error(
                 "Cannot combine --resume with --target/--target-list. "
                 "--resume picks up where the prior run left off, including the "
                 "original target list."
             )
-        _load_resume_state(args, parser)
-        agents_path = runtime_state_dir(run_dir_for(args.resume)) / "agents.json"
-        if not agents_path.exists():
-            parser.error(
-                f"--resume {args.resume}: missing {agents_path}. The run was "
-                f"persisted but never reached its first agent snapshot — "
-                f"there's nothing to resume from. Pick a fresh --run-name "
-                f"or remove --resume to start over with the same targets."
-            )
+        if not args.resume.strip():
+            # A bare --resume: main() opens the inline picker of prior runs
+            # before anything launches; headless has nobody to pick, so it
+            # lists them.
+            args.resume = None
+            args.resume_picker = True
+            if args.non_interactive:
+                parser.error(resume_run_list_message("--resume needs a run name in headless mode."))
+            if not list_run_summaries():
+                parser.error(f"--resume: no runs in ./{RUNS_DIR_NAME} to resume")
+            return args
+        try:
+            load_resume_state(args)
+        except ResumeError as exc:
+            parser.error(str(exc))
     else:
         if not args.target and not args.target_list:
             if args.non_interactive:
@@ -311,28 +417,60 @@ Examples:
     return args
 
 
-def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Populate ``args.targets_info`` and friends from a prior run's run.json."""
+def terminal_attached() -> bool:
+    """Whether the TUI can take over the terminal: a tty on both ends, not dumb."""
+    if os.environ.get("TERM", "").strip().lower() == "dumb":
+        return False
+    return all(hasattr(stream, "isatty") and stream.isatty() for stream in (sys.stdin, sys.stdout))
+
+
+class ResumeError(ValueError):
+    """A prior run cannot be resumed as recorded; the message names why."""
+
+
+def resume_run_list_message(lead: str) -> str:
+    """``lead`` followed by the runs that ``--resume <name>`` would accept."""
+    runs = list_run_summaries()
+    if not runs:
+        return f"{lead} There are no runs in ./{RUNS_DIR_NAME}."
+    name_width = max(len(run.run_name) for run in runs)
+    status_width = max(len(run.status) for run in runs)
+    lines = [f"{lead} Runs in ./{RUNS_DIR_NAME}:"]
+    lines.extend(
+        f"  {run.run_name:<{name_width}}  {run.status:<{status_width}}  "
+        f"{run.started_at[:19]:<19}  {run.target}".rstrip()
+        for run in runs
+    )
+    return "\n".join(lines)
+
+
+def load_resume_state(args: argparse.Namespace) -> None:
+    """Populate ``args.targets_info`` and friends from a prior run's run.json.
+
+    Raises :class:`ResumeError` when the run is missing, unreadable, or its
+    recorded workspace is gone.
+    """
     from strix.report.writer import read_run_record
 
     run_dir = run_dir_for(args.resume)
     state_path = run_dir / "run.json"
     if not state_path.exists():
-        parser.error(
+        raise ResumeError(
             f"--resume {args.resume}: no such run "
             f"(missing {state_path}; remove --resume for a fresh start)"
         )
     try:
         state = read_run_record(run_dir)
-    except RuntimeError as exc:
-        parser.error(f"--resume {args.resume}: run.json unreadable: {exc}")
+    except (RuntimeError, TypeError) as exc:
+        raise ResumeError(f"--resume {args.resume}: run.json unreadable: {exc}") from exc
 
     args.targets_info = state.get("targets_info") or []
-    # A target-less run has no targets_info at all: it works in a mounted
-    # directory, driven by its instruction.
+    # A target-less run has no targets_info at all. It is driven by its
+    # instruction, over a mounted working directory or over nothing when the
+    # mount was declined, so either of those is enough to resume it.
     workspace_mount = state.get("workspace_mount") or None
-    if not args.targets_info and not workspace_mount:
-        parser.error(f"--resume {args.resume}: run.json has no targets_info")
+    if not args.targets_info and not workspace_mount and not state.get("user_instruction"):
+        raise ResumeError(f"--resume {args.resume}: run.json has no targets_info")
 
     for target in args.targets_info:
         if not isinstance(target, dict):
@@ -342,7 +480,7 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
             try:
                 check_mountable_dir(Path(details["target_path"]).expanduser())
             except ValueError as exc:
-                parser.error(f"--resume {args.resume}: {exc}")
+                raise ResumeError(f"--resume {args.resume}: {exc}") from exc
             continue
         if target.get("type") != "repository":
             continue
@@ -350,7 +488,7 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
         if not cloned:
             continue
         if not Path(cloned).expanduser().exists():
-            parser.error(
+            raise ResumeError(
                 f"--resume {args.resume}: cloned repo at {cloned} is missing. "
                 f"It was deleted between runs. Pick a fresh --run-name to "
                 f"re-clone, or restore the directory before resuming."
@@ -365,9 +503,26 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
     # this directory, so the target mount guard does not apply to it; it only has
     # to still be there.
     args.workspace_mount = workspace_mount
+
+    # Replace the workspace files the run started with, unless this resume names
+    # its own. The persisted record is revalidated like a fresh flag, so an
+    # edited run.json cannot widen what a resume places. A file deleted between
+    # runs is dropped rather than fatal: it is context for the agent, not scope.
+    if not getattr(args, "workspace_files", None):
+        restored = [
+            f"{source_path}:{workspace_path}"
+            for workspace_file in state.get("workspace_files") or []
+            if isinstance(workspace_file, dict)
+            and (source_path := Path(str(workspace_file.get("source_path") or ""))).is_file()
+            and (workspace_path := str(workspace_file.get("workspace_path") or ""))
+        ]
+        try:
+            args.workspace_files = resolve_workspace_files(restored)
+        except ValueError as error:
+            raise ResumeError(f"--resume {args.resume}: invalid workspace file: {error}") from error
     if workspace_mount:
         if not Path(workspace_mount).expanduser().is_dir():
-            parser.error(
+            raise ResumeError(
                 f"--resume {args.resume}: the working directory {workspace_mount} "
                 f"is missing. Restore it before resuming, or start a fresh run."
             )
@@ -377,3 +532,11 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
     persisted_scan_mode = state.get("scan_mode")
     if persisted_scan_mode and args.scan_mode == "deep":
         args.scan_mode = persisted_scan_mode
+    agents_path = runtime_state_dir(run_dir) / "agents.json"
+    if not agents_path.exists():
+        raise ResumeError(
+            f"--resume {args.resume}: missing {agents_path}. The run was "
+            f"persisted but never reached its first agent snapshot — "
+            f"there's nothing to resume from. Pick a fresh --run-name "
+            f"or remove --resume to start over with the same targets."
+        )

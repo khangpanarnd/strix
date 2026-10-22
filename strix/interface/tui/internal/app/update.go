@@ -59,6 +59,14 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureVulnerabilityVisible()
 			return m, nil
 		}
+		if m.focus == focusMcp && len(m.snapshot.Connections) > 0 {
+			delta := 1
+			if key.String() == "up" {
+				delta = -1
+			}
+			m.mcpOffset = m.clampMcpOffset(m.mcpOffset + delta)
+			return m, nil
+		}
 	case "enter", " ":
 		if m.focus == focusVulnerabilities && len(m.snapshot.Vulnerabilities) > 0 {
 			if key.String() == "enter" {
@@ -94,6 +102,10 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.ensureVulnerabilityVisible()
 			return m, nil
 		}
+		if m.focus == focusMcp && len(m.snapshot.Connections) > 0 {
+			m.mcpOffset = m.clampMcpOffset(m.mcpOffset - m.mcpPageSize())
+			return m, nil
+		}
 		m.focus = focusChat
 		m.input.Blur()
 		m.followOutput = false
@@ -103,6 +115,10 @@ func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.focus == focusVulnerabilities && len(m.snapshot.Vulnerabilities) > 0 {
 			m.moveVulnerabilitySelection(m.vulnerabilityPageItems())
 			m.ensureVulnerabilityVisible()
+			return m, nil
+		}
+		if m.focus == focusMcp && len(m.snapshot.Connections) > 0 {
+			m.mcpOffset = m.clampMcpOffset(m.mcpOffset + m.mcpPageSize())
 			return m, nil
 		}
 		m.focus = focusChat
@@ -146,12 +162,8 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m.updateSetupMouse(msg)
 	}
 	showSidebar, _, chatWidth, chatHeight := m.layout()
-	viewerHeight := m.viewerHeight()
-	_, vulnHeight, agentHeight := m.sidebarHeights()
 	x, y := msg.X, msg.Y
-	if m.updateMainScrollbarMouse(
-		msg, showSidebar, chatWidth, chatHeight, viewerHeight, agentHeight, vulnHeight,
-	) {
+	if m.updateMainScrollbarMouse(msg, showSidebar, chatWidth, chatHeight) {
 		return m, nil
 	}
 	if m.selection.dragging {
@@ -182,20 +194,8 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		if showSidebar && x >= chatWidth+1 {
-			switch {
-			case y < viewerHeight:
-				return m, nil
-			case y < viewerHeight+agentHeight:
-				m.focus = focusAgents
-				m.input.Blur()
-				m.agentOffset = max(0, m.agentOffset-3)
-				m.keepAgentSelectionInWindow()
-				m.refreshViewport()
-			case vulnHeight > 0 && y < viewerHeight+agentHeight+vulnHeight:
-				m.focus = focusVulnerabilities
-				m.input.Blur()
-				m.vulnOffset = max(0, m.vulnOffset-3)
-				m.keepVulnerabilitySelectionInWindow()
+			if rect, ok := m.panelAt(y); ok && rect.height > 1 {
+				m.scrollPanel(rect.panel, -3)
 			}
 			return m, nil
 		}
@@ -206,21 +206,8 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.MouseButtonWheelDown:
 		if showSidebar && x >= chatWidth+1 {
-			switch {
-			case y < viewerHeight:
-				return m, nil
-			case y < viewerHeight+agentHeight:
-				m.focus = focusAgents
-				m.input.Blur()
-				rows := m.agentPageSize()
-				m.agentOffset = min(max(0, len(agentTreeEntries(m.snapshot.Agents, m.collapsedAgents))-rows), m.agentOffset+3)
-				m.keepAgentSelectionInWindow()
-				m.refreshViewport()
-			case vulnHeight > 0 && y < viewerHeight+agentHeight+vulnHeight:
-				m.focus = focusVulnerabilities
-				m.input.Blur()
-				m.vulnOffset = min(max(0, len(m.snapshot.Vulnerabilities)-1), m.vulnOffset+3)
-				m.keepVulnerabilitySelectionInWindow()
+			if rect, ok := m.panelAt(y); ok && rect.height > 1 {
+				m.scrollPanel(rect.panel, 3)
 			}
 			return m, nil
 		}
@@ -263,21 +250,32 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if !showSidebar || x < chatWidth+1 {
+	if x < chatWidth+1 {
 		return m, nil
 	}
-	// Sidebar: viewer, agents, vulnerabilities, then stats.
-	switch {
-	case y < viewerHeight:
+	if m.toggleButtonHit(x, y) {
+		m.selection.active = false
+		m.toggleSidebar()
+		return m, nil
+	}
+	if !showSidebar {
+		return m, nil
+	}
+	if y < m.viewerHeight() {
 		return m, send(m.client, "viewer.open", map[string]any{})
-	case y < viewerHeight+agentHeight:
+	}
+	rect, ok := m.panelAt(y)
+	if !ok || m.clickPanel(rect, x, y) {
+		return m, nil
+	}
+	localY := y - rect.top
+	switch rect.panel {
+	case panelAgents:
 		m.focus = focusAgents
 		m.input.Blur()
-		// Content starts after the top border (1) and vertical padding (1).
 		entries := agentTreeEntries(m.snapshot.Agents, m.collapsedAgents)
-		start := windowStart(m.agentOffset, len(entries), max(1, agentHeight-4))
-		localY := y - viewerHeight
-		if row := start + localY - 2; localY >= 2 && localY < agentHeight-2 && row < len(entries) {
+		start := windowStart(m.agentOffset, len(entries), m.agentPageSize())
+		if row := start + localY - 2; localY >= 2 && localY < rect.height-1 && row < len(entries) {
 			m.selectedAgent = entries[row].index
 			agentID := m.snapshot.Agents[m.selectedAgent].ID
 			if hasAgentChildren(agentID, m.snapshot.Agents) {
@@ -286,24 +284,22 @@ func (m Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshViewport()
 		}
-	case vulnHeight > 0 && y < viewerHeight+agentHeight+vulnHeight:
+	case panelFindings:
 		m.focus = focusVulnerabilities
 		m.input.Blur()
-		// Content starts after the top border (1); clicking a row opens its detail.
-		row := y - viewerHeight - agentHeight - 1
-		if idx := m.vulnerabilityIndexAtRow(row); row >= 0 && row < vulnHeight-2 && idx >= 0 {
+		row := localY - 2
+		if idx := m.vulnerabilityIndexAtRow(row); row >= 0 && row < rect.height-3 && idx >= 0 {
 			m.selectedVuln = idx
 			m.openModal(modalVulnerability)
 		}
+	case panelMcp:
+		m.focus = focusMcp
+		m.input.Blur()
 	}
 	return m, nil
 }
 
-func (m *Model) updateMainScrollbarMouse(
-	msg tea.MouseMsg,
-	showSidebar bool,
-	chatWidth, chatHeight, viewerHeight, agentHeight, vulnHeight int,
-) bool {
+func (m *Model) updateMainScrollbarMouse(msg tea.MouseMsg, showSidebar bool, chatWidth, chatHeight int) bool {
 	if msg.Action == tea.MouseActionRelease {
 		if m.draggingScrollbar == scrollbarNone {
 			return false
@@ -312,42 +308,60 @@ func (m *Model) updateMainScrollbarMouse(
 		return true
 	}
 	if msg.Action == tea.MouseActionMotion && m.draggingScrollbar != scrollbarNone {
-		m.scrollFromMouse(m.draggingScrollbar, msg.Y, chatHeight, viewerHeight, agentHeight)
+		m.scrollFromMouse(m.draggingScrollbar, msg.Y, chatHeight)
 		return true
 	}
 	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
 		return false
 	}
-
-	target := scrollbarNone
-	switch {
-	case msg.X == chatWidth-2 && msg.Y >= 1 && msg.Y < chatHeight-1 &&
-		m.viewport.TotalLineCount() > m.viewport.VisibleLineCount():
-		target = scrollbarTrace
-	case showSidebar && msg.X == m.width-3 && msg.Y >= viewerHeight+2 &&
-		msg.Y < viewerHeight+agentHeight-2 &&
-		len(agentTreeEntries(m.snapshot.Agents, m.collapsedAgents)) > m.agentPageSize():
-		target = scrollbarAgents
-	case showSidebar && vulnHeight > 0 && msg.X == m.width-3 &&
-		msg.Y >= viewerHeight+agentHeight+1 &&
-		msg.Y < viewerHeight+agentHeight+vulnHeight-1:
-		totalRows, _ := m.vulnerabilityScrollRows()
-		if totalRows > m.vulnerabilityPageSize() {
-			target = scrollbarFindings
-		}
-	}
+	target := m.scrollbarAt(msg, showSidebar, chatWidth, chatHeight)
 	if target == scrollbarNone {
 		return false
 	}
 	m.draggingScrollbar = target
-	m.scrollFromMouse(target, msg.Y, chatHeight, viewerHeight, agentHeight)
+	m.scrollFromMouse(target, msg.Y, chatHeight)
 	return true
 }
 
-func (m *Model) scrollFromMouse(
-	target scrollbarTarget,
-	y, chatHeight, viewerHeight, agentHeight int,
-) {
+// scrollbarGrab is how far either side of the bar still counts as grabbing it. A
+// one column target is unreasonable to hit with a mouse, and nothing else lives
+// in the column beside it.
+const scrollbarGrab = 1
+
+func nearColumn(x, column int) bool {
+	return x >= column-scrollbarGrab && x <= column+scrollbarGrab
+}
+
+func (m Model) scrollbarAt(msg tea.MouseMsg, showSidebar bool, chatWidth, chatHeight int) scrollbarTarget {
+	if nearColumn(msg.X, chatWidth-2) && msg.Y >= 1 && msg.Y < chatHeight-1 &&
+		m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
+		return scrollbarTrace
+	}
+	if !showSidebar || !nearColumn(msg.X, m.width-3) {
+		return scrollbarNone
+	}
+	rect, ok := m.panelAt(msg.Y)
+	if !ok || rect.height <= 1 || msg.Y < rect.top+2 || msg.Y >= rect.top+rect.height-1 {
+		return scrollbarNone
+	}
+	switch rect.panel {
+	case panelAgents:
+		if len(agentTreeEntries(m.snapshot.Agents, m.collapsedAgents)) > m.agentPageSize() {
+			return scrollbarAgents
+		}
+	case panelFindings:
+		if totalRows, _ := m.vulnerabilityScrollRows(); totalRows > m.vulnerabilityPageSize() {
+			return scrollbarFindings
+		}
+	case panelMcp:
+		if len(m.snapshot.Connections) > m.mcpPageSize() {
+			return scrollbarMcp
+		}
+	}
+	return scrollbarNone
+}
+
+func (m *Model) scrollFromMouse(target scrollbarTarget, y, chatHeight int) {
 	switch target {
 	case scrollbarTrace:
 		height := max(1, chatHeight-2)
@@ -361,17 +375,23 @@ func (m *Model) scrollFromMouse(
 		total := len(agentTreeEntries(m.snapshot.Agents, m.collapsedAgents))
 		m.focus = focusAgents
 		m.input.Blur()
-		m.agentOffset = scrollbarOffset(y-viewerHeight-2, height, total, height)
+		m.agentOffset = scrollbarOffset(y-m.panelTop(panelAgents)-2, height, total, height)
 		m.keepAgentSelectionInWindow()
 		m.refreshViewport()
 	case scrollbarFindings:
 		height := m.vulnerabilityPageSize()
 		totalRows, _ := m.vulnerabilityScrollRows()
-		rowOffset := scrollbarOffset(y-viewerHeight-agentHeight-1, height, totalRows, height)
 		m.focus = focusVulnerabilities
 		m.input.Blur()
-		m.vulnOffset = m.vulnerabilityOffsetAtRow(rowOffset)
+		// The offset is a row, so dragging moves the list continuously.
+		m.vulnOffset = scrollbarOffset(y-m.panelTop(panelFindings)-2, height, totalRows, height)
 		m.keepVulnerabilitySelectionInWindow()
+	case scrollbarMcp:
+		height := m.mcpPageSize()
+		total := len(m.snapshot.Connections)
+		m.focus = focusMcp
+		m.input.Blur()
+		m.mcpOffset = scrollbarOffset(y-m.panelTop(panelMcp)-2, height, total, height)
 	}
 }
 
@@ -401,6 +421,22 @@ func (m Model) updateSetupMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		m.focus = focusInput
 		m.input.Focus()
+	}
+	return m, nil
+}
+
+// pressReportButton performs a button of the report row, however it was reached.
+func (m Model) pressReportButton(button string) (tea.Model, tea.Cmd) {
+	switch button {
+	case reportPrev:
+		m.showVulnerability(m.selectedVuln - 1)
+	case reportNext:
+		m.showVulnerability(m.selectedVuln + 1)
+	case reportCopy:
+		m.reportFocus = reportCopy
+		return m, m.startVulnerabilityCopy()
+	default:
+		m.closeModal()
 	}
 	return m, nil
 }
@@ -440,14 +476,35 @@ func (m Model) updateModalMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.modalChoice = 1
 			return m.updateModal(tea.KeyMsg{Type: tea.KeyEnter})
 		}
-	case modalVulnerability:
-		if m.centeredLabelHit(view, "Copy", msg.X, msg.Y) {
+	case modalConfirmMount:
+		left, top, panel := m.mountPromptBounds()
+		if labelHitAt(panel, mountConfirmLabel, left, top, msg.X, msg.Y) {
 			m.modalChoice = 0
+			cmd := m.answerMountConfirmation(true)
+			return m, cmd
+		}
+		if labelHitAt(panel, mountCancelLabel, left, top, msg.X, msg.Y) {
+			m.modalChoice = 1
+			cmd := m.answerMountConfirmation(false)
+			return m, cmd
+		}
+	case modalVulnerability:
+		for _, button := range m.reportButtons() {
+			if button == reportCopy || button == reportDone {
+				continue
+			}
+			if m.centeredLabelHit(view, button, msg.X, msg.Y) {
+				m.reportFocus = button
+				return m.pressReportButton(button)
+			}
+		}
+		if m.centeredLabelHit(view, "Copy", msg.X, msg.Y) {
+			m.reportFocus = reportCopy
 			cmd := m.startVulnerabilityCopy()
 			return m, cmd
 		}
 		if m.centeredLabelHit(view, "Done", msg.X, msg.Y) {
-			m.modalChoice = 1
+			m.reportFocus = reportDone
 			m.closeModal()
 		}
 	}
@@ -464,7 +521,14 @@ func (m Model) centeredViewBounds(view string) (left, top, width, height int) {
 
 func (m Model) centeredLabelHit(view, label string, x, y int) bool {
 	left, top, _, _ := m.centeredViewBounds(view)
-	for row, line := range strings.Split(view, "\n") {
+	return labelHitAt(view, label, left, top, x, y)
+}
+
+// labelHitAt reports whether a click landed on a label drawn in a panel whose
+// top-left corner is at (left, top). The mount prompt is docked in a corner
+// rather than centered, so it cannot use the centered bounds.
+func labelHitAt(panel, label string, left, top, x, y int) bool {
+	for row, line := range strings.Split(panel, "\n") {
 		plain := ansi.Strip(line)
 		index := strings.Index(plain, label)
 		if index < 0 || y != top+row {
@@ -478,10 +542,11 @@ func (m Model) centeredLabelHit(view, label string, x, y int) bool {
 
 func (m *Model) cycleFocus(delta int) {
 	available := []focusMode{focusInput, focusChat}
-	if m.width >= 120 {
-		available = append(available, focusAgents)
-		if len(m.snapshot.Vulnerabilities) > 0 {
-			available = append(available, focusVulnerabilities)
+	if showSidebar, _, _, _ := m.layout(); showSidebar {
+		for _, rect := range m.sidebarPanels() {
+			if focus, ok := panelFocus(rect.panel); ok && rect.height > 1 {
+				available = append(available, focus)
+			}
 		}
 	}
 	idx := 0
@@ -516,16 +581,19 @@ func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch key.String() {
 		case "esc":
 			m.closeModal()
-		case "left", "right", "tab", "shift+tab":
-			m.modalChoice = 1 - m.modalChoice
+		// The arrows step between reports directly; tab walks the button row.
+		case "left":
+			m.showVulnerability(m.selectedVuln - 1)
+		case "right":
+			m.showVulnerability(m.selectedVuln + 1)
+		case "tab":
+			m.stepReportFocus(1)
+		case "shift+tab":
+			m.stepReportFocus(-1)
 		case "enter":
-			if m.modalChoice == 0 {
-				cmd := m.startVulnerabilityCopy()
-				return m, cmd
-			}
-			m.closeModal()
+			return m.pressReportButton(m.focusedReportButton())
 		case "c":
-			m.modalChoice = 0
+			m.reportFocus = reportCopy
 			cmd := m.startVulnerabilityCopy()
 			return m, cmd
 		case "up":
@@ -547,7 +615,8 @@ func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		if m.modal == modalConfirmMount {
 			// The backend is waiting on an answer; escape declines it.
-			return m, m.answerMountConfirmation(false)
+			cmd := m.answerMountConfirmation(false)
+			return m, cmd
 		}
 		m.closeModal()
 		return m, nil
@@ -558,7 +627,10 @@ func (m Model) updateModal(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		modal, choice := m.modal, m.modalChoice
 		if modal == modalConfirmMount {
 			// The snapshot closes this prompt once the backend has the answer.
-			return m, m.answerMountConfirmation(choice == 0)
+			// Bound to a variable first: the call restores the held prompt into
+			// the composer, and that has to be in the model being returned.
+			cmd := m.answerMountConfirmation(choice == 0)
+			return m, cmd
 		}
 		m.closeModal()
 		if choice == 1 {
@@ -584,6 +656,7 @@ func (m *Model) openModal(mode modalMode) {
 		m.modalChoice = 1
 	}
 	if mode == modalVulnerability {
+		m.reportFocus = reportDone
 		m.modalChoice = 1
 		m.vulnerabilityCopied = false
 		m.vulnerabilityCopyError = ""
