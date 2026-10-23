@@ -1130,7 +1130,16 @@ def _is_http_git_repo(url: str) -> bool:
         return False
 
 
-def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR0911
+def infer_target_type(  # noqa: PLR0911
+    target: str, *, probe_git: bool = True
+) -> tuple[str, dict[str, str]]:
+    """Classify a scan target into a type and its details.
+
+    ``probe_git`` guards the outbound ``_is_http_git_repo`` network request:
+    the viewer passes ``False`` so browser-driven classification performs no
+    I/O (an SSRF-safe path). The default ``True`` keeps every current caller
+    byte-for-byte identical.
+    """
     if not target or not isinstance(target, str):
         raise ValueError("Target must be a non-empty string")
 
@@ -1169,7 +1178,7 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
         if parsed.query or parsed.fragment:
             return "web_application", {"target_url": target}
         path_segments = [s for s in parsed.path.split("/") if s]
-        if len(path_segments) >= 2 and _is_http_git_repo(target):
+        if len(path_segments) >= 2 and probe_git and _is_http_git_repo(target):
             return "repository", {"target_repo": target}
         return "web_application", {"target_url": target}
 
@@ -1203,7 +1212,7 @@ def infer_target_type(target: str) -> tuple[str, dict[str, str]]:  # noqa: PLR09
         host_part, _, path_part = target.partition("/")
         if "." in host_part and not host_part.startswith(".") and path_part:
             full_url = f"https://{target}"
-            if _is_http_git_repo(full_url):
+            if probe_git and _is_http_git_repo(full_url):
                 return "repository", {"target_repo": full_url}
             return "web_application", {"target_url": full_url}
 

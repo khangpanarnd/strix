@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -54,6 +55,22 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be an integer greater than 0")
     return parsed
+
+
+# A run name becomes a directory under ./strix_runs, so it is constrained to a
+# conservative, path-safe shape: start alphanumeric, then up to 63 more of
+# [A-Za-z0-9._-]. This matches the viewer's validation so a caller-chosen name
+# cannot escape the runs directory.
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _run_name(value: str) -> str:
+    if not _RUN_NAME_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            "must start with a letter or digit and contain only letters, digits, "
+            "'.', '_' or '-' (max 64 characters)"
+        )
+    return value
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -313,6 +330,20 @@ Strix Cloud:
         ),
     )
 
+    parser.add_argument(
+        "--run-name",
+        dest="run_name_override",
+        type=_run_name,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Use this name for the run directory under ./strix_runs instead of a "
+            "generated one. Must start with a letter or digit and contain only "
+            "letters, digits, '.', '_' or '-' (max 64 characters). Cannot be "
+            "combined with --resume."
+        ),
+    )
+
     args = parser.parse_args()
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.
@@ -342,6 +373,12 @@ Strix Cloud:
 
     if args.update:
         sys.exit(0 if self_update() else 1)
+
+    if args.run_name_override is not None and args.resume is not None:
+        parser.error(
+            "Cannot combine --run-name with --resume. --resume reuses the prior "
+            "run's directory; --run-name names a fresh one."
+        )
 
     if args.fail_on and not args.non_interactive and terminal_attached():
         # Without a terminal main() switches to headless anyway, so the

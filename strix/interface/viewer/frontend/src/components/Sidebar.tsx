@@ -7,6 +7,7 @@ import {
   Mail,
   LogOut,
   ChevronsUpDown,
+  Plus,
 } from "lucide-react";
 import { LuGitPullRequestArrow } from "react-icons/lu";
 import { VscExtensions } from "react-icons/vsc";
@@ -36,6 +37,8 @@ const COLLAPSE_KEY = "strix_viewer_sidebar_collapsed";
 interface SidebarProps {
   view: View;
   onSelectView: (view: View) => void;
+  scanLaunchAvailable: boolean;
+  onOpenLaunch: () => void;
   issuesCount: number;
   agentCount: number;
   mcpConnections: McpConnectionStatus[];
@@ -62,6 +65,8 @@ function readInt(key: string, fallback: number): number {
 export default function Sidebar({
   view,
   onSelectView,
+  scanLaunchAvailable,
+  onOpenLaunch,
   issuesCount,
   agentCount,
   mcpConnections,
@@ -229,6 +234,15 @@ export default function Sidebar({
         {/* Navigation */}
         <nav className="relative min-w-[160px] flex-1 overflow-y-auto overflow-x-clip scrollbar-thin pb-10 pt-2">
           <div className="relative flex flex-col gap-px px-2">
+            {scanLaunchAvailable && (
+              <NavItem
+                icon={<Plus className="h-4 w-4" />}
+                label="New scan"
+                active={view === "launch"}
+                onClick={onOpenLaunch}
+                testId="sidebar-new-scan"
+              />
+            )}
             <NavItem
               icon={<ProjectsIcon />}
               label="Pentest Overview"
@@ -403,12 +417,14 @@ interface NavItemProps {
   active: boolean;
   onClick: () => void;
   count?: number;
+  testId?: string;
 }
 
-function NavItem({ icon, label, active, onClick, count }: NavItemProps) {
+function NavItem({ icon, label, active, onClick, count, testId }: NavItemProps) {
   return (
     <button
       onClick={onClick}
+      data-testid={testId}
       className={cn(
         "group flex h-9 w-full origin-left flex-row items-center rounded-md transition-colors",
         active

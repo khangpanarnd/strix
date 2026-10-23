@@ -23,11 +23,13 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from strix.core.paths import run_record_path
 from strix.interface.viewer import auth
+from strix.interface.viewer.launch_errors import LaunchError
+from strix.interface.viewer.launch_request import parse_launch_request
 from strix.interface.viewer.transcript import (
     build_run_state,
     primary_target,
@@ -40,6 +42,8 @@ from strix.interface.viewer.transcript import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from strix.interface.viewer.scan_launcher import ScanLauncher
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,12 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
     run_dirs = [child for child in base_dir.iterdir() if run_record_path(child).is_file()]
     run_dirs.sort(key=lambda child: run_record_path(child).stat().st_mtime, reverse=True)
     return run_dirs
+
+
+def _latest_run_dir(base_dir: Path) -> Path | None:
+    """The newest run under ``base_dir`` by ``run.json`` mtime, or None (DD-8)."""
+    run_dirs = _iter_run_dirs(base_dir)
+    return run_dirs[0] if run_dirs else None
 
 
 def run_list_entry(run_dir: Path) -> dict[str, Any]:
@@ -93,11 +103,15 @@ def build_runs_payload(base_dir: Path, *, unlocked: bool) -> dict[str, Any]:
     return {"locked": False, "count": count, "runs": [run_list_entry(d) for d in run_dirs]}
 
 
-def resolve_run_dir(base_dir: Path, run_param: str | None, default_run_dir: Path) -> Path | None:
+def resolve_run_dir(
+    base_dir: Path, run_param: str | None, default_run_dir: Path | None
+) -> Path | None:
     """Resolve a ``?run=`` value to a real run directory under ``base_dir``.
 
-    Returns ``default_run_dir`` when no run is requested. Rejects traversal and
-    unknown runs (returns None) so the caller can answer 404.
+    Returns ``default_run_dir`` when no run is requested (which may itself be
+    ``None`` in launch mode with no run yet, so the caller answers 404
+    ``no_run``). Rejects traversal and unknown runs (returns None) so the caller
+    can answer 404.
     """
     if not run_param:
         return default_run_dir
@@ -119,15 +133,29 @@ SESSION_COOKIE_PREFIX = "strix_viewer_session"
 class _ViewerState:
     def __init__(
         self,
-        run_dir: Path,
+        run_dir: Path | None,
+        runs_dir: Path,
         assets_dir: Path,
         steer_handler: Callable[[str, str], bool] | None = None,
+        launcher: ScanLauncher | None = None,
     ) -> None:
+        # The run the viewer was started on, or None in launch mode with no run
+        # at start. Handlers go through ``default_run()`` (DD-8), never this
+        # field directly, so a reload mid-scan lands on the newest run.
         self.run_dir = run_dir
         self.assets_dir = assets_dir
-        # The strix_runs directory that holds the launched run; used to
-        # enumerate and resolve other runs for the history list.
-        self.base_dir = run_dir.parent
+        # The strix_runs directory that holds launched runs; replaces the old
+        # ``run_dir.parent`` as the base for listing and resolving runs. Always
+        # set, even when no run exists yet (launch mode).
+        self.base_dir = runs_dir
+        self.runs_dir = runs_dir
+        # The launch service, present only in launch mode (BR-5). When None the
+        # launch/stop/status endpoints answer 403 ``launch_unavailable``.
+        self.launcher = launcher
+        # The viewer's own origin (``http://host:port``), set in ``serve()``
+        # after the socket binds (BR-2). Empty until then.
+        self.origin = ""
+        self.bound_host = ""
         # Set only when the viewer runs inside a live scan process (the TUI
         # launcher), which can deliver a message to a running agent. Absent for
         # standalone ``strix view`` / finished runs, so steering is unavailable.
@@ -144,6 +172,17 @@ class _ViewerState:
         # Finalized in ``serve()`` once the port is known (the server binds
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
         self.cookie_name = SESSION_COOKIE_PREFIX
+
+    def default_run(self) -> Path | None:
+        """The run a request resolves against when none is named (DD-8, §10a).
+
+        Returns the fixed run when the viewer was started on one; otherwise the
+        latest run at request time (so a reload mid-scan lands on the newest
+        run), or ``None`` when the workspace has no run at all.
+        """
+        if self.run_dir is not None:
+            return self.run_dir
+        return _latest_run_dir(self.runs_dir)
 
 
 def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
@@ -187,6 +226,10 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     self._handle_feedback()
                 elif path == "/api/agents/steer":
                     self._handle_steer()
+                elif path == "/api/scans":
+                    self._handle_scan_launch()
+                elif path == "/api/scans/stop":
+                    self._handle_scan_stop()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
             except BrokenPipeError:
@@ -252,9 +295,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, payload)
                 return
             if path == "/api/capabilities":
-                # Steering is only possible when the viewer shares a live scan's
-                # coordinator + event loop (the TUI launcher wires a handler).
-                self._send_json(HTTPStatus.OK, {"can_steer": state.steer_handler is not None})
+                self._send_json(HTTPStatus.OK, self._capabilities_payload())
                 return
             if path == "/api/auth/status":
                 self._handle_auth_status()
@@ -266,22 +307,40 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if not self._has_session():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
+            self._handle_authed_get(path, query)
+
+        def _handle_authed_get(self, path: str, query: dict[str, list[str]]) -> None:
+            """Session-gated GET routes: launch status/artifacts and run data."""
+            # Launch-mode status and artifact endpoints take the raw query (they
+            # resolve or ignore ``?run=`` themselves).
+            launch_routes = {
+                "/api/scans/status": self._handle_scan_status,
+                "/api/run/artifacts": self._handle_run_artifacts,
+                "/api/run/artifact": self._handle_run_artifact,
+            }
+            launch_handler = launch_routes.get(path)
+            if launch_handler is not None:
+                launch_handler(query)
+                return
 
             run_values = query.get("run")
             run_param = run_values[0] if run_values else None
-            run_dir = resolve_run_dir(state.base_dir, run_param, state.run_dir)
+            run_dir = resolve_run_dir(state.base_dir, run_param, state.default_run())
             if run_dir is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown run"})
+                # In launch mode with no run yet, or a reload before any run
+                # exists, the run-data endpoints answer 404 ``no_run`` (DD-8).
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "no_run"})
                 return
 
             # The launched run is always viewable. Any *other* run's data is part
-            # of the history: it needs this process's session capability (so
-            # merely reaching an exposed --host port is not enough) -- knowing a
-            # run name is not sufficient to leak its metadata, vulnerabilities,
-            # report, or transcript. Email verification is intentionally NOT
-            # required, matching the /api/runs list: once the list is browsable,
-            # its entries must be openable without an OTP step.
-            if run_dir.resolve() != state.run_dir.resolve() and not self._has_session():
+            # of the history: with a fixed run it needs the session capability
+            # (held above). With no fixed run (launch mode) every run requires
+            # the cookie, which a browser that opened the authorized link has.
+            if (
+                state.run_dir is not None
+                and run_dir.resolve() != state.run_dir.resolve()
+                and not self._has_session()
+            ):
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
 
@@ -372,7 +431,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unverified"})
                 return
             run_param = str(self._read_body().get("run") or "") or None
-            run_dir = resolve_run_dir(state.base_dir, run_param, state.run_dir)
+            run_dir = resolve_run_dir(state.base_dir, run_param, state.default_run())
             if run_dir is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown run"})
                 return
@@ -464,6 +523,233 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             else:
                 self._send_json(HTTPStatus.OK, {"ok": False, "error": "not_delivered"})
 
+        # Launch endpoint caps: the JSON body is at most 16 KiB (NFR-3, BR-3).
+        _LAUNCH_BODY_MAX = 16 * 1024
+
+        def _capabilities_payload(self) -> dict[str, Any]:
+            """The /api/capabilities body, unauthenticated as today (FR-3, DD-8).
+
+            ``scan_launch_available`` is true exactly in launch mode; ``initial_run``
+            is true when a run exists at this moment; ``scan_limits`` mirrors the
+            server's bounds so the form hard-codes nothing.
+            """
+            launch_available = state.launcher is not None
+            payload: dict[str, Any] = {
+                "can_steer": state.steer_handler is not None,
+                "scan_launch_available": launch_available,
+                "initial_run": state.default_run() is not None,
+                "scan_limits": None,
+            }
+            if launch_available:
+                limits = state.launcher.limits  # type: ignore[union-attr]
+                payload["scan_limits"] = {
+                    "max_budget_usd": limits.max_budget_usd,
+                    "default_budget_usd": limits.default_budget_usd,
+                    "modes": list(limits.modes),
+                    "instruction_max": limits.instruction_max,
+                }
+            return payload
+
+        def _launch_precheck(self) -> bool:
+            """Run the ordered launch gate checks a→e (section 2, BR-1..BR-3).
+
+            Returns True when every check passed and the caller may read the
+            body and proceed; otherwise it has already sent the error response.
+            Order: cookie → launch mode → Origin/Host → Content-Type →
+            Content-Length. The body is never read until all pass.
+            """
+            error = self._first_gate_error()
+            if error is None:
+                return True
+            status, code = error
+            self._send_json(status, {"error": code})
+            return False
+
+        def _first_gate_error(self) -> tuple[HTTPStatus, str] | None:
+            """The first failing launch gate as ``(status, code)``, or None if all pass."""
+            if not self._has_session():
+                return HTTPStatus.FORBIDDEN, "forbidden"
+            if state.launcher is None:
+                return HTTPStatus.FORBIDDEN, "launch_unavailable"
+            if not self._origin_ok():
+                return HTTPStatus.FORBIDDEN, "bad_origin"
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "invalid_content_type"
+            return self._content_length_error()
+
+        def _content_length_error(self) -> tuple[HTTPStatus, str] | None:
+            """Validate ``Content-Length``: 411 when missing/invalid, 413 when oversized."""
+            length = self._content_length()
+            if length is None:
+                return HTTPStatus.LENGTH_REQUIRED, "length_required"
+            if length > self._LAUNCH_BODY_MAX:
+                return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "body_too_large"
+            return None
+
+        def _content_length(self) -> int | None:
+            """The numeric ``Content-Length``, or None when missing/invalid (BR-3).
+
+            A missing length (including a chunked body, which the stdlib server
+            does not support) returns None so the caller answers 411.
+            """
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                return None
+            try:
+                value = int(raw)
+            except ValueError:
+                return None
+            return value if value >= 0 else None
+
+        def _origin_ok(self) -> bool:
+            """Enforce the Origin/Host rule (BR-2).
+
+            When ``Origin`` is present it must equal the viewer's own origin (with
+            loopback aliases accepted only when the viewer is bound to loopback).
+            When absent, ``Host`` must equal the bound ``host:port``.
+            """
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                return origin in self._acceptable_origins()
+            host = (self.headers.get("Host") or "").strip()
+            return host in self._acceptable_hosts()
+
+        def _bound_hostport(self) -> str:
+            """The viewer's bound ``host:port`` parsed from its origin."""
+            return state.origin.split("://", 1)[-1] if state.origin else ""
+
+        def _is_loopback_bind(self) -> bool:
+            return state.bound_host in ("127.0.0.1", "localhost", "::1")
+
+        def _acceptable_origins(self) -> set[str]:
+            origins = {state.origin}
+            if self._is_loopback_bind():
+                _, _, port = self._bound_hostport().partition(":")
+                suffix = f":{port}" if port else ""
+                origins |= {f"http://127.0.0.1{suffix}", f"http://localhost{suffix}"}
+            return origins
+
+        def _acceptable_hosts(self) -> set[str]:
+            hosts = {self._bound_hostport()}
+            if self._is_loopback_bind():
+                _, _, port = self._bound_hostport().partition(":")
+                suffix = f":{port}" if port else ""
+                hosts |= {f"127.0.0.1{suffix}", f"localhost{suffix}"}
+            return hosts
+
+        def _read_launch_body(self, length: int) -> Any:
+            raw = self.rfile.read(length) if length else b"{}"
+            return json.loads(raw or b"{}")
+
+        def _send_launch_error(self, exc: LaunchError) -> None:
+            headers = (
+                {"Retry-After": str(exc.extra["retry_after"])}
+                if exc.code == "rate_limited"
+                else None
+            )
+            self._send_json(HTTPStatus(exc.status), exc.to_payload(), extra_headers=headers)
+
+        def _handle_scan_launch(self) -> None:
+            """POST /api/scans — validate, rate-limit, spawn (section 2)."""
+            if not self._launch_precheck():
+                return
+            assert state.launcher is not None
+            length = self._content_length() or 0
+            try:
+                body = self._read_launch_body(length)
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                request = parse_launch_request(body, state.launcher.limits)
+                run_name = state.launcher.launch(request)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            self._send_json(HTTPStatus.ACCEPTED, {"run_name": run_name, "state": "starting"})
+
+        def _handle_scan_stop(self) -> None:
+            """POST /api/scans/stop — graceful stop of a live child (FR-27)."""
+            if not self._launch_precheck():
+                return
+            assert state.launcher is not None
+            length = self._content_length() or 0
+            try:
+                body = self._read_launch_body(length)
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            run = body.get("run") if isinstance(body, dict) else None
+            if not isinstance(run, str) or not run:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                result = state.launcher.stop(run)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            self._send_json(HTTPStatus.ACCEPTED, result)
+
+        def _handle_scan_status(self, query: dict[str, list[str]]) -> None:
+            """GET /api/scans/status?run= — status of a tracked child (session-gated)."""
+            if state.launcher is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "launch_unavailable"})
+                return
+            run_values = query.get("run")
+            run = run_values[0] if run_values else ""
+            self._send_json(HTTPStatus.OK, state.launcher.status(run))
+
+        # The four allow-listed downloadable artifacts, keyed by the fixed name
+        # the client sends; the value is never joined from client text (BR-32).
+        _ARTIFACTS: ClassVar[dict[str, str]] = {
+            "report.html": "report.html",
+            "penetration_test_report.md": "penetration_test_report.md",
+            "findings.sarif": "findings.sarif",
+            "vulnerabilities.json": "vulnerabilities.json",
+        }
+
+        def _handle_run_artifacts(self, query: dict[str, list[str]]) -> None:
+            """GET /api/run/artifacts?run= — which allow-listed files exist (BR-32)."""
+            run_dir = self._resolve_artifact_run(query)
+            if run_dir is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "no_run"})
+                return
+            available = [name for name, fn in self._ARTIFACTS.items() if (run_dir / fn).is_file()]
+            self._send_json(HTTPStatus.OK, {"available": available})
+
+        def _handle_run_artifact(self, query: dict[str, list[str]]) -> None:
+            """GET /api/run/artifact?run=&name= — stream one allow-listed file (BR-32)."""
+            run_dir = self._resolve_artifact_run(query)
+            if run_dir is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "no_run"})
+                return
+            name_values = query.get("name")
+            key = name_values[0] if name_values else ""
+            filename = self._ARTIFACTS.get(key)
+            if filename is None:
+                # Any name not in the fixed dict is 404; client text is never a path.
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            target = run_dir / filename
+            if not target.is_file():
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            content = target.read_bytes()
+            content_type, _ = mimetypes.guess_type(filename)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            self.wfile.write(content)
+
+        def _resolve_artifact_run(self, query: dict[str, list[str]]) -> Path | None:
+            """Resolve ``?run=`` through the existing run-name guard (BR-32, BR-33)."""
+            run_values = query.get("run")
+            run_param = run_values[0] if run_values else None
+            return resolve_run_dir(state.base_dir, run_param, state.default_run())
+
         def _send_relay_error(self, exc: auth.RelayError) -> None:
             status_by_code = {
                 "rate_limited": HTTPStatus.TOO_MANY_REQUESTS,
@@ -547,11 +833,19 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return None
             return candidate if candidate.is_file() else None
 
-        def _send_json(self, status: HTTPStatus, payload: Any) -> None:
+        def _send_json(
+            self,
+            status: HTTPStatus,
+            payload: Any,
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -570,12 +864,14 @@ def authorized_url(base_url: str, token: str) -> str:
 
 
 def serve(
-    run_dir: Path,
+    run_dir: Path | None,
     *,
     host: str = "127.0.0.1",
     port: int = 0,
     open_browser: bool = True,
     steer_handler: Callable[[str, str], bool] | None = None,
+    runs_dir: Path | None = None,
+    launcher: ScanLauncher | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -589,9 +885,26 @@ def serve(
     ``steer_handler`` is supplied only by the in-TUI launcher, which runs inside
     the live scan process and can forward a message to a running agent. Left
     ``None`` (standalone ``strix view``), steering is reported unavailable.
+
+    Launch mode (``strix view --launch`` / an empty workspace) passes a
+    ``launcher`` and an explicit ``runs_dir``, and may pass ``run_dir=None``
+    when there is no run to start on. Existing callers keep passing a concrete
+    ``run_dir`` and nothing else; ``runs_dir`` then defaults to its parent so
+    their behaviour is unchanged (DD-8).
     """
+    if runs_dir is None:
+        if run_dir is None:
+            raise ValueError("serve() needs either run_dir or runs_dir")
+        runs_dir = run_dir.parent
+
     assets_dir = bundle_dir()
-    state = _ViewerState(run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler)
+    state = _ViewerState(
+        run_dir=run_dir,
+        runs_dir=runs_dir,
+        assets_dir=assets_dir,
+        steer_handler=steer_handler,
+        launcher=launcher,
+    )
     handler = _make_handler(state)
 
     try:
@@ -606,6 +919,9 @@ def serve(
     bound_port = int(httpd.server_address[1])
     state.cookie_name = f"{SESSION_COOKIE_PREFIX}_{bound_port}"
     url = f"http://{host}:{bound_port}"
+    # Record the bound origin so the Origin/Host check (BR-2) has the truth.
+    state.origin = url
+    state.bound_host = host
 
     thread = threading.Thread(target=httpd.serve_forever, name="strix-viewer", daemon=True)
     thread.start()

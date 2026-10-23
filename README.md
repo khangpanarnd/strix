@@ -206,6 +206,23 @@ The dashboard shows the findings, a live map of the agent team, and past runs. N
 
 See the [viewer documentation](https://docs.strix.ai/usage/viewer) for the options and for reaching the viewer from another machine.
 
+### Launch a Scan from the Viewer
+
+The viewer can also start scans, so you can go from a URL to the findings without the command line:
+
+```bash
+# Start the viewer in launch mode (this is also what plain `strix view` does when there are no runs yet)
+strix view --launch
+```
+
+Open the printed link, choose **New scan**, enter a URL, domain, or IP address, pick a scan mode and a budget, tick **I am authorized to test this target**, and press **Start scan**. The viewer starts a headless `strix -n` scan on the same machine, opens the live run, and lets you **Stop** it and download the report (HTML, Markdown, SARIF, JSON). Docker and your LLM settings must already be configured, exactly as for the CLI.
+
+- Only one scan runs at a time. A scan counts as running if the viewer started it, or if another run's `run.json` says `running` and was updated in the last 5 minutes (`STRIX_VIEWER_ACTIVE_WINDOW_SECONDS` changes this).
+- The budget cap is required (default 5 USD, maximum 50 USD; `STRIX_VIEWER_MAX_BUDGET_USD` changes the maximum).
+- Private and loopback targets (for example `http://localhost:3000`) are blocked unless you tick **Allow private/loopback targets**. Cloud-metadata addresses are always blocked.
+- Stopping the viewer (Ctrl-C) also stops a scan it started. If the viewer is killed without a chance to clean up, the scan can keep running.
+- Anyone who holds the viewer link can start scans that spend your LLM budget. Keep it on `127.0.0.1` unless you trust everyone who can reach the port.
+
 ---
 
 ## Usage Examples
