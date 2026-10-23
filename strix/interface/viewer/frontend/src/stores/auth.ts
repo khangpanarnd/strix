@@ -1,6 +1,5 @@
 // Local stub of the strix-app auth store. The local viewer has no accounts:
-// there is never a signed-in user and no feature is entitled, so every upsell
-// CTA routes to the external cloud sign-up link.
+// there is never a signed-in user and no feature is entitled.
 interface AuthState {
   user: null;
   hasFeature: (feature: string) => boolean;

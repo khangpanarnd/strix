@@ -209,6 +209,7 @@ This fork tracks upstream Strix and adds a few things on top of it:
 - **Past runs without email verification** - the viewer's run history opens directly; email verification is only needed if you choose to email a report.
 - **Launch scans from the browser** - `strix view --launch` adds a **New scan** form with target safety checks, a budget cap, Stop, and report downloads (see [Launch a Scan from the Viewer](#launch-a-scan-from-the-viewer)).
 - **`--run-name`** - choose the run directory name for a headless scan, so automation knows where results land.
+- **A local-only viewer UI** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
 
 ---
 

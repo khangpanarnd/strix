@@ -470,20 +470,6 @@ export async function steerAgent(agentId: string, message: string): Promise<Stee
   return { ok: false, error: String(data.error ?? "unavailable") };
 }
 
-export type SubmitFeedbackResult = { ok: true } | { ok: false; error: string };
-
-/**
- * POST /api/feedback. Sends a feedback message plus a work email (no
- * verification) to the local server, which relays it to Strix.
- */
-export async function submitFeedback(
-  message: string,
-  email: string
-): Promise<SubmitFeedbackResult> {
-  const { ok, data } = await postJson("/api/feedback", { message, email });
-  if (ok && data.ok === true) return { ok: true };
-  return { ok: false, error: String(data.error ?? "unavailable") };
-}
 
 export async function fetchAuthStatus(): Promise<AuthStatus> {
   const obj = (await getJson("/api/auth/status")) as Partial<AuthStatus>;
