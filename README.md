@@ -94,6 +94,20 @@ strix --target ./app-directory
 > [!NOTE]
 > First run automatically pulls the sandbox Docker image. Results are saved to `strix_runs/<run-name>`
 
+### What a Scan Produces
+
+Every scan writes its results to `strix_runs/<run-name>/` as it runs, so you can open them before the scan finishes:
+
+| File | Contents |
+|------|----------|
+| `penetration_test_report.md` | The final report |
+| `vulnerabilities/*.md` and `vulnerabilities.json` | One file per finding, plus all findings as JSON |
+| `findings.sarif` | The same findings as SARIF 2.1.0, for code-scanning tools |
+| `report.html` | A single self-contained HTML report with a severity summary and every finding in detail (no external assets, safe to email or archive). Turn it off with `STRIX_HTML_REPORT=0`. |
+| `run.json` | Run status, targets, timing and LLM usage |
+
+Browse any of it in the browser with `strix view` (see Local Web Viewer below).
+
 ### Updating
 
 ```bash
@@ -187,6 +201,17 @@ Advanced multi-agent orchestration for comprehensive automated penetration testi
 
 ---
 
+## 🧩 What This Fork Adds
+
+This fork tracks upstream Strix and adds a few things on top of it:
+
+- **Self-contained HTML report** - every scan also writes `report.html` next to the Markdown, JSON and SARIF outputs (see [What a Scan Produces](#what-a-scan-produces)). Disable with `STRIX_HTML_REPORT=0`.
+- **Past runs without email verification** - the viewer's run history opens directly; email verification is only needed if you choose to email a report.
+- **Launch scans from the browser** - `strix view --launch` adds a **New scan** form with target safety checks, a budget cap, Stop, and report downloads (see [Launch a Scan from the Viewer](#launch-a-scan-from-the-viewer)).
+- **`--run-name`** - choose the run directory name for a headless scan, so automation knows where results land.
+
+---
+
 ## 🖥️ Local Web Viewer
 
 Every scan writes its results to disk as it runs. Bring them up in a local dashboard with a single command:
@@ -202,7 +227,15 @@ strix view my-run-name
 strix view --host 0.0.0.0 --port 8080 --no-open
 ```
 
-The dashboard shows the findings, a live map of the agent team, and past runs. Nothing leaves your machine, and the UI ships prebuilt. `strix view` binds to `127.0.0.1` and prints a tokened link that grants access to the run, so share it carefully.
+The dashboard gives you:
+
+- **Findings** - every issue with severity, description, proof of concept and remediation, updating live while the scan runs.
+- **Agents** - a live map of the agent team and each agent's transcript.
+- **Past runs** - every run under `strix_runs/` in one list, openable with one click. No email verification is needed to browse them.
+- **Report downloads** - the HTML, Markdown, SARIF and JSON report files, whenever they exist for the run.
+- **New scan** - start a scan from the browser (below).
+
+Nothing leaves your machine, and the UI ships prebuilt. `strix view` binds to `127.0.0.1` and prints a tokened link that grants access to the run, so share it carefully. Every run-data and scan-control endpoint requires the session cookie that link sets.
 
 See the [viewer documentation](https://docs.strix.ai/usage/viewer) for the options and for reaching the viewer from another machine.
 
@@ -274,6 +307,9 @@ Run Strix programmatically without interactive UI using the `-n/--non-interactiv
 
 ```bash
 strix -n --target https://your-app.com
+
+# Choose the run name yourself, so scripts know where the results land (strix_runs/nightly-staging)
+strix -n --target https://staging.example.com --run-name nightly-staging
 ```
 
 ### CI/CD (GitHub Actions)
