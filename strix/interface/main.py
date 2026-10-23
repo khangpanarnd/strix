@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -427,6 +428,23 @@ def _force_utf8_streams() -> None:
             reconfigure(encoding="utf-8")
 
 
+def _install_windows_break_handler() -> None:
+    """Make a Windows break event behave like Ctrl-C for the headless scan.
+
+    A child launched in a new process group ignores Ctrl-C, so the viewer stops
+    it with CTRL_BREAK_EVENT. Without this handler that event ends the process
+    immediately with no cleanup; installing ``default_int_handler`` turns it
+    into a ``KeyboardInterrupt``, the same path Ctrl-C takes, so the run is
+    recorded as interrupted (DD-2). Inert on POSIX and unless a break arrives.
+    """
+    if sys.platform != "win32":
+        return
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is None:
+        return
+    signal.signal(sigbreak, signal.default_int_handler)
+
+
 def main() -> None:
     if sys.platform == "win32":
         _force_utf8_streams()
@@ -500,6 +518,7 @@ def main() -> None:
         if args.non_interactive:
             from strix.interface.cli import run_cli
 
+            _install_windows_break_handler()
             asyncio.run(run_cli(args))
             # Headless runs have no user to quit: the agent either finished
             # (already beaconed as finished_by_tool) or stopped on its own.

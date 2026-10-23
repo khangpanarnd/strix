@@ -35,6 +35,7 @@ import {
   type AuthStatus,
   type LoadedRun,
   type RunsPayload,
+  type ScanLimits,
 } from "@/data/serverSource";
 import { SIGNUP_URL, DEMO_URL, ctaUrl, trackCta } from "@/lib/cta";
 import { runTitle } from "@/lib/target-utils";
@@ -45,8 +46,11 @@ import { RunDetails } from "@/components/RunDetails";
 import { TrustToast } from "@/components/TrustToast";
 import FeedbackView from "@/components/FeedbackView";
 import { ProInlineCta } from "@/components/ProCta";
+import { LaunchView } from "@/components/launch/LaunchView";
+import { StopScanButton } from "@/components/launch/StopScanButton";
+import { ReportDownloads } from "@/components/launch/ReportDownloads";
 
-export type View = "overview" | "issues" | "agents" | "history" | "email" | "feedback";
+export type View = "overview" | "issues" | "agents" | "history" | "email" | "feedback" | "launch";
 
 const TRUST_BANNER =
   "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by Strix.";
@@ -67,6 +71,16 @@ export default function App() {
   // Whether this viewer can steer a live scan (true only inside the in-TUI
   // launcher that shares the running scan's coordinator + event loop).
   const [canSteer, setCanSteer] = useState(false);
+  // Launch mode: whether the New-scan affordance is available, the limits the
+  // form reads, and whether a run exists at all. `initialRun === false` tells
+  // us NOT to start the run-poll loop (it would 404 every 500 ms) and to open
+  // the launch view instead.
+  const [scanLaunchAvailable, setScanLaunchAvailable] = useState(false);
+  const [scanLimits, setScanLimits] = useState<ScanLimits | null>(null);
+  const [initialRun, setInitialRun] = useState(true);
+  // Resolved once capabilities land, so the no-run guard only fires after we
+  // actually know whether a run exists.
+  const [capsLoaded, setCapsLoaded] = useState(false);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -89,10 +103,21 @@ export default function App() {
     void refreshRuns();
     // Capabilities never change over a session, so fetch once on mount.
     fetchCapabilities()
-      .then((caps) => setCanSteer(caps.can_steer))
+      .then((caps) => {
+        setCanSteer(caps.can_steer);
+        setScanLaunchAvailable(caps.scan_launch_available);
+        setScanLimits(caps.scan_limits);
+        setInitialRun(caps.initial_run);
+        // Empty workspace in launch mode: open the launch view straight away
+        // rather than spinning on a run that does not exist yet.
+        if (caps.scan_launch_available && !caps.initial_run) {
+          setView("launch");
+        }
+      })
       .catch(() => {
         /* absence of steering is the safe default */
-      });
+      })
+      .finally(() => setCapsLoaded(true));
   }, [refreshAuth, refreshRuns]);
 
   // Live polling, scoped to the active run. Re-runs when the active run changes
@@ -100,6 +125,12 @@ export default function App() {
   // does a single full fetch and stops.
   const finishedRef = useRef(false);
   useEffect(() => {
+    // Wait until capabilities resolve so the no-run guard below is accurate.
+    if (!capsLoaded) return;
+    // Launch mode with an empty workspace: no run to poll. Starting the loop
+    // here would 404 every 500 ms; the launch view is shown instead.
+    if (activeRun === null && !initialRun) return;
+
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     finishedRef.current = false;
@@ -161,7 +192,7 @@ export default function App() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [activeRun]);
+  }, [activeRun, capsLoaded, initialRun]);
 
   const counts = useMemo(
     () => (run ? severityCounts(run.vulnerabilities) : null),
@@ -232,6 +263,23 @@ export default function App() {
     initialViewAppliedRef.current = false;
   }, []);
 
+  // Open the launch form (Sidebar "New scan"). The active run, if any, is left
+  // untouched until a launch actually succeeds.
+  const openLaunch = useCallback(() => {
+    userSetView("launch");
+  }, [userSetView]);
+
+  // A launch succeeded and the new run is watchable: select it and land on the
+  // overview, which immediately picks up the live-run defaults (Agents once
+  // agents appear). selectRun resets activeRun, which restarts the poll loop.
+  const onLaunched = useCallback(
+    (runName: string) => {
+      selectRun(runName);
+      userSetView("overview");
+    },
+    [selectRun, userSetView]
+  );
+
   const goEmail = useCallback((skipDisclosure: boolean, surface: string) => {
     trackCta("email_report", surface);
     setEmailPurpose("report");
@@ -272,6 +320,8 @@ export default function App() {
           if (v === "history") openHistory();
           else userSetView(v);
         }}
+        scanLaunchAvailable={scanLaunchAvailable}
+        onOpenLaunch={openLaunch}
         issuesCount={run?.vulnerabilities.length ?? 0}
         agentCount={agentCount}
         mcpConnections={mcpConnections}
@@ -301,6 +351,12 @@ export default function App() {
               <div className="text-base text-white font-medium tracking-tight">Strix</div>
             </a>
             {run && <LiveIndicator finished={run.finished} />}
+            {activeRun && run && !run.finished && (
+              <StopScanButton runName={activeRun} finished={run.finished} />
+            )}
+            {activeRun && run && run.finished && (
+              <ReportDownloads runName={activeRun} finished={run.finished} />
+            )}
             <div className="ml-auto flex items-center gap-3">
               {verified && runs && !runs.locked && runs.runs.length > 0 && (
                 <RunSwitcher
@@ -325,7 +381,7 @@ export default function App() {
         </div>
 
         <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "history" && view !== "email" && (
+          {error && !run && view !== "history" && view !== "email" && view !== "launch" && (
             <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
               <p className="text-sm text-red-300">{error}</p>
@@ -338,7 +394,21 @@ export default function App() {
             key={`${activeRun ?? "launched"}:${view}:${selectedId ?? ""}`}
             className="animate-page-in space-y-6"
           >
-          {view === "email" ? (
+          {view === "launch" ? (
+            scanLimits ? (
+              <LaunchView
+                limits={scanLimits}
+                onLaunched={onLaunched}
+                onOpenRun={selectRun}
+              />
+            ) : (
+              <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
+                <p className="text-sm text-[#888]">
+                  Launching scans is not available in this viewer.
+                </p>
+              </div>
+            )
+          ) : view === "email" ? (
             <EmailReportView
               activeRun={activeRun}
               auth={auth}

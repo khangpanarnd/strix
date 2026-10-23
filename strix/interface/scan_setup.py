@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from strix.config import Settings, codex, load_settings
-from strix.core.paths import run_dir_for
+from strix.core.paths import RUNS_DIR_NAME, run_dir_for
 from strix.interface.utils import (
     assign_workspace_subdirs,
     clone_repository,
@@ -243,7 +243,18 @@ def prepare_run(args: argparse.Namespace) -> None:
     user has supplied a target via ``/target``). Mutates *args* in place and
     raises :class:`ValueError` on any preparation failure.
     """
-    args.run_name = args.resume or generate_run_name(args.targets_info)
+    run_name_override = getattr(args, "run_name_override", None)
+    if run_name_override:
+        # A caller-chosen name must not collide with an existing run directory,
+        # otherwise the new run would write over another run's artifacts.
+        if run_dir_for(run_name_override).exists():
+            raise ValueError(
+                f"Run name '{run_name_override}' already exists under "
+                f"./{RUNS_DIR_NAME}. Pick a different --run-name."
+            )
+        args.run_name = run_name_override
+    else:
+        args.run_name = args.resume or generate_run_name(args.targets_info)
 
     if args.resume:
         return
