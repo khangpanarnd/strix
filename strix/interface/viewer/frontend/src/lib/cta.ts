@@ -22,7 +22,3 @@ export function track(event: string, props: Record<string, string | undefined> =
   }
 }
 
-// Anonymous usage tracking for a UI action. `surface` records where it happened.
-export function trackCta(cta: string, surface?: string): void {
-  track("cta_clicked", { cta, surface });
-}

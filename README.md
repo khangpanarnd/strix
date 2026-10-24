@@ -206,10 +206,10 @@ Advanced multi-agent orchestration for comprehensive automated penetration testi
 This fork tracks upstream Strix and adds a few things on top of it:
 
 - **Self-contained HTML report** - every scan also writes `report.html` next to the Markdown, JSON and SARIF outputs (see [What a Scan Produces](#what-a-scan-produces)). Disable with `STRIX_HTML_REPORT=0`.
-- **Past runs without email verification** - the viewer's run history opens directly; email verification is only needed if you choose to email a report.
+- **Past runs without email verification** - the viewer's run history opens directly. The email / encrypted-PDF export is removed from the UI, so there is no email step anywhere in the viewer.
 - **Launch scans from the browser** - `strix view --launch` adds a **New scan** form with target safety checks, a budget cap, Stop, and report downloads (see [Launch a Scan from the Viewer](#launch-a-scan-from-the-viewer)).
 - **`--run-name`** - choose the run directory name for a headless scan, so automation knows where results land.
-- **A local-only viewer UI** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
+- **A local-only viewer UI branded "PRDCV Strix Agents"** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
 
 ---
 
@@ -232,7 +232,7 @@ The dashboard gives you:
 
 - **Findings** - every issue with severity, description, proof of concept and remediation, updating live while the scan runs.
 - **Agents** - a live map of the agent team and each agent's transcript.
-- **Past runs** - every run under `strix_runs/` in one list, openable with one click. No email verification is needed to browse them.
+- **Past runs** - every run under `strix_runs/` in one list, openable with one click.
 - **Report downloads** - the HTML, Markdown, SARIF and JSON report files, whenever they exist for the run.
 - **New scan** - start a scan from the browser (below).
 

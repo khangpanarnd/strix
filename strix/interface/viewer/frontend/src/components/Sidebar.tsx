@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Bot, History, Mail, LogOut, Plus } from "lucide-react";
+import React, { useCallback, useEffect, useState } from "react";
+import { AlertTriangle, Bot, History, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpConnectionStatus } from "@/data/serverSource";
 import type { View } from "@/App";
@@ -30,12 +30,7 @@ interface SidebarProps {
   mcpConnections: McpConnectionStatus[];
   mcpInUse: Set<string>;
   runCount: number;
-  finished: boolean;
-  verified: boolean;
-  email: string | null;
-  onOpenEmail: () => void;
   onOpenHistory: () => void;
-  onForget: () => void;
 }
 
 function readInt(key: string, fallback: number): number {
@@ -58,12 +53,7 @@ export default function Sidebar({
   mcpConnections,
   mcpInUse,
   runCount,
-  finished,
-  verified,
-  email,
-  onOpenEmail,
   onOpenHistory,
-  onForget,
 }: SidebarProps) {
   const [width, setWidth] = useState(() => {
     const w = readInt(WIDTH_KEY, DEFAULT_WIDTH);
@@ -77,8 +67,7 @@ export default function Sidebar({
     }
   });
   const [isResizing, setIsResizing] = useState(false);
-  const [showUserMenu, setShowUserMenu] = useState(false);
-  const userMenuRef = useRef<HTMLDivElement>(null);
+
 
   const persistWidth = useCallback((w: number) => {
     setWidth(w);
@@ -140,17 +129,6 @@ export default function Sidebar({
     };
   }, [isResizing, collapsed, persistCollapsed, persistWidth]);
 
-  // Close the user menu when clicking outside it.
-  useEffect(() => {
-    if (!showUserMenu) return;
-    const onDown = (e: MouseEvent) => {
-      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
-        setShowUserMenu(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [showUserMenu]);
 
   return (
     <>
@@ -182,7 +160,7 @@ export default function Sidebar({
                   <span className="text-[10px] font-semibold text-white">S</span>
                 </span>
                 <span className="flex flex-1 flex-row items-center gap-2 min-w-0">
-                  <span className="truncate min-w-0 text-[14px] font-medium text-[#ededed]">Strix</span>
+                  <span className="truncate min-w-0 text-[14px] font-medium text-[#ededed]">PRDCV Strix Agents</span>
                   <span className="flex h-5 flex-shrink-0 items-center rounded px-2 text-[11px] font-medium text-[#888] bg-[rgba(255,255,255,0.08)]">
                     Local
                   </span>
@@ -236,70 +214,24 @@ export default function Sidebar({
               active={view === "history"}
               onClick={onOpenHistory}
             />
-            {finished && (
-              <NavItem
-                icon={<Mail className="h-4 w-4" />}
-                label="Export report"
-                active={view === "email"}
-                onClick={onOpenEmail}
-              />
-            )}
+
           </div>
         </nav>
 
-        {/* User footer — verified-email footer. */}
-        <section className="flex min-w-[160px] flex-col gap-0.5" ref={userMenuRef}>
-          <div className="relative p-2">
-            {verified && email ? (
-              <button
-                onClick={() => setShowUserMenu((v) => !v)}
-                className="relative flex w-full cursor-pointer items-center gap-2 rounded-md bg-transparent px-2.5 py-2 transition-colors hover:bg-[rgba(255,255,255,0.06)]"
+        {/* Footer: this viewer has no accounts. */}
+        <section className="flex min-w-[160px] flex-col gap-0.5">
+          <div className="p-2">
+            <div className="flex items-center gap-2 rounded-md px-2.5 py-2">
+              <span
+                className="flex flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500"
+                style={{ width: 20, height: 20 }}
               >
-                <span
-                  className="flex flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500"
-                  style={{ width: 20, height: 20 }}
-                >
-                  <span className="text-[9px] font-semibold text-white">
-                    {email[0]?.toUpperCase() || "U"}
-                  </span>
-                </span>
-                <span className="flex min-w-0 flex-1 flex-col text-left">
-                  <span className="truncate text-[13px] font-medium text-[#ededed]">{email}</span>
-                  <span className="truncate text-[11px] text-[#555]">Linked to this machine</span>
-                </span>
-              </button>
-            ) : (
-              <div className="flex items-center gap-2 rounded-md px-2.5 py-2">
-                <span
-                  className="flex flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500"
-                  style={{ width: 20, height: 20 }}
-                >
-                  <span className="text-[9px] font-semibold text-white">S</span>
-                </span>
-                <span className="flex min-w-0 flex-1 flex-col text-left">
-                  <span className="truncate text-[13px] font-medium text-[#ededed]">Local viewer</span>
-                </span>
-              </div>
-            )}
-
-            {showUserMenu && verified && email && (
-              <div className="absolute bottom-full left-2 right-2 z-50 mb-1 overflow-hidden rounded-lg border border-[#333] bg-black shadow-xl">
-                <div className="border-b border-[#333] px-3 py-2">
-                  <p className="truncate text-[13px] font-medium text-white">Linked email</p>
-                  <p className="truncate text-[11px] text-[#666]">{email}</p>
-                </div>
-                <button
-                  onClick={() => {
-                    setShowUserMenu(false);
-                    onForget();
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-[#888] transition-colors hover:bg-[rgba(255,255,255,0.06)] hover:text-red-400"
-                >
-                  <LogOut className="h-4 w-4" />
-                  Forget this email
-                </button>
-              </div>
-            )}
+                <span className="text-[9px] font-semibold text-white">S</span>
+              </span>
+              <span className="flex min-w-0 flex-1 flex-col text-left">
+                <span className="truncate text-[13px] font-medium text-[#ededed]">Local viewer</span>
+              </span>
+            </div>
           </div>
         </section>
 
