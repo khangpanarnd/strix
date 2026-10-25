@@ -22,6 +22,8 @@ from strix.core.paths import (
     runs_base_dir,
 )
 from strix.interface.viewer.launch_request import LaunchLimits
+from strix.interface.viewer.llm_connection_test import ConnectionTester
+from strix.interface.viewer.llm_settings import SettingsStore
 from strix.interface.viewer.scan_launcher import ScanLauncher
 from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
 from strix.interface.viewer.transcript import read_run_summary
@@ -100,12 +102,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> None:
-    """Serve a fixed run exactly as before (``--launch`` absent, a run exists)."""
+    """Serve a fixed run (``--launch`` absent, a run exists), plus the settings page.
+
+    The settings page works whenever the viewer runs (Step 6.1), so a store and
+    tester are built here too; fixed-run mode has no launcher, so ``scan_active``
+    is always false for this viewer.
+    """
+    settings_store = SettingsStore()
+    connection_tester = ConnectionTester()
     httpd, url, token = serve(
         run_dir,
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
+        settings_store=settings_store,
+        connection_tester=connection_tester,
     )
     open_url = authorized_url(url, token)
 
@@ -123,14 +134,24 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
     console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
     console.print()
 
-    _run_forever(console, httpd, launcher=None)
+    _run_forever(console, httpd, launcher=None, connection_tester=connection_tester)
 
 
 def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
     """Serve the launch form (FR-1, FR-2); build a launcher and clean up its children."""
     runs_dir = runs_base_dir()
     runs_dir.mkdir(parents=True, exist_ok=True)
-    launcher = ScanLauncher(runs_dir, LaunchLimits.from_env())
+    # Built once and shared: the store's hooks feed the launcher so a save
+    # between two launches is seen by the next spawn with no restart (FR-17,
+    # NFR-5), and the same store/tester back the settings page (Step 6.1).
+    settings_store = SettingsStore()
+    connection_tester = ConnectionTester()
+    launcher = ScanLauncher(
+        runs_dir,
+        LaunchLimits.from_env(),
+        child_env_builder=settings_store.child_env,
+        pre_launch_check=settings_store.pre_launch_check,
+    )
 
     httpd, url, token = serve(
         None,
@@ -139,6 +160,8 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         open_browser=not args.no_open,
         runs_dir=runs_dir,
         launcher=launcher,
+        settings_store=settings_store,
+        connection_tester=connection_tester,
     )
     open_url = authorized_url(url, token)
 
@@ -159,16 +182,29 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         )
     console.print()
 
-    _run_forever(console, httpd, launcher=launcher)
+    _run_forever(console, httpd, launcher=launcher, connection_tester=connection_tester)
 
 
 def _run_forever(
-    console: Console, httpd: ThreadingHTTPServer, *, launcher: ScanLauncher | None
+    console: Console,
+    httpd: ThreadingHTTPServer,
+    *,
+    launcher: ScanLauncher | None,
+    connection_tester: ConnectionTester | None = None,
 ) -> None:
     """Block until Ctrl-C, then stop launched children before the server stops.
 
     The launcher is shut down first (FR-28) so every child it started receives
     the graceful-then-force sequence before the HTTP server is torn down.
+
+    A connection test in flight is handled by the tester itself: it runs one
+    child at a time under a 90-second hard wall-clock limit and kills the whole
+    process tree on expiry (BR-31), and the child is spawned with
+    ``start_new_session`` / a new process group so it is not tied to this
+    process. ``ConnectionTester`` exposes no ``close()``/``shutdown()`` (it owns
+    no long-lived resource between tests), so there is nothing to stop here
+    beyond letting that bounded test finish; the parameter is accepted to make
+    the ownership explicit and to give a future tester-shutdown a wiring point.
     """
     try:
         while True:
@@ -178,6 +214,7 @@ def _run_forever(
     finally:
         if launcher is not None:
             launcher.shutdown()
+        _ = connection_tester  # no shutdown hook today; see the docstring.
         httpd.shutdown()
         httpd.server_close()
 

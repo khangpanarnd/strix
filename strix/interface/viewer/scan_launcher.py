@@ -174,6 +174,8 @@ class ScanLauncher:
         classifier: Classifier | None = None,
         kill_tree: Callable[[PopenLike], None] | None = None,
         environ: Mapping[str, str] | None = None,
+        child_env_builder: Callable[[Mapping[str, str]], Mapping[str, str]] | None = None,
+        pre_launch_check: Callable[[], None] | None = None,
     ) -> None:
         self._runs_dir = runs_dir
         self._limits = limits
@@ -183,6 +185,12 @@ class ScanLauncher:
         self._classifier = classifier
         self._kill_tree = kill_tree or _default_kill_tree
         self._environ = dict(environ) if environ is not None else dict(os.environ)
+        # The settings store hands us these at wiring time (cli.py). ``child_env_builder``
+        # is evaluated at EACH spawn (FR-17) so a save between two launches is seen by
+        # the next one with no restart; ``pre_launch_check`` runs the managed base-URL
+        # DNS-rebinding guard (DD-9/BR-36) before any lock or rate-limit side effect.
+        self._child_env_builder = child_env_builder
+        self._pre_launch_check = pre_launch_check
 
         self._children: dict[str, ScanChild] = {}
         self._lock = threading.Lock()
@@ -205,7 +213,26 @@ class ScanLauncher:
         under the lock, and the child is registered *before* the lock is
         released, so a second request waiting on the lock sees it even though
         its ``run.json`` does not exist yet (FR-24).
+
+        Order chosen for ``pre_launch_check`` (the managed base-URL rebinding
+        guard, DD-9/BR-36): it runs *first*, before the rate limit is consumed
+        and before the launch lock is taken. A request that is refused for a
+        blocked base therefore does not burn a rate slot and never holds the
+        lock across its 3-second DNS bound. Any :class:`LaunchError` it raises
+        propagates unchanged. It is called exactly once per ``launch`` and not
+        at all for a request rejected earlier (the rate-limit 429), because that
+        rejection happens after this point.
+
+        Lock order: the launch lock (``self._lock``) is the OUTER lock; the
+        settings-store lock, taken inside ``child_env_builder`` during
+        ``_spawn``, is the INNER lock. The store never takes the launch lock
+        (BR-35), so the two can never deadlock.
         """
+        if self._pre_launch_check is not None:
+            # Runs before any side effect (rate limit, lock) so a blocked base
+            # neither consumes a slot nor holds the lock; LaunchError propagates.
+            self._pre_launch_check()
+
         self._record_attempt()
 
         validated = validate_target(
@@ -216,6 +243,10 @@ class ScanLauncher:
         )
 
         with self._lock:
+            # Lock order: this launch lock is OUTER. ``_spawn`` below calls the
+            # child-env builder, which takes the settings-store lock (INNER). The
+            # store never acquires this launch lock, so the nesting is deadlock-free
+            # (BR-35).
             active = self._active_run_locked()
             if active is not None:
                 raise LaunchError(
@@ -242,7 +273,37 @@ class ScanLauncher:
         return run_name
 
     def _spawn(self, run_name: str, target: str, request: LaunchRequest) -> ScanChild:
-        """Build the argv and start the child; raise ``spawn_failed`` on OS refusal."""
+        """Build the argv and start the child; raise ``spawn_failed`` on OS refusal.
+
+        The child's environment is taken from ``child_env_builder`` when one was
+        supplied, evaluated here at *every* spawn (never from a start-up snapshot)
+        so a settings save between two launches is picked up by the next one with
+        no restart (FR-17). The builder is called with ``os.environ`` read now, and
+        it takes the settings-store lock (the INNER lock; this runs while the launch
+        lock is held — see ``launch`` for the order).
+
+        Builder-exception decision: a builder failure FAILS the launch with
+        ``spawn_failed`` rather than falling back to the raw viewer environment.
+        For a managed launch the builder is what strips the viewer's own LLM
+        secrets from the child (FR-16); silently using the unstripped environment
+        would leak exactly what the strip set is meant to remove, so refusing is
+        the safe choice.
+        """
+        if self._child_env_builder is not None:
+            try:
+                env: Mapping[str, str] = dict(self._child_env_builder(os.environ))
+            except LaunchError:
+                # A LaunchError from the store (e.g. config_unreadable) already
+                # carries a stable code/status; let it surface unchanged.
+                raise
+            except Exception as exc:
+                raise LaunchError(
+                    "spawn_failed",
+                    "the scan environment could not be prepared",
+                    status=500,
+                ) from exc
+        else:
+            env = self._environ
         argv = self._build_argv(run_name, target, request)
         try:
             process = self._popen(
@@ -252,7 +313,7 @@ class ScanLauncher:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 shell=False,
-                env=self._environ,
+                env=env,
                 text=True,
                 **_process_group_kwargs(),
             )

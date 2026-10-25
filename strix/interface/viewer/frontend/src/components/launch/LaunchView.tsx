@@ -37,15 +37,37 @@ export interface LaunchViewProps {
   onLaunched: (runName: string) => void;
   /** Open an already-running scan (the scan_active 409 path). */
   onOpenRun: (runName: string) => void;
+  /**
+   * Open the LLM Settings page. Present only when the Settings page is
+   * available; the launch error card links to it when the failure is
+   * `llm_base_blocked` or the message indicates a missing key or model (FR-37).
+   */
+  onOpenSettings?: () => void;
 }
 
-export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
+/**
+ * Heuristic for whether a launch failure should offer an "Open Settings" link:
+ * the pre-launch base block (`llm_base_blocked`), or a failure whose text names
+ * a missing API key or model (frontend-components §LaunchView link, BR-37).
+ */
+function failureSuggestsSettings(code: string | null, message: string | null): boolean {
+  if (code === "llm_base_blocked") return true;
+  const text = (message ?? "").toLowerCase();
+  if (!text) return false;
+  const mentionsKey = text.includes("api key") || text.includes("api_key") || text.includes("no key");
+  const mentionsModel = text.includes("no model") || text.includes("model is not set") || text.includes("missing model");
+  return mentionsKey || mentionsModel;
+}
+
+export function LaunchView({ limits, onLaunched, onOpenRun, onOpenSettings }: LaunchViewProps) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [banner, setBanner] = useState<string | null>(null);
   const [conflict, setConflict] = useState<string | null>(null);
   const [errorTail, setErrorTail] = useState<string | null>(null);
   const [tookTooLong, setTookTooLong] = useState(false);
+  // Set when a launch failure should link to Settings (see failureSuggestsSettings).
+  const [settingsHint, setSettingsHint] = useState(false);
 
   // The run name being started (only set in `starting`/`failed`).
   const [runName, setRunName] = useState<string | null>(null);
@@ -59,6 +81,7 @@ export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
       setBanner(null);
       setConflict(null);
       setErrorTail(null);
+      setSettingsHint(false);
       setLastValues(values);
       try {
         const { run_name } = await launchScan(values);
@@ -77,6 +100,7 @@ export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
             setFieldErrors({ [field]: err.message });
           } else {
             setBanner(err.message);
+            if (failureSuggestsSettings(err.code, err.message)) setSettingsHint(true);
           }
           setPhase("idle");
           return;
@@ -106,6 +130,7 @@ export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
 
       if (status.state === "failed") {
         setErrorTail(status.error_tail);
+        setSettingsHint(failureSuggestsSettings(null, status.error_tail));
         setPhase("failed");
         return;
       }
@@ -161,6 +186,7 @@ export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
           onCancel={handleCancel}
           onOpenRun={() => runName && onOpenRun(runName)}
           onEditAndRetry={handleEditAndRetry}
+          onOpenSettings={settingsHint && onOpenSettings ? onOpenSettings : undefined}
         />
       </div>
     );
@@ -196,7 +222,19 @@ export function LaunchView({ limits, onLaunched, onOpenRun }: LaunchViewProps) {
           className="flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3"
         >
           <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-400" aria-hidden="true" />
-          <p className="text-sm text-red-300">{banner}</p>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm text-red-300">{banner}</p>
+            {settingsHint && onOpenSettings && (
+              <button
+                type="button"
+                data-testid="launch-open-settings-button"
+                onClick={onOpenSettings}
+                className="mt-2 inline-flex items-center rounded-md border border-red-500/40 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:border-red-400 hover:text-white"
+              >
+                Open Settings
+              </button>
+            )}
+          </div>
         </div>
       )}
 

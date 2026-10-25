@@ -19,7 +19,9 @@ import logging
 import mimetypes
 import secrets
 import threading
+import time
 import webbrowser
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +45,8 @@ from strix.interface.viewer.transcript import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from strix.interface.viewer.llm_connection_test import ConnectionTester
+    from strix.interface.viewer.llm_settings import SettingsStore
     from strix.interface.viewer.scan_launcher import ScanLauncher
 
 
@@ -138,11 +142,21 @@ class _ViewerState:
         assets_dir: Path,
         steer_handler: Callable[[str, str], bool] | None = None,
         launcher: ScanLauncher | None = None,
+        settings_store: SettingsStore | None = None,
+        connection_tester: ConnectionTester | None = None,
     ) -> None:
         # The run the viewer was started on, or None in launch mode with no run
         # at start. Handlers go through ``default_run()`` (DD-8), never this
         # field directly, so a reload mid-scan lands on the newest run.
         self.run_dir = run_dir
+        # The LLM-settings store and the isolated connection tester (Step 5/6).
+        # Both are present whenever the viewer runs (launch and fixed-run mode);
+        # when either is None the four settings routes answer 403
+        # ``settings_unavailable`` and ``/api/capabilities`` reports
+        # ``llm_settings.available=false`` (BR-5 analogue; see
+        # ``_handle_settings_*``). They never gate the pre-existing endpoints.
+        self.settings_store = settings_store
+        self.connection_tester = connection_tester
         self.assets_dir = assets_dir
         # The strix_runs directory that holds launched runs; replaces the old
         # ``run_dir.parent`` as the base for listing and resolving runs. Always
@@ -172,6 +186,12 @@ class _ViewerState:
         # Finalized in ``serve()`` once the port is known (the server binds
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
         self.cookie_name = SESSION_COOKIE_PREFIX
+        # Sliding-window rate limiter for settings CHANGES (PUT + reset), shared
+        # across worker threads (BR-4: 10 per rolling minute). The connection
+        # test keeps its own 6/min window inside ``ConnectionTester``, so it is
+        # not counted here. ``_settings_change_lock`` guards the deque.
+        self.settings_changes: deque[float] = deque()
+        self.settings_change_lock = threading.Lock()
 
     def default_run(self) -> Path | None:
         """The run a request resolves against when none is named (DD-8, §10a).
@@ -211,25 +231,23 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            routes: dict[str, Callable[[], None]] = {
+                "/api/event": self._handle_event,
+                "/api/auth/otp/start": self._handle_otp_start,
+                "/api/auth/otp/verify": self._handle_otp_verify,
+                "/api/auth/forget": self._handle_forget,
+                "/api/report/send": self._handle_report_send,
+                "/api/feedback": self._handle_feedback,
+                "/api/agents/steer": self._handle_steer,
+                "/api/scans": self._handle_scan_launch,
+                "/api/scans/stop": self._handle_scan_stop,
+                "/api/settings/reset": self._handle_settings_reset,
+                "/api/settings/test": self._handle_settings_test,
+            }
             try:
-                if path == "/api/event":
-                    self._handle_event()
-                elif path == "/api/auth/otp/start":
-                    self._handle_otp_start()
-                elif path == "/api/auth/otp/verify":
-                    self._handle_otp_verify()
-                elif path == "/api/auth/forget":
-                    self._handle_forget()
-                elif path == "/api/report/send":
-                    self._handle_report_send()
-                elif path == "/api/feedback":
-                    self._handle_feedback()
-                elif path == "/api/agents/steer":
-                    self._handle_steer()
-                elif path == "/api/scans":
-                    self._handle_scan_launch()
-                elif path == "/api/scans/stop":
-                    self._handle_scan_stop()
+                handler = routes.get(path)
+                if handler is not None:
+                    handler()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
             except BrokenPipeError:
@@ -237,6 +255,20 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except Exception:
                 # A bad request must never kill the worker thread.
                 logger.exception("viewer request failed: POST %s", path)
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
+
+        def do_PUT(self) -> None:
+            path = urlsplit(self.path).path
+            try:
+                if path == "/api/settings":
+                    self._handle_settings_put()
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+            except BrokenPipeError:
+                logger.debug("viewer client disconnected during PUT %s", path)
+            except Exception:
+                # A bad request must never kill the worker thread.
+                logger.exception("viewer request failed: PUT %s", path)
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
         def _read_body(self) -> dict[str, Any]:
@@ -296,6 +328,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/capabilities":
                 self._send_json(HTTPStatus.OK, self._capabilities_payload())
+                return
+            if path == "/api/settings":
+                self._handle_settings_get()
                 return
             if path == "/api/auth/status":
                 self._handle_auth_status()
@@ -539,6 +574,14 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "scan_launch_available": launch_available,
                 "initial_run": state.default_run() is not None,
                 "scan_limits": None,
+                # The settings page is available whenever the store was wired
+                # (launch and fixed-run mode). ``editable`` tells the SPA whether
+                # to render the write controls; a non-loopback bind shows them
+                # read-only (BR-2). Unauthenticated, like the rest of this body.
+                "llm_settings": {
+                    "available": state.settings_store is not None,
+                    "editable": self._is_loopback_bind(),
+                },
             }
             if launch_available:
                 limits = state.launcher.limits  # type: ignore[union-attr]
@@ -699,6 +742,185 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             run_values = query.get("run")
             run = run_values[0] if run_values else ""
             self._send_json(HTTPStatus.OK, state.launcher.status(run))
+
+        # --- LLM settings (Step 5.1; FR-1..FR-9, FR-27..FR-32, BR-1..BR-5) ---
+
+        # Settings change rate limit: 10 PUT+reset per rolling minute (BR-4).
+        _SETTINGS_CHANGE_LIMIT = 10
+        _SETTINGS_RATE_WINDOW_SECONDS = 60.0
+
+        def _handle_settings_get(self) -> None:
+            """GET /api/settings — the effective view (section 3; FR-5..FR-8).
+
+            Requires the session cookie (BR-1); when no store is wired it answers
+            403 ``settings_unavailable`` (the chosen sentinel, mirrored by
+            ``/api/capabilities``). GET works on any bind — read-only viewers
+            still see their settings (BR-2) — so ``editable`` reflects the real
+            loopback decision and no editable gate is applied here.
+
+            Lock order (BR-35): ``scan_active`` is read from the launcher BEFORE
+            ``store.view`` takes the store lock, never while holding it.
+            """
+            if not self._has_session():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if state.settings_store is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "settings_unavailable"})
+                return
+            # Launcher lock (outer) before the store lock (inner): snapshot the
+            # active-scan flag first, then build the view.
+            scan_active = state.launcher is not None and state.launcher.active_run() is not None
+            view = state.settings_store.view(
+                editable=self._is_loopback_bind(), scan_active=scan_active
+            )
+            self._send_json(HTTPStatus.OK, view)
+
+        def _settings_gate_error(self) -> tuple[HTTPStatus, str] | None:
+            """First failing gate for a settings change/test, or None if all pass.
+
+            Order (section 4): cookie → store wired → editable (loopback bind) →
+            Origin/Host → Content-Type → Content-Length. The body is never read
+            until every header check passes (BR-3). The per-endpoint rate limit
+            runs after this (the test endpoint's own 6/min lives in the tester).
+            """
+            if not self._has_session():
+                return HTTPStatus.FORBIDDEN, "forbidden"
+            if state.settings_store is None:
+                return HTTPStatus.FORBIDDEN, "settings_unavailable"
+            if not self._is_loopback_bind():
+                return HTTPStatus.FORBIDDEN, "settings_read_only"
+            if not self._origin_ok():
+                return HTTPStatus.FORBIDDEN, "bad_origin"
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "invalid_content_type"
+            return self._content_length_error()
+
+        def _settings_precheck(self) -> bool:
+            """Run the ordered settings gate; send the error and return False on failure."""
+            error = self._settings_gate_error()
+            if error is None:
+                return True
+            status, code = error
+            self._send_json(status, {"error": code})
+            return False
+
+        def _settings_change_rate_ok(self) -> bool:
+            """Count this change against the 10/min window; send 429 when full (BR-4).
+
+            Counts PUT and reset together. On a breach it sends ``rate_limited``
+            (429) with a ``Retry-After`` header and returns False. The connection
+            test is NOT counted here — it has its own 6/min window in the tester.
+            """
+            now = time.monotonic()
+            cutoff = now - self._SETTINGS_RATE_WINDOW_SECONDS
+            with state.settings_change_lock:
+                while state.settings_changes and state.settings_changes[0] <= cutoff:
+                    state.settings_changes.popleft()
+                if len(state.settings_changes) >= self._SETTINGS_CHANGE_LIMIT:
+                    self._send_json(
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        {"error": "rate_limited", "message": "too many settings changes"},
+                        extra_headers={"Retry-After": str(int(self._SETTINGS_RATE_WINDOW_SECONDS))},
+                    )
+                    return False
+                state.settings_changes.append(now)
+            return True
+
+        def _read_settings_body(self) -> Any:
+            """Read the JSON body after the gate passed; never logged (NFR-1)."""
+            length = self._content_length() or 0
+            raw = self.rfile.read(length) if length else b"{}"
+            return json.loads(raw or b"{}")
+
+        def _handle_settings_put(self) -> None:
+            """PUT /api/settings — validate, save, return the refreshed view (section 4).
+
+            Gate → rate limit (10/min, PUT+reset) → read body → ``store.apply``.
+            On success returns 200 with the GET view (``editable`` overridden with
+            the real loopback value) plus ``warnings``. All ``LaunchError`` (the
+            error-table codes the store raises) map through ``_send_launch_error``.
+            The key is never read into any response or log (BR-12, NFR-1).
+            """
+            if not self._settings_precheck():
+                return
+            assert state.settings_store is not None
+            if not self._settings_change_rate_ok():
+                return
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                view = state.settings_store.apply(body)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            # ``apply`` returns the view with ``editable=True``; override with the
+            # real bind so a race on the toggle cannot mislead the SPA.
+            view["editable"] = self._is_loopback_bind()
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_settings_reset(self) -> None:
+            """POST /api/settings/reset — clear the marker + strip set (section 5, FR-14).
+
+            Same gate and rate window as PUT. Body ``{"confirm": true}``; the
+            store raises ``invalid_json`` when confirm is not true.
+            """
+            if not self._settings_precheck():
+                return
+            assert state.settings_store is not None
+            if not self._settings_change_rate_ok():
+                return
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            confirm = body.get("confirm") if isinstance(body, dict) else None
+            try:
+                view = state.settings_store.reset(confirm=confirm is True)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            view["editable"] = self._is_loopback_bind()
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_settings_test(self) -> None:
+            """POST /api/settings/test — isolated preflight (section 7, FR-27..FR-32).
+
+            Same gate as PUT, but NOT counted against the 10/min change window —
+            the tester enforces its own 6/min and one-at-a-time limits. Resolves
+            effective values (``store.effective_test_values``), then runs the
+            child (``tester.run``) and returns the result dict. An ``ok:false``
+            result is still HTTP 200; only ``LaunchError`` (409/429 from the
+            tester, 400 from value resolution) maps through the error path.
+            """
+            if not self._settings_precheck():
+                return
+            assert state.settings_store is not None
+            if state.connection_tester is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "settings_unavailable"})
+                return
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                values = state.settings_store.effective_test_values(body)
+                result = state.connection_tester.run(values)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            self._send_json(HTTPStatus.OK, result)
 
         # The four allow-listed downloadable artifacts, keyed by the fixed name
         # the client sends; the value is never joined from client text (BR-32).
@@ -872,6 +1094,8 @@ def serve(
     steer_handler: Callable[[str, str], bool] | None = None,
     runs_dir: Path | None = None,
     launcher: ScanLauncher | None = None,
+    settings_store: SettingsStore | None = None,
+    connection_tester: ConnectionTester | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -891,6 +1115,13 @@ def serve(
     when there is no run to start on. Existing callers keep passing a concrete
     ``run_dir`` and nothing else; ``runs_dir`` then defaults to its parent so
     their behaviour is unchanged (DD-8).
+
+    ``settings_store`` and ``connection_tester`` wire the LLM settings page
+    (Step 5/6). They are passed in both launch and fixed-run mode so the page
+    works whenever the viewer runs. When either is ``None`` the four
+    ``/api/settings*`` routes answer 403 ``settings_unavailable`` and
+    ``/api/capabilities`` reports ``llm_settings.available=false``; the
+    pre-existing endpoints are never affected.
     """
     if runs_dir is None:
         if run_dir is None:
@@ -904,6 +1135,8 @@ def serve(
         assets_dir=assets_dir,
         steer_handler=steer_handler,
         launcher=launcher,
+        settings_store=settings_store,
+        connection_tester=connection_tester,
     )
     handler = _make_handler(state)
 

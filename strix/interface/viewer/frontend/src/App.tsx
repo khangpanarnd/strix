@@ -38,8 +38,9 @@ import { TrustToast } from "@/components/TrustToast";
 import { LaunchView } from "@/components/launch/LaunchView";
 import { StopScanButton } from "@/components/launch/StopScanButton";
 import { ReportDownloads } from "@/components/launch/ReportDownloads";
+import SettingsView from "@/components/settings/SettingsView";
 
-export type View = "overview" | "issues" | "agents" | "history" | "launch";
+export type View = "overview" | "issues" | "agents" | "history" | "launch" | "settings";
 
 const TRUST_BANNER =
   "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by PRDCV Strix Agents.";
@@ -64,6 +65,9 @@ export default function App() {
   const [scanLaunchAvailable, setScanLaunchAvailable] = useState(false);
   const [scanLimits, setScanLimits] = useState<ScanLimits | null>(null);
   const [initialRun, setInitialRun] = useState(true);
+  // Whether the LLM Settings page is offered (loopback or not). Read once from
+  // capabilities; the Sidebar shows the entry only when available.
+  const [llmSettingsAvailable, setLlmSettingsAvailable] = useState(false);
   // Resolved once capabilities land, so the no-run guard only fires after we
   // actually know whether a run exists.
   const [capsLoaded, setCapsLoaded] = useState(false);
@@ -86,6 +90,7 @@ export default function App() {
         setScanLaunchAvailable(caps.scan_launch_available);
         setScanLimits(caps.scan_limits);
         setInitialRun(caps.initial_run);
+        setLlmSettingsAvailable(caps.llm_settings.available);
         // Empty workspace in launch mode: open the launch view straight away
         // rather than spinning on a run that does not exist yet.
         if (caps.scan_launch_available && !caps.initial_run) {
@@ -263,6 +268,12 @@ export default function App() {
     userSetView("history");
   }, [refreshRuns, userSetView]);
 
+  // Open the LLM Settings page (Sidebar entry, or the launch error card's
+  // "Open Settings" link). Like the launch view, it needs no run.
+  const openSettings = useCallback(() => {
+    userSetView("settings");
+  }, [userSetView]);
+
 
   return (
     <div className="min-h-screen bg-black text-white flex">
@@ -278,6 +289,8 @@ export default function App() {
         }}
         scanLaunchAvailable={scanLaunchAvailable}
         onOpenLaunch={openLaunch}
+        llmSettingsAvailable={llmSettingsAvailable}
+        onOpenSettings={openSettings}
         issuesCount={run?.vulnerabilities.length ?? 0}
         agentCount={agentCount}
         mcpConnections={mcpConnections}
@@ -315,7 +328,7 @@ export default function App() {
         </div>
 
         <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "history" && view !== "launch" && (
+          {error && !run && view !== "history" && view !== "launch" && view !== "settings" && (
             <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
               <p className="text-sm text-red-300">{error}</p>
@@ -334,6 +347,7 @@ export default function App() {
                 limits={scanLimits}
                 onLaunched={onLaunched}
                 onOpenRun={selectRun}
+                onOpenSettings={llmSettingsAvailable ? openSettings : undefined}
               />
             ) : (
               <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
@@ -342,6 +356,8 @@ export default function App() {
                 </p>
               </div>
             )
+          ) : view === "settings" ? (
+            <SettingsView />
           ) : view === "history" ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2">

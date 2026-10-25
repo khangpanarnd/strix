@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Bot, History, Plus } from "lucide-react";
+import { AlertTriangle, Bot, History, Plus, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpConnectionStatus } from "@/data/serverSource";
 import type { View } from "@/App";
@@ -25,6 +25,9 @@ interface SidebarProps {
   onSelectView: (view: View) => void;
   scanLaunchAvailable: boolean;
   onOpenLaunch: () => void;
+  /** Whether the LLM Settings page is offered (FR-1, FR-3). */
+  llmSettingsAvailable: boolean;
+  onOpenSettings: () => void;
   issuesCount: number;
   agentCount: number;
   mcpConnections: McpConnectionStatus[];
@@ -48,6 +51,8 @@ export default function Sidebar({
   onSelectView,
   scanLaunchAvailable,
   onOpenLaunch,
+  llmSettingsAvailable,
+  onOpenSettings,
   issuesCount,
   agentCount,
   mcpConnections,
@@ -206,6 +211,15 @@ export default function Sidebar({
             )}
             {mcpConnections.length > 0 && (
               <McpConnectionsPanel connections={mcpConnections} inUse={mcpInUse} />
+            )}
+            {llmSettingsAvailable && (
+              <NavItem
+                icon={<Settings className="h-4 w-4" />}
+                label="Settings"
+                active={view === "settings"}
+                onClick={onOpenSettings}
+                testId="sidebar-settings"
+              />
             )}
             <NavItem
               icon={<History className="h-4 w-4" />}

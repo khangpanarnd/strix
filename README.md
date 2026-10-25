@@ -209,6 +209,7 @@ This fork tracks upstream Strix and adds a few things on top of it:
 - **Past runs without email verification** - the viewer's run history opens directly. The email / encrypted-PDF export is removed from the UI, so there is no email step anywhere in the viewer.
 - **Launch scans from the browser** - `strix view --launch` adds a **New scan** form with target safety checks, a budget cap, Stop, and report downloads (see [Launch a Scan from the Viewer](#launch-a-scan-from-the-viewer)).
 - **`--run-name`** - choose the run directory name for a headless scan, so automation knows where results land.
+- **Configure the LLM from the browser** - a Settings page for model, API key, API base URL and reasoning effort, applied to the next scan with no restart (see [Configure the LLM from the Viewer](#configure-the-llm-from-the-viewer)).
 - **A local-only viewer UI branded "PRDCV Strix Agents"** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
 
 ---
@@ -257,6 +258,22 @@ Open the printed link, choose **New scan**, enter a URL, domain, or IP address, 
 - Stopping the viewer (Ctrl-C) also stops a scan it started. If the viewer is killed without a chance to clean up, the scan can keep running.
 - Anyone who holds the viewer link can start scans that spend your LLM budget. Keep it on `127.0.0.1` unless you trust everyone who can reach the port.
 
+### Configure the LLM from the Viewer
+
+You do not need to export variables or restart anything to change the model. Open **Settings** in the sidebar of `strix view` and set:
+
+- **Model** - any LiteLLM model id, for example `anthropic/claude-sonnet-4-5` (suggestions are offered, any text is accepted).
+- **API key** - write-only: the page shows only that a key is set and where it comes from, never the key itself.
+- **API base URL** - optional, for a proxy or a local model server. `https://` is required, except for loopback and private/LAN hosts (for example Ollama), where `http://` is allowed. Cloud-metadata addresses are always refused.
+- **Reasoning effort** - `none` to `max`.
+
+**Test connection** sends one tiny request with the values you typed, before you save, in a separate short-lived process so nothing leaks into the viewer. **Save** writes `~/.strix/cli-config.json` (the same file the command line uses, owner-only permissions), so a model and key saved here also work for `strix` in a terminal.
+
+- Saved values apply to scans you start **after** saving; a running scan is not changed.
+- Once you save here, the viewer ignores LLM variables from the shell for scans it launches, so the page and the scan always agree. **Reset to environment** hands control back to your shell.
+- Changing the base URL asks you to re-enter the key, and shows where the key will be sent, so a saved key cannot be quietly redirected.
+- Settings can be edited only when the viewer runs on this machine (`127.0.0.1`). On a viewer exposed to a network the page is read-only.
+- On Windows the file mode is not enforced, so the key is protected only by your account's permissions; the page says so.
 ---
 
 ## Usage Examples

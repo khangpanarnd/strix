@@ -225,6 +225,18 @@ export interface Capabilities {
   initial_run: boolean;
   /** Present only in launch mode; the form reads its bounds from here. */
   scan_limits: ScanLimits | null;
+  /**
+   * Whether the LLM Settings page is offered and, if so, whether it is
+   * editable (loopback bind) or read-only (FR-3). Defaults to unavailable so a
+   * server that predates this feature simply hides the Settings entry.
+   */
+  llm_settings: LlmSettingsCapability;
+}
+
+/** The `llm_settings` capability block (GET /api/capabilities, FR-3). */
+export interface LlmSettingsCapability {
+  available: boolean;
+  editable: boolean;
 }
 
 /** The form values POSTed to /api/scans (domain-entities §3). */
@@ -333,7 +345,21 @@ export async function fetchCapabilities(): Promise<Capabilities> {
     // the existing polling behaviour rather than silently suppressing it.
     initial_run: obj?.initial_run !== false,
     scan_limits: parseScanLimits((obj as Record<string, unknown>)?.scan_limits),
+    llm_settings: parseLlmSettings((obj as Record<string, unknown>)?.llm_settings),
   };
+}
+
+/**
+ * Parse the `llm_settings` capability. Defaults to `{available:false,
+ * editable:false}` when the field is absent (an older server), so the Settings
+ * entry is simply hidden rather than erroring.
+ */
+function parseLlmSettings(raw: unknown): LlmSettingsCapability {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { available: false, editable: false };
+  }
+  const r = raw as Record<string, unknown>;
+  return { available: r.available === true, editable: r.editable === true };
 }
 
 /**
@@ -455,6 +481,262 @@ export async function steerAgent(agentId: string, message: string): Promise<Stee
   });
   if (ok && data.ok === true) return { ok: true };
   return { ok: false, error: String(data.error ?? "unavailable") };
+}
+
+// ---------------------------------------------------------------------------
+// LLM settings (unit: llm-settings)
+//
+// GET /api/settings, PUT /api/settings, POST /api/settings/reset and
+// POST /api/settings/test back the Settings page. The server is the single
+// source of truth: the key is write-only (never returned, never pre-filled),
+// every value carries its source, and error responses carry a machine-readable
+// code mapped to a field by the form (domain-entities §3, business-rules §8).
+// ---------------------------------------------------------------------------
+
+/**
+ * Where an effective value comes from (domain-entities SettingsView):
+ *   - `ui`          saved through this page (managed);
+ *   - `file`        saved by the command line into the shared config file (DD-6);
+ *   - `environment` set in the shell that started the viewer;
+ *   - `default`     the Strix built-in default.
+ */
+export type FieldSource = "ui" | "file" | "environment" | "default";
+
+/** A value-bearing field (model, base, reasoning) with its source. */
+export interface SettingsValueField {
+  value: string | null;
+  source: FieldSource;
+}
+
+/** The API key field: never a value, only whether one is set and its source. */
+export interface SettingsKeyField {
+  set: boolean;
+  source: FieldSource;
+}
+
+/** GET /api/settings (and the body returned after a save / clear / reset). */
+export interface SettingsView {
+  fields: {
+    model: SettingsValueField;
+    api_base: SettingsValueField;
+    reasoning_effort: SettingsValueField;
+    api_key: SettingsKeyField;
+  };
+  /** The managed marker is present: this page owns the connection (FR-15). */
+  managed: boolean;
+  /** Editable only on a loopback bind; otherwise read-only (FR-2). */
+  editable: boolean;
+  /** `unreadable` means the config file is not valid JSON; Save is blocked. */
+  file_status: "ok" | "missing" | "unreadable";
+  /** Display form of the config path, e.g. `~/.strix/cli-config.json`. */
+  config_path: string;
+  /** `win32` triggers the always-visible key-file note (NFR-3). */
+  platform: string;
+  /** The seven allowed reasoning-effort values, server-ordered. */
+  reasoning_choices: string[];
+  /** Static model-id suggestions for the datalist (DD-7). */
+  model_suggestions: string[];
+  /** A viewer-launched scan is running: saves apply to later scans only. */
+  scan_active: boolean;
+  /** Advisory save warnings (e.g. `model_unfamiliar`); present on a save. */
+  warnings: string[];
+}
+
+/**
+ * The PUT body. Any subset of the four fields plus a `clear` list naming
+ * fields to remove. The key is included only when the user typed one; an
+ * empty string is never sent (clearing is only via `clear`, BR-11).
+ */
+export interface SettingsUpdate {
+  model?: string;
+  api_key?: string;
+  api_base?: string;
+  reasoning_effort?: string;
+  clear?: SettingsFieldName[];
+}
+
+/** The four field names that can appear in a `clear` list (BR-10). */
+export type SettingsFieldName = "model" | "api_key" | "api_base" | "reasoning_effort";
+
+/** POST /api/settings/test result (domain-entities TestResult). */
+export interface TestResult {
+  ok: boolean;
+  latency_ms: number | null;
+  category: string | null;
+  status: number | null;
+  message: string;
+}
+
+/**
+ * A structured settings failure, mirroring `LaunchError`. `error` is a code
+ * from the business-rules error table (§8) and the form maps it to the field
+ * it belongs to; anything unmapped renders as a banner above the buttons.
+ */
+export class SettingsError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, message: string, status: number) {
+    super(message);
+    this.name = "SettingsError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function asFieldSource(value: unknown): FieldSource {
+  return value === "ui" || value === "file" || value === "environment" || value === "default"
+    ? value
+    : "default";
+}
+
+function parseValueField(raw: unknown): SettingsValueField {
+  if (!raw || typeof raw !== "object") return { value: null, source: "default" };
+  const r = raw as Record<string, unknown>;
+  const value = typeof r.value === "string" ? r.value : null;
+  return { value, source: asFieldSource(r.source) };
+}
+
+function parseKeyField(raw: unknown): SettingsKeyField {
+  if (!raw || typeof raw !== "object") return { set: false, source: "default" };
+  const r = raw as Record<string, unknown>;
+  return { set: r.set === true, source: asFieldSource(r.source) };
+}
+
+function parseFileStatus(value: unknown): SettingsView["file_status"] {
+  return value === "ok" || value === "missing" || value === "unreadable" ? value : "ok";
+}
+
+function parseStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+/** Normalise a raw settings payload into a fully-typed `SettingsView`. */
+function parseSettingsView(raw: unknown): SettingsView {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const fields = (r.fields && typeof r.fields === "object" ? r.fields : {}) as Record<string, unknown>;
+  return {
+    fields: {
+      model: parseValueField(fields.model),
+      api_base: parseValueField(fields.api_base),
+      reasoning_effort: parseValueField(fields.reasoning_effort),
+      api_key: parseKeyField(fields.api_key),
+    },
+    managed: r.managed === true,
+    editable: r.editable === true,
+    file_status: parseFileStatus(r.file_status),
+    config_path: typeof r.config_path === "string" ? r.config_path : "",
+    platform: typeof r.platform === "string" ? r.platform : "",
+    reasoning_choices: parseStringList(r.reasoning_choices),
+    model_suggestions: parseStringList(r.model_suggestions),
+    scan_active: r.scan_active === true,
+    warnings: parseStringList(r.warnings),
+  };
+}
+
+/** Build a `SettingsError` from a parsed error body and HTTP status. */
+function settingsErrorFrom(data: Record<string, unknown>, status: number): SettingsError {
+  const code = typeof data.error === "string" ? data.error : "unavailable";
+  const message =
+    typeof data.message === "string" && data.message
+      ? data.message
+      : "The settings could not be saved. Please try again.";
+  return new SettingsError(code, message, status);
+}
+
+/** Shared same-origin JSON POST/PUT that reads the body on any status. */
+async function sendSettingsJson(
+  path: string,
+  method: "PUT" | "POST",
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }> {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    cache: "no-store",
+    body: JSON.stringify(body),
+    signal,
+  });
+  let data: Record<string, unknown> = {};
+  try {
+    const parsed = await res.json();
+    if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
+  } catch {
+    /* empty or non-JSON body */
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
+/** GET /api/settings. Same-origin; tolerant parsing into a `SettingsView`. */
+export async function fetchSettings(): Promise<SettingsView> {
+  const res = await fetch("/api/settings", { cache: "no-store", credentials: "same-origin" });
+  if (!res.ok) {
+    let data: Record<string, unknown> = {};
+    try {
+      const parsed = await res.json();
+      if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw settingsErrorFrom(data, res.status);
+  }
+  return parseSettingsView(await res.json());
+}
+
+/**
+ * PUT /api/settings. Sends only the fields present in `update` (the caller
+ * includes a field only when it changed, and the key only when typed).
+ * Resolves to the refreshed view (with `warnings`) on 200, else throws a
+ * `SettingsError` carrying the server's code, message and status.
+ */
+export async function saveSettings(update: SettingsUpdate): Promise<SettingsView> {
+  const body: Record<string, unknown> = {};
+  if (update.model !== undefined) body.model = update.model;
+  if (update.api_key !== undefined) body.api_key = update.api_key;
+  if (update.api_base !== undefined) body.api_base = update.api_base;
+  if (update.reasoning_effort !== undefined) body.reasoning_effort = update.reasoning_effort;
+  if (update.clear && update.clear.length > 0) body.clear = update.clear;
+  const { ok, status, data } = await sendSettingsJson("/api/settings", "PUT", body);
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseSettingsView(data);
+}
+
+/** POST /api/settings/reset ("Reset to environment"). Throws on non-200. */
+export async function resetSettings(): Promise<SettingsView> {
+  const { ok, status, data } = await sendSettingsJson("/api/settings/reset", "POST", {
+    confirm: true,
+  });
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseSettingsView(data);
+}
+
+/**
+ * POST /api/settings/test. Sends the same value fields as a save (no `clear`).
+ * A 200 carries a `TestResult` even when `ok` is false (a provider rejection is
+ * a successful test round-trip); a non-200 (e.g. 409 `test_in_progress`, 429,
+ * 400 `key_required_for_base_change`) throws a `SettingsError`. The optional
+ * `signal` lets the caller abort the request from the 45 s Cancel button.
+ */
+export async function testConnection(
+  update: Omit<SettingsUpdate, "clear">,
+  signal?: AbortSignal
+): Promise<TestResult> {
+  const body: Record<string, unknown> = {};
+  if (update.model !== undefined) body.model = update.model;
+  if (update.api_key !== undefined) body.api_key = update.api_key;
+  if (update.api_base !== undefined) body.api_base = update.api_base;
+  if (update.reasoning_effort !== undefined) body.reasoning_effort = update.reasoning_effort;
+  const { ok, status, data } = await sendSettingsJson("/api/settings/test", "POST", body, signal);
+  if (!ok) throw settingsErrorFrom(data, status);
+  return {
+    ok: data.ok === true,
+    latency_ms: typeof data.latency_ms === "number" ? data.latency_ms : null,
+    category: typeof data.category === "string" ? data.category : null,
+    status: typeof data.status === "number" ? data.status : null,
+    message: typeof data.message === "string" ? data.message : "",
+  };
 }
 
 
