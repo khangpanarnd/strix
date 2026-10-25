@@ -1,42 +1,78 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertCircle, AlertTriangle, Info, Settings as SettingsIcon } from "lucide-react";
+import { AlertCircle, AlertTriangle, Info, Plus, Settings as SettingsIcon } from "lucide-react";
 import {
   SettingsError,
-  fetchSettings,
+  activateProfile,
+  deleteProfile,
+  fetchProfiles,
   resetSettings,
-  saveSettings,
+  saveProfile,
   testConnection,
-  type SettingsFieldName,
-  type SettingsUpdate,
-  type SettingsView as SettingsViewData,
+  type LlmProfile,
+  type ProfileSaveBody,
+  type ProfilesView as ProfilesViewData,
   type TestResult,
 } from "@/data/serverSource";
-import {
-  SettingsForm,
-  fieldForSettingsCode,
-  type SettingsFieldErrors,
-  type SettingsFormValues,
-} from "@/components/settings/SettingsForm";
+import { fieldForSettingsCode, type SettingsFieldErrors } from "@/components/settings/SettingsForm";
+import { LegacySettingsView } from "@/components/settings/LegacySettingsView";
+import { ProfileList } from "@/components/settings/ProfileList";
+import { ProfileEditor, type ProfileEditorValues } from "@/components/settings/ProfileEditor";
+import { ResetConfirm } from "@/components/settings/ResetConfirm";
 
 /**
- * Container and data owner for the LLM Settings page (frontend-components
- * §SettingsView). Loads `GET /api/settings` on mount and after every
- * successful save, clear or reset, holds the typed form values, and runs every
- * async action (test with an AbortController, save with the base-change
- * confirmation, per-field clear, reset with confirmation).
+ * Container and data owner for the LLM Settings page (llm-profiles-spec.md
+ * §UI). Loads `GET /api/settings/profiles` on mount; on a 404/403 (an older
+ * server that predates profiles) it falls back to the single-form page so
+ * nothing breaks.
+ *
+ * It renders a profiles list at the top and a New/Edit editor panel below.
+ * It owns the server state, the typed editor values and every async action
+ * (test with an AbortController and the active profile's id, save with the
+ * base-change confirmation, activate, delete with confirmation, reset).
  *
  * Security: the key field is never seeded from the server, never stored in
- * browser storage, and is cleared after a successful save (§4).
+ * browser storage, and is cleared after a successful save.
  */
 
-/** Build the empty, write-only form baseline from a loaded view. */
-function formFromView(view: SettingsViewData): SettingsFormValues {
+type EditorMode = { kind: "closed" } | { kind: "new" } | { kind: "edit"; id: string };
+
+const EMPTY_EDITOR: ProfileEditorValues = {
+  name: "",
+  preset: "custom",
+  model: "",
+  api_key: "",
+  api_base: "",
+  reasoning_effort: "",
+};
+
+/** Default reasoning effort for a fresh editor (first server-ordered choice). */
+function defaultReasoning(view: ProfilesViewData): string {
+  return view.reasoning_choices[0] ?? "";
+}
+
+/** Build the editor baseline for a new profile (key always empty). */
+function newEditorValues(view: ProfilesViewData): ProfileEditorValues {
+  const preset = view.presets[0]?.id ?? "custom";
+  const base = view.presets.find((p) => p.id === preset)?.default_base ?? "";
+  const prefix = view.presets.find((p) => p.id === preset)?.model_prefix ?? "";
   return {
-    model: view.fields.model.value ?? "",
+    ...EMPTY_EDITOR,
+    preset,
+    model: prefix,
+    api_base: base,
+    reasoning_effort: defaultReasoning(view),
+  };
+}
+
+/** Build the editor baseline for an existing profile (key always empty). */
+function editEditorValues(profile: LlmProfile, view: ProfilesViewData): ProfileEditorValues {
+  return {
+    name: profile.name,
+    preset: profile.preset || "custom",
+    model: profile.model ?? "",
     api_key: "", // write-only: never seeded from the server
-    api_base: view.fields.api_base.value ?? "",
-    reasoning_effort:
-      view.fields.reasoning_effort.value ?? view.reasoning_choices[0] ?? "high",
+    api_base: profile.api_base ?? "",
+    reasoning_effort: profile.reasoning_effort ?? defaultReasoning(view),
   };
 }
 
@@ -52,162 +88,237 @@ function hostOf(base: string): string {
 }
 
 export function SettingsView() {
-  const [view, setView] = useState<SettingsViewData | null>(null);
-  const [values, setValues] = useState<SettingsFormValues>({
-    model: "",
-    api_key: "",
-    api_base: "",
-    reasoning_effort: "",
-  });
+  const [view, setView] = useState<ProfilesViewData | null>(null);
+  const [legacyFallback, setLegacyFallback] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<TestResult | null>(null);
+
+  const [mode, setMode] = useState<EditorMode>({ kind: "closed" });
+  const [values, setValues] = useState<ProfileEditorValues>(EMPTY_EDITOR);
   const [fieldErrors, setFieldErrors] = useState<SettingsFieldErrors>({});
-  const [confirm, setConfirm] = useState<"none" | "base-change" | "reset">("none");
+  const [confirm, setConfirm] = useState<"none" | "base-change">("none");
+  const [testResult, setTestResult] = useState<TestResult | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [resetConfirm, setResetConfirm] = useState(false);
+  const [activatedNote, setActivatedNote] = useState(false);
 
   const testAbortRef = useRef<AbortController | null>(null);
 
-  const applyView = useCallback((next: SettingsViewData) => {
-    setView(next);
-    setValues(formFromView(next));
-  }, []);
-
   const load = useCallback(async () => {
     try {
-      const next = await fetchSettings();
-      applyView(next);
+      const next = await fetchProfiles();
+      setView(next);
+      setLegacyFallback(false);
       setLoadError(null);
     } catch (err) {
+      if (err instanceof SettingsError && (err.status === 404 || err.status === 403)) {
+        // Older server without the profiles endpoint: fall back to the
+        // single-form page so the Settings page keeps working.
+        setLegacyFallback(true);
+        return;
+      }
       setLoadError(
         err instanceof SettingsError
           ? err.message
           : "The settings could not be loaded. Please try again."
       );
     }
-  }, [applyView]);
+  }, []);
 
   useEffect(() => {
     void load();
     return () => {
-      // Abort any in-flight test on unmount.
       testAbortRef.current?.abort();
     };
   }, [load]);
 
-  const onChange = useCallback((patch: Partial<SettingsFormValues>) => {
-    setValues((prev) => ({ ...prev, ...patch }));
-    // A fresh edit invalidates the last test result and clears stale errors
-    // for the edited fields.
+  const editingProfile =
+    mode.kind === "edit" && view ? (view.profiles.find((p) => p.id === mode.id) ?? null) : null;
+
+  const openNew = useCallback(() => {
+    if (!view) return;
+    setMode({ kind: "new" });
+    setValues(newEditorValues(view));
+    setFieldErrors({});
     setTestResult(null);
-    setFieldErrors((prev) => {
-      const next = { ...prev };
-      for (const key of Object.keys(patch)) {
-        delete next[key as keyof SettingsFieldErrors];
-      }
-      delete next.banner;
-      return next;
-    });
+    setConfirm("none");
+    setActivatedNote(false);
+  }, [view]);
+
+  const openEdit = useCallback(
+    (id: string) => {
+      if (!view) return;
+      const profile = view.profiles.find((p) => p.id === id);
+      if (!profile) return;
+      setMode({ kind: "edit", id });
+      setValues(editEditorValues(profile, view));
+      setFieldErrors({});
+      setTestResult(null);
+      setConfirm("none");
+      setActivatedNote(false);
+    },
+    [view]
+  );
+
+  const closeEditor = useCallback(() => {
+    testAbortRef.current?.abort();
+    setMode({ kind: "closed" });
+    setValues(EMPTY_EDITOR);
+    setFieldErrors({});
+    setTestResult(null);
+    setConfirm("none");
+    setTesting(false);
   }, []);
 
-  // Compute the changed subset. The key is "changed" only when the user typed
-  // something (the field is write-only and starts empty).
-  const changed = view
-    ? {
-        model: values.model !== (view.fields.model.value ?? ""),
-        api_base: values.api_base !== (view.fields.api_base.value ?? ""),
-        reasoning_effort:
-          values.reasoning_effort !== (view.fields.reasoning_effort.value ?? ""),
-        api_key: values.api_key.length > 0,
+  // Editing a field: apply the patch and, when the preset changes, pre-fill the
+  // model prefix and the base hint (where the preset has a default_base). Every
+  // field stays editable.
+  const onChange = useCallback(
+    (patch: Partial<ProfileEditorValues>) => {
+      setTestResult(null);
+      setFieldErrors((prev) => {
+        const next = { ...prev };
+        for (const key of Object.keys(patch)) {
+          delete next[key as keyof SettingsFieldErrors];
+        }
+        delete next.banner;
+        return next;
+      });
+
+      if (patch.preset !== undefined && view) {
+        const preset = view.presets.find((p) => p.id === patch.preset);
+        setValues((prev) => ({
+          ...prev,
+          ...patch,
+          // Pre-fill the model prefix and base hint only; keep anything the
+          // user already typed beyond the prefix by replacing just the prefix.
+          model: preset ? preset.model_prefix : prev.model,
+          api_base: preset && preset.default_base ? preset.default_base : prev.api_base,
+        }));
+        return;
       }
-    : { model: false, api_base: false, reasoning_effort: false, api_key: false };
-
-  const dirty = changed.model || changed.api_base || changed.reasoning_effort || changed.api_key;
-
-  /** Build the PUT update from only the changed fields. */
-  const buildUpdate = useCallback((): SettingsUpdate => {
-    const update: SettingsUpdate = {};
-    if (changed.model) update.model = values.model.trim();
-    if (changed.api_base) update.api_base = values.api_base.trim();
-    if (changed.reasoning_effort) update.reasoning_effort = values.reasoning_effort;
-    if (changed.api_key) update.api_key = values.api_key;
-    return update;
-  }, [changed, values]);
+      setValues((prev) => ({ ...prev, ...patch }));
+    },
+    [view]
+  );
 
   const handleServerError = useCallback((err: unknown) => {
     if (err instanceof SettingsError) {
       const field = fieldForSettingsCode(err.code);
       setFieldErrors({ [field]: err.message });
     } else {
-      setFieldErrors({ banner: "The settings could not be saved. Please try again." });
+      setFieldErrors({ banner: "The profile could not be saved. Please try again." });
     }
   }, []);
 
+  // Which fields changed vs the edited profile (for a new profile everything a
+  // non-empty value is sent). The key is "changed" only when the user typed.
+  const buildSaveBody = useCallback((): ProfileSaveBody => {
+    const body: ProfileSaveBody = { name: values.name.trim() };
+    body.preset = values.preset;
+    if (mode.kind === "edit" && editingProfile) {
+      body.id = editingProfile.id;
+      const clear: Array<"api_key" | "api_base" | "reasoning_effort"> = [];
+      if (values.model.trim() !== (editingProfile.model ?? "")) body.model = values.model.trim();
+      if (values.api_base.trim() !== (editingProfile.api_base ?? "")) {
+        if (values.api_base.trim()) body.api_base = values.api_base.trim();
+        else if (editingProfile.api_base) clear.push("api_base");
+      }
+      if (values.reasoning_effort !== (editingProfile.reasoning_effort ?? "")) {
+        if (values.reasoning_effort) body.reasoning_effort = values.reasoning_effort;
+        else if (editingProfile.reasoning_effort) clear.push("reasoning_effort");
+      }
+      if (values.api_key.length > 0) body.api_key = values.api_key;
+      if (clear.length > 0) body.clear = clear;
+    } else {
+      if (values.model.trim()) body.model = values.model.trim();
+      if (values.api_base.trim()) body.api_base = values.api_base.trim();
+      if (values.reasoning_effort) body.reasoning_effort = values.reasoning_effort;
+      if (values.api_key.length > 0) body.api_key = values.api_key;
+    }
+    return body;
+  }, [values, mode, editingProfile]);
+
+  const applyViewAfterSave = useCallback((next: ProfilesViewData) => {
+    setView(next);
+  }, []);
+
   const doSave = useCallback(
-    async (update: SettingsUpdate) => {
+    async (body: ProfileSaveBody) => {
       setSaving(true);
+      setBusy(true);
       setFieldErrors({});
       try {
-        const next = await saveSettings(update);
-        applyView(next);
-        setConfirm("none");
-        setTestResult(null);
+        const next = await saveProfile(body);
+        applyViewAfterSave(next);
+        closeEditor();
       } catch (err) {
         handleServerError(err);
         setConfirm("none");
       } finally {
         setSaving(false);
+        setBusy(false);
       }
     },
-    [applyView, handleServerError]
+    [applyViewAfterSave, closeEditor, handleServerError]
   );
 
-  // Save entry point: enforces the base-change rule (FR-12 / BR-13) before the
-  // confirmation dialog. A base change requires a key; when none is typed and
-  // one is saved, we surface the field error rather than opening the dialog.
+  // Save entry: name is required, and (on an edit) the base-change rule gates
+  // the save behind the confirmation dialog, requiring a typed key.
   const onSave = useCallback(() => {
     if (!view) return;
-    const savedBase = view.fields.api_base.value ?? "";
-    const baseChanged = values.api_base.trim() !== savedBase.trim();
-    const keySaved = view.fields.api_key.set;
-    const typedKey = values.api_key.length > 0;
-
-    if (baseChanged && keySaved) {
-      if (!typedKey) {
-        setFieldErrors({ api_key: "Re-enter your API key to use a different base URL." });
-        return;
-      }
-      setConfirm("base-change");
+    if (!values.name.trim()) {
+      setFieldErrors({ name: "Enter a name for this profile." });
       return;
     }
-    void doSave(buildUpdate());
-  }, [view, values, doSave, buildUpdate]);
+    if (mode.kind === "edit" && editingProfile) {
+      const baseChanged = values.api_base.trim() !== (editingProfile.api_base ?? "").trim();
+      const keySaved = editingProfile.api_key_set;
+      const typedKey = values.api_key.length > 0;
+      if (baseChanged && keySaved) {
+        if (!typedKey) {
+          setFieldErrors({ api_key: "Re-enter your API key to use a different base URL." });
+          return;
+        }
+        setConfirm("base-change");
+        return;
+      }
+    }
+    void doSave(buildSaveBody());
+  }, [view, values, mode, editingProfile, doSave, buildSaveBody]);
 
   const onConfirmBaseChange = useCallback(() => {
-    void doSave(buildUpdate());
-  }, [doSave, buildUpdate]);
+    void doSave(buildSaveBody());
+  }, [doSave, buildSaveBody]);
 
   const onCancelBaseChange = useCallback(() => setConfirm("none"), []);
 
-  const onClearField = useCallback(
-    (field: SettingsFieldName) => {
-      void doSave({ clear: [field] });
-    },
-    [doSave]
-  );
-
+  // Build the test body (the same value fields as a save, no name/preset).
   const onTest = useCallback(async () => {
     if (!view) return;
-    // Mirror the client-side base-change guard so Test never silently sends
-    // the saved key to a different host (the server enforces BR-15 too).
-    const savedBase = view.fields.api_base.value ?? "";
-    const baseChanged = values.api_base.trim() !== savedBase.trim();
-    const keySaved = view.fields.api_key.set;
-    const typedKey = values.api_key.length > 0;
-    if (baseChanged && keySaved && !typedKey) {
-      setFieldErrors({ api_key: "Re-enter your API key to use a different base URL." });
-      return;
+    const profileId = mode.kind === "edit" && editingProfile ? editingProfile.id : undefined;
+    if (mode.kind === "edit" && editingProfile) {
+      const baseChanged = values.api_base.trim() !== (editingProfile.api_base ?? "").trim();
+      const keySaved = editingProfile.api_key_set;
+      const typedKey = values.api_key.length > 0;
+      if (baseChanged && keySaved && !typedKey) {
+        setFieldErrors({ api_key: "Re-enter your API key to use a different base URL." });
+        return;
+      }
     }
+
+    const update: {
+      model?: string;
+      api_key?: string;
+      api_base?: string;
+      reasoning_effort?: string;
+    } = {};
+    if (values.model.trim()) update.model = values.model.trim();
+    if (values.api_base.trim()) update.api_base = values.api_base.trim();
+    if (values.reasoning_effort) update.reasoning_effort = values.reasoning_effort;
+    if (values.api_key.length > 0) update.api_key = values.api_key;
 
     const controller = new AbortController();
     testAbortRef.current = controller;
@@ -215,41 +326,83 @@ export function SettingsView() {
     setTestResult(null);
     setFieldErrors({});
     try {
-      const result = await testConnection(buildUpdate(), controller.signal);
+      const result = await testConnection(update, controller.signal, profileId);
       setTestResult(result);
     } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") {
-        // User cancelled; leave the result empty.
-        return;
-      }
+      if (err instanceof DOMException && err.name === "AbortError") return;
       handleServerError(err);
     } finally {
       setTesting(false);
       testAbortRef.current = null;
     }
-  }, [view, values, buildUpdate, handleServerError]);
+  }, [view, values, mode, editingProfile, handleServerError]);
 
   const onCancelTest = useCallback(() => {
     testAbortRef.current?.abort();
     setTesting(false);
   }, []);
 
-  const onReset = useCallback(() => setConfirm("reset"), []);
-  const onCancelReset = useCallback(() => setConfirm("none"), []);
-  const onConfirmReset = useCallback(async () => {
-    setSaving(true);
-    setFieldErrors({});
+  const onActivate = useCallback(async (id: string) => {
+    setBusy(true);
     try {
-      const next = await resetSettings();
-      applyView(next);
-      setTestResult(null);
+      const next = await activateProfile(id);
+      setView(next);
+      setActivatedNote(true);
     } catch (err) {
-      handleServerError(err);
+      setLoadError(
+        err instanceof SettingsError ? err.message : "The profile could not be activated."
+      );
     } finally {
-      setSaving(false);
-      setConfirm("none");
+      setBusy(false);
     }
-  }, [applyView, handleServerError]);
+  }, []);
+
+  const onConfirmDelete = useCallback(async (id: string) => {
+    setBusy(true);
+    try {
+      const next = await deleteProfile(id);
+      setView(next);
+      setPendingDeleteId(null);
+    } catch (err) {
+      setLoadError(
+        err instanceof SettingsError ? err.message : "The profile could not be deleted."
+      );
+      setPendingDeleteId(null);
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const onConfirmReset = useCallback(async () => {
+    setBusy(true);
+    try {
+      await resetSettings();
+      setResetConfirm(false);
+      setActivatedNote(false);
+      await load();
+    } catch (err) {
+      setLoadError(err instanceof SettingsError ? err.message : "The settings could not be reset.");
+    } finally {
+      setBusy(false);
+    }
+  }, [load]);
+
+  // Save is enabled when a name is present; for an edit it also needs a change.
+  const canSave = (() => {
+    if (!values.name.trim()) return false;
+    if (mode.kind === "new") return true;
+    if (mode.kind === "edit" && editingProfile) {
+      return (
+        values.name.trim() !== editingProfile.name ||
+        values.preset !== (editingProfile.preset || "custom") ||
+        values.model.trim() !== (editingProfile.model ?? "") ||
+        values.api_base.trim() !== (editingProfile.api_base ?? "") ||
+        values.reasoning_effort !== (editingProfile.reasoning_effort ?? "") ||
+        values.api_key.length > 0
+      );
+    }
+    return false;
+  })();
 
   return (
     <div className="mx-auto max-w-2xl space-y-6" data-testid="settings-view">
@@ -258,7 +411,9 @@ export function SettingsView() {
         <h1 className="text-2xl font-semibold text-white">Settings</h1>
       </div>
 
-      {loadError && !view ? (
+      {legacyFallback ? (
+        <LegacySettingsView />
+      ) : loadError && !view ? (
         <div
           role="alert"
           className="flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3"
@@ -273,79 +428,172 @@ export function SettingsView() {
         </div>
       ) : (
         <>
-          <Notices view={view} />
+          <Notices view={view} activatedNote={activatedNote} />
+          {loadError && (
+            <div
+              role="alert"
+              data-testid="settings-action-error"
+              className="flex items-start gap-3 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3"
+            >
+              <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-400" aria-hidden="true" />
+              <p className="text-sm text-red-300">{loadError}</p>
+            </div>
+          )}
+
           {view.config_path && (
             <p className="text-xs text-[#666]">
               Stored in <span className="font-mono text-[#888]">{view.config_path}</span>
             </p>
           )}
-          <SettingsForm
-            view={view}
-            values={values}
-            onChange={onChange}
-            dirty={dirty}
-            saving={saving}
-            testing={testing}
-            testResult={testResult}
-            fieldErrors={fieldErrors}
-            confirm={confirm}
-            baseChangeHost={hostOf(values.api_base)}
-            onTest={() => void onTest()}
-            onCancelTest={onCancelTest}
-            onSave={onSave}
-            onConfirmBaseChange={onConfirmBaseChange}
-            onCancelBaseChange={onCancelBaseChange}
-            onClearField={onClearField}
-            onReset={onReset}
-            onConfirmReset={() => void onConfirmReset()}
-            onCancelReset={onCancelReset}
-          />
+
+          {view.profiles.length === 0 ? (
+            <EmptyState editable={view.editable} busy={busy} onNew={openNew} />
+          ) : (
+            <ProfileList
+              profiles={view.profiles}
+              presets={view.presets}
+              editable={view.editable}
+              pendingDeleteId={pendingDeleteId}
+              busy={busy}
+              onNew={openNew}
+              onActivate={(id) => void onActivate(id)}
+              onEdit={openEdit}
+              onRequestDelete={setPendingDeleteId}
+              onConfirmDelete={(id) => void onConfirmDelete(id)}
+              onCancelDelete={() => setPendingDeleteId(null)}
+            />
+          )}
+
+          {view.editable && mode.kind !== "closed" && (
+            <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
+              <ProfileEditor
+                view={view}
+                editing={editingProfile}
+                values={values}
+                onChange={onChange}
+                canSave={canSave}
+                saving={saving}
+                testing={testing}
+                testResult={testResult}
+                fieldErrors={fieldErrors}
+                confirm={confirm}
+                baseChangeHost={hostOf(values.api_base)}
+                onTest={() => void onTest()}
+                onCancelTest={onCancelTest}
+                onSave={onSave}
+                onCancel={closeEditor}
+                onConfirmBaseChange={onConfirmBaseChange}
+                onCancelBaseChange={onCancelBaseChange}
+              />
+            </div>
+          )}
+
+          {/* Reset to environment lives under the list, like the single form. */}
+          {view.editable && view.managed && mode.kind === "closed" && (
+            <div className="pt-1">
+              {resetConfirm ? (
+                <ResetConfirm
+                  busy={busy}
+                  onConfirm={() => void onConfirmReset()}
+                  onCancel={() => setResetConfirm(false)}
+                />
+              ) : (
+                <button
+                  type="button"
+                  data-testid="settings-reset"
+                  onClick={() => setResetConfirm(true)}
+                  disabled={busy}
+                  className="inline-flex items-center justify-center rounded-lg px-3 py-2 text-sm text-[#888] transition-colors hover:text-white disabled:opacity-60"
+                >
+                  Reset to environment
+                </button>
+              )}
+            </div>
+          )}
         </>
       )}
     </div>
   );
 }
 
+/** The empty state for a fresh install with no profiles yet. */
+function EmptyState({
+  editable,
+  busy,
+  onNew,
+}: {
+  editable: boolean;
+  busy: boolean;
+  onNew: () => void;
+}) {
+  return (
+    <div
+      data-testid="settings-empty-state"
+      className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center"
+    >
+      <h2 className="text-base font-semibold text-white">No profiles yet</h2>
+      <p className="mx-auto mt-1 max-w-md text-sm text-[#888]">
+        Create a profile to connect a model for scans you start from the viewer. Pick a preset to
+        pre-fill the provider, or configure a custom endpoint.
+      </p>
+      {editable ? (
+        <button
+          type="button"
+          data-testid="profile-new"
+          onClick={onNew}
+          disabled={busy}
+          className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <Plus className="h-4 w-4" aria-hidden="true" />
+          New profile
+        </button>
+      ) : (
+        <p className="mt-4 text-xs text-[#666]">
+          Profiles can be created only from a viewer started on this machine.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /**
- * The stack of state notices above the form (frontend-components §SettingsView):
- * read-only, file-unreadable, scan-active, managed-missing-values, and the
- * command-line-replaced-the-connection note.
+ * State notices above the list: read-only, file-unreadable, scan-active, the
+ * managed-missing-values warning for the active profile, and the just-activated
+ * confirmation ("applies to scans you start next").
  */
-function Notices({ view }: { view: SettingsViewData }) {
+function Notices({ view, activatedNote }: { view: ProfilesViewData; activatedNote: boolean }) {
   const readOnly = !view.editable;
   const fileUnreadable = view.file_status === "unreadable";
-  const modelMissing = !view.fields.model.value;
-  const keyMissing = !view.fields.api_key.set;
-  const managedMissing = view.managed && (modelMissing || keyMissing);
-  const staleConnection = view.managed && modelMissing;
+  const active = view.profiles.find((p) => p.id === view.active_id) ?? null;
+  const activeMissing =
+    view.managed && active !== null && (!active.model || !active.api_key_set);
 
   return (
     <div className="space-y-3">
       {readOnly && (
         <NoticeCard tone="info" testId="settings-readonly-notice">
           Settings can be changed only from a viewer started on this machine (bound to a loopback
-          address). This viewer is reachable over the network, so the fields are read-only. You can
-          see the settings here, but not the API key.
+          address). This viewer is reachable over the network, so the profiles are read-only. You
+          can see them here, but not the API keys.
         </NoticeCard>
       )}
 
       {fileUnreadable && (
         <NoticeCard tone="error" testId="settings-unreadable-notice">
-          The config file is not valid JSON. Nothing can be saved until it is fixed; Save is
-          disabled.
+          The config file is not valid JSON. Nothing can be saved until it is fixed.
         </NoticeCard>
       )}
 
-      {managedMissing && (
+      {activeMissing && (
         <NoticeCard tone="warning" testId="settings-missing-values-notice">
-          Scans started from the viewer will fail until a model and an API key are set. Enter them,
-          or reset to use your shell environment.
+          Scans started from the viewer will fail until the active profile has a model and an API
+          key. Edit it, or reset to use your shell environment.
         </NoticeCard>
       )}
 
-      {staleConnection && (
-        <NoticeCard tone="warning" testId="settings-stale-connection-notice">
-          The command line replaced the saved connection. Enter your settings again.
+      {activatedNote && (
+        <NoticeCard tone="info" testId="settings-activated-note">
+          Applies to scans you start next. A running scan is not changed.
         </NoticeCard>
       )}
 
@@ -355,7 +603,7 @@ function Notices({ view }: { view: SettingsViewData }) {
         </NoticeCard>
       ) : (
         <p data-testid="settings-apply-note" className="text-xs text-[#666]">
-          Changes apply to scans you start after saving, never to a scan already running.
+          Activating a profile applies to scans you start next, never to a scan already running.
         </p>
       )}
     </div>

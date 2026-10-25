@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from strix.interface.viewer.llm_connection_test import ConnectionTester
+    from strix.interface.viewer.llm_profiles import ProfileStore
     from strix.interface.viewer.llm_settings import SettingsStore
     from strix.interface.viewer.scan_launcher import ScanLauncher
 
@@ -144,6 +145,7 @@ class _ViewerState:
         launcher: ScanLauncher | None = None,
         settings_store: SettingsStore | None = None,
         connection_tester: ConnectionTester | None = None,
+        profile_store: ProfileStore | None = None,
     ) -> None:
         # The run the viewer was started on, or None in launch mode with no run
         # at start. Handlers go through ``default_run()`` (DD-8), never this
@@ -157,6 +159,11 @@ class _ViewerState:
         # ``_handle_settings_*``). They never gate the pre-existing endpoints.
         self.settings_store = settings_store
         self.connection_tester = connection_tester
+        # The named-profiles layer over ``settings_store`` (same lock/file). It
+        # is optional: when not passed it is built lazily from ``settings_store``
+        # by ``profiles()`` so existing call sites keep working. When there is no
+        # settings store the four profile routes answer 403 like the flat ones.
+        self._profile_store = profile_store
         self.assets_dir = assets_dir
         # The strix_runs directory that holds launched runs; replaces the old
         # ``run_dir.parent`` as the base for listing and resolving runs. Always
@@ -187,11 +194,23 @@ class _ViewerState:
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
         self.cookie_name = SESSION_COOKIE_PREFIX
         # Sliding-window rate limiter for settings CHANGES (PUT + reset), shared
-        # across worker threads (BR-4: 10 per rolling minute). The connection
+        # across worker threads (BR-4: 30 per rolling minute). The connection
         # test keeps its own 6/min window inside ``ConnectionTester``, so it is
         # not counted here. ``_settings_change_lock`` guards the deque.
         self.settings_changes: deque[float] = deque()
         self.settings_change_lock = threading.Lock()
+
+    def profiles(self) -> ProfileStore | None:
+        """The profiles layer, built lazily from ``settings_store`` (DD).
+
+        Returns ``None`` only when no settings store is wired (the profile
+        routes then answer 403 ``settings_unavailable`` like the flat routes).
+        """
+        if self._profile_store is None and self.settings_store is not None:
+            from strix.interface.viewer.llm_profiles import ProfileStore
+
+            self._profile_store = ProfileStore(self.settings_store)
+        return self._profile_store
 
     def default_run(self) -> Path | None:
         """The run a request resolves against when none is named (DD-8, §10a).
@@ -243,6 +262,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "/api/scans/stop": self._handle_scan_stop,
                 "/api/settings/reset": self._handle_settings_reset,
                 "/api/settings/test": self._handle_settings_test,
+                "/api/settings/profiles/save": self._handle_profiles_save,
+                "/api/settings/profiles/activate": self._handle_profiles_activate,
+                "/api/settings/profiles/delete": self._handle_profiles_delete,
             }
             try:
                 handler = routes.get(path)
@@ -331,6 +353,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/settings":
                 self._handle_settings_get()
+                return
+            if path == "/api/settings/profiles":
+                self._handle_profiles_get()
                 return
             if path == "/api/auth/status":
                 self._handle_auth_status()
@@ -745,8 +770,10 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
         # --- LLM settings (Step 5.1; FR-1..FR-9, FR-27..FR-32, BR-1..BR-5) ---
 
-        # Settings change rate limit: 10 PUT+reset per rolling minute (BR-4).
-        _SETTINGS_CHANGE_LIMIT = 10
+        # Settings change rate limit (BR-4): 30 changes per rolling minute (PUT, reset,
+        # profile save/activate/delete). Raised from 10 so setting up several profiles
+        # in a row is not throttled.
+        _SETTINGS_CHANGE_LIMIT = 30
         _SETTINGS_RATE_WINDOW_SECONDS = 60.0
 
         def _handle_settings_get(self) -> None:
@@ -915,12 +942,85 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
                 return
             try:
-                values = state.settings_store.effective_test_values(body)
+                if isinstance(body, dict) and body.get("profile_id") is not None:
+                    profiles = state.profiles()
+                    assert profiles is not None
+                    values = profiles.effective_test_values(body)
+                else:
+                    values = state.settings_store.effective_test_values(body)
                 result = state.connection_tester.run(values)
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
             self._send_json(HTTPStatus.OK, result)
+
+        # --- LLM profiles (spec: several named profiles, one active) --------
+
+        def _handle_profiles_get(self) -> None:
+            """GET /api/settings/profiles — the profiles view (spec GET shape).
+
+            Same authorization as ``GET /api/settings``: cookie required, works
+            on any bind, ``editable`` reflects the real loopback decision. The
+            key is never returned.
+            """
+            if not self._has_session():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            profiles = state.profiles()
+            if profiles is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "settings_unavailable"})
+                return
+            scan_active = state.launcher is not None and state.launcher.active_run() is not None
+            try:
+                view = profiles.view(editable=self._is_loopback_bind(), scan_active=scan_active)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_profiles_change(
+            self, apply: Callable[[ProfileStore, dict[str, Any]], dict[str, Any]]
+        ) -> None:
+            """Shared body for the three profile-change POSTs (spec).
+
+            Same gate order and 10/min change window as ``/api/settings/reset``:
+            gate -> rate limit -> read body -> ``apply``. On success returns 200
+            with the profiles view; every ``LaunchError`` maps through the error
+            path. ``editable`` is overridden with the real loopback value.
+            """
+            if not self._settings_precheck():
+                return
+            profiles = state.profiles()
+            assert profiles is not None
+            if not self._settings_change_rate_ok():
+                return
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                view = apply(profiles, body)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            view["editable"] = self._is_loopback_bind()
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_profiles_save(self) -> None:
+            """POST /api/settings/profiles/save — create or update a profile."""
+            self._handle_profiles_change(lambda p, b: p.save(b))
+
+        def _handle_profiles_activate(self) -> None:
+            """POST /api/settings/profiles/activate — set and mirror the active profile."""
+            self._handle_profiles_change(lambda p, b: p.activate(b))
+
+        def _handle_profiles_delete(self) -> None:
+            """POST /api/settings/profiles/delete — delete a non-active profile."""
+            self._handle_profiles_change(lambda p, b: p.delete(b))
 
         # The four allow-listed downloadable artifacts, keyed by the fixed name
         # the client sends; the value is never joined from client text (BR-32).
@@ -1096,6 +1196,7 @@ def serve(
     launcher: ScanLauncher | None = None,
     settings_store: SettingsStore | None = None,
     connection_tester: ConnectionTester | None = None,
+    profile_store: ProfileStore | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -1122,6 +1223,10 @@ def serve(
     ``/api/settings*`` routes answer 403 ``settings_unavailable`` and
     ``/api/capabilities`` reports ``llm_settings.available=false``; the
     pre-existing endpoints are never affected.
+
+    ``profile_store`` is the optional named-profiles layer; when omitted it is
+    built lazily from ``settings_store`` by ``_ViewerState.profiles()`` so
+    existing callers need not change.
     """
     if runs_dir is None:
         if run_dir is None:
@@ -1137,6 +1242,7 @@ def serve(
         launcher=launcher,
         settings_store=settings_store,
         connection_tester=connection_tester,
+        profile_store=profile_store,
     )
     handler = _make_handler(state)
 

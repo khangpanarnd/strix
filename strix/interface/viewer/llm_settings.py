@@ -97,6 +97,14 @@ FIELD_NAMES: dict[str, tuple[str, ...]] = {
 #: The nine strip-set names: four canonical plus five aliases (BR-25). Upper-case.
 STRIP_SET: frozenset[str] = frozenset(CANONICAL.values()) | frozenset(ALIASES)
 
+#: The two env entries the *profiles* layer owns (``llm_profiles``). Named here
+#: so ``reset`` can remove them without importing the profiles module (which
+#: would be a circular import). Kept in sync with ``llm_profiles`` by
+#: ``tests/test_llm_profiles_store.py``.
+PROFILE_ENTRY_NAMES: frozenset[str] = frozenset(
+    {"STRIX_VIEWER_LLM_PROFILES", "STRIX_VIEWER_LLM_ACTIVE"}
+)
+
 #: Static suggestion list shown by the page (DD-7); suggestions only.
 MODEL_SUGGESTIONS: tuple[str, ...] = (
     "openai/gpt-5",
@@ -360,6 +368,7 @@ class SettingsStore:
             self._enforce_first_save_rule(validated, key_only_from_env)
 
             new_block = self._build_new_block(block, managed, environ, validated, clear)
+            self._sync_active_profile(new_block)
             new_data = dict(data)
             new_data["env"] = new_block
             write_secret_text(self.path, json.dumps(new_data, indent=2))
@@ -499,6 +508,42 @@ class SettingsStore:
             return env_value
         return self._first_present(block, names)
 
+    def _sync_active_profile(self, new_block: dict[str, Any]) -> None:
+        """Keep the active profile's stored fields in step with a flat PUT (spec).
+
+        When a profiles list exists with an active id, a flat ``PUT /api/settings``
+        must update that active profile's stored fields to match the just-written
+        canonical names, so the stored list and the canonical mirror never
+        disagree. Mutates ``new_block`` in place; a missing/empty/malformed list
+        or no active profile is a no-op (the single-settings path is unchanged).
+        """
+        raw = new_block.get("STRIX_VIEWER_LLM_PROFILES")
+        active_id = new_block.get("STRIX_VIEWER_LLM_ACTIVE")
+        if not isinstance(raw, str) or active_id is None:
+            return
+        try:
+            profiles = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(profiles, list):
+            return
+        wanted = str(active_id).lower()
+        changed = False
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            if str(profile.get("id", "")).lower() != wanted:
+                continue
+            for field, canonical in CANONICAL.items():
+                if canonical in new_block:
+                    profile[field] = new_block[canonical]
+                else:
+                    profile.pop(field, None)
+            changed = True
+            break
+        if changed:
+            new_block["STRIX_VIEWER_LLM_PROFILES"] = json.dumps(profiles)
+
     def _compute_warnings(self, validated: Mapping[str, str]) -> list[str]:
         """Advisory warnings after a save (currently only ``model_unfamiliar``)."""
         if "model" not in validated:
@@ -546,7 +591,8 @@ class SettingsStore:
                     "the config file is not valid JSON; it was left unchanged",
                     status=409,
                 )
-            new_block = {k: v for k, v in block.items() if k != MARKER and k not in STRIP_SET}
+            removed = {MARKER, *STRIP_SET, *PROFILE_ENTRY_NAMES}
+            new_block = {k: v for k, v in block.items() if k not in removed}
             new_data = dict(data)
             new_data["env"] = new_block
             write_secret_text(self.path, json.dumps(new_data, indent=2))
@@ -709,3 +755,36 @@ class SettingsStore:
         with self._lock:
             block, _status = self._read_env_block()
         return self._first_present(block, FIELD_NAMES["api_base"])
+
+    # --- helpers for the profiles layer (llm_profiles) ---------------------
+
+    @classmethod
+    def canonical_fields(cls, block: Mapping[str, Any]) -> dict[str, str | None]:
+        """Return the logical field -> value map read from an env ``block``.
+
+        Reads each field from its canonical name then its aliases (the same
+        precedence ``view`` uses). Used by the profiles layer to synthesise the
+        virtual ``default`` migration profile from managed flat values. The
+        block must already be upper-cased.
+        """
+        return {field: cls._first_present(block, FIELD_NAMES[field]) for field in CANONICAL}
+
+    @staticmethod
+    def mirror_block(block: Mapping[str, Any], fields: Mapping[str, str]) -> dict[str, Any]:
+        """Return ``block`` with ``fields`` mirrored to the canonical names (BR-18).
+
+        For each logical field present in ``fields`` the canonical name is set
+        and every alias of that field is removed; fields ABSENT from ``fields``
+        have both their canonical and alias names removed (so the mirror never
+        carries a stale value the active profile lacks). The marker is set. This
+        is the exact mirror rule the single-settings ``_build_new_block`` uses,
+        factored out so the profiles layer reuses it verbatim.
+        """
+        new_block = dict(block)
+        for field, canonical in CANONICAL.items():
+            for name in FIELD_NAMES[field]:
+                new_block.pop(name, None)
+            if field in fields:
+                new_block[canonical] = fields[field]
+        new_block[MARKER] = "1"
+        return new_block

@@ -516,7 +516,7 @@ def test_reset_without_confirm_is_400(tmp_path: Path, monkeypatch: pytest.Monkey
         httpd.server_close()
 
 
-# --- rate limit (BR-4: 10 PUT+reset per minute) -----------------------------
+# --- rate limit (BR-4: 30 changes per minute) -----------------------------
 
 
 def test_change_rate_limit_is_429_with_retry_after(
@@ -525,8 +525,8 @@ def test_change_rate_limit_is_429_with_retry_after(
     httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
         cookie = _session_cookie(url, token)
-        # 10 successful changes.
-        for i in range(10):
+        # 30 successful changes.
+        for i in range(30):
             status, _, _ = _request(
                 url,
                 "/api/settings",
@@ -535,7 +535,7 @@ def test_change_rate_limit_is_429_with_retry_after(
                 cookie=cookie,
             )
             assert status == 200, f"change {i} should succeed"
-        # The 11th within the window is rate-limited.
+        # The 31st within the window is rate-limited.
         status, headers, payload = _request(
             url, "/api/settings", method="PUT", body={"reasoning_effort": "high"}, cookie=cookie
         )

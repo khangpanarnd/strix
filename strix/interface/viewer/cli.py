@@ -23,6 +23,7 @@ from strix.core.paths import (
 )
 from strix.interface.viewer.launch_request import LaunchLimits
 from strix.interface.viewer.llm_connection_test import ConnectionTester
+from strix.interface.viewer.llm_profiles import ProfileStore
 from strix.interface.viewer.llm_settings import SettingsStore
 from strix.interface.viewer.scan_launcher import ScanLauncher
 from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
@@ -117,6 +118,7 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
         open_browser=not args.no_open,
         settings_store=settings_store,
         connection_tester=connection_tester,
+        profile_store=ProfileStore(settings_store),
     )
     open_url = authorized_url(url, token)
 
@@ -162,6 +164,7 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         launcher=launcher,
         settings_store=settings_store,
         connection_tester=connection_tester,
+        profile_store=ProfileStore(settings_store),
     )
     open_url = authorized_url(url, token)
 

@@ -260,7 +260,7 @@ Open the printed link, choose **New scan**, enter a URL, domain, or IP address, 
 
 ### Configure the LLM from the Viewer
 
-You do not need to export variables or restart anything to change the model. Open **Settings** in the sidebar of `strix view` and set:
+You do not need to export variables or restart anything to change the model. Open **Settings** in the sidebar of ``strix view``. You can keep **several LLM profiles** (for example OpenAI, Anthropic, DeepSeek, GLM, Qwen, Gemini, OpenRouter, Moonshot, Ollama, or any OpenAI-compatible server) and mark exactly one **active**; scans you start from the viewer use the active profile, and switching takes one click. Choosing a provider preset pre-fills the model-id prefix (``deepseek/``, ``zai/`` for GLM, ``dashscope/`` for Qwen, ``anthropic/``, ...) and example models. Each profile has:
 
 - **Model** - any LiteLLM model id, for example `anthropic/claude-sonnet-4-5` (suggestions are offered, any text is accepted).
 - **API key** - write-only: the page shows only that a key is set and where it comes from, never the key itself.
@@ -269,6 +269,8 @@ You do not need to export variables or restart anything to change the model. Ope
 
 **Test connection** sends one tiny request with the values you typed, before you save, in a separate short-lived process so nothing leaks into the viewer. **Save** writes `~/.strix/cli-config.json` (the same file the command line uses, owner-only permissions), so a model and key saved here also work for `strix` in a terminal.
 
+- The active profile is also written to the flat settings in `~/.strix/cli-config.json`, so `strix` in a terminal uses it too. The other profiles are stored in the same file and are never shown back in the page (keys stay write-only).
+- You cannot delete the active profile; activate another one first. Your earlier single set of settings appears as a profile named **Default**.
 - Saved values apply to scans you start **after** saving; a running scan is not changed.
 - Once you save here, the viewer ignores LLM variables from the shell for scans it launches, so the page and the scan always agree. **Reset to environment** hands control back to your shell.
 - Changing the base URL asks you to re-enter the key, and shows where the key will be sent, so a saved key cannot be quietly redirected.

@@ -721,9 +721,11 @@ export async function resetSettings(): Promise<SettingsView> {
  */
 export async function testConnection(
   update: Omit<SettingsUpdate, "clear">,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  profileId?: string
 ): Promise<TestResult> {
   const body: Record<string, unknown> = {};
+  if (profileId !== undefined) body.profile_id = profileId;
   if (update.model !== undefined) body.model = update.model;
   if (update.api_key !== undefined) body.api_key = update.api_key;
   if (update.api_base !== undefined) body.api_base = update.api_base;
@@ -740,3 +742,208 @@ export async function testConnection(
 }
 
 
+
+// ---------------------------------------------------------------------------
+// LLM profiles (llm-profiles-spec.md)
+//
+// Several named LLM profiles can be saved; exactly one is active. Scans
+// launched from the viewer use the active profile. These endpoints extend the
+// single-settings feature: the key stays write-only (never returned), changes
+// need a loopback bind, and errors carry a machine-readable code surfaced via
+// the same `SettingsError` class.
+// ---------------------------------------------------------------------------
+
+/** One saved LLM profile as returned by GET /api/settings/profiles. */
+export interface LlmProfile {
+  id: string;
+  name: string;
+  preset: string;
+  model: string | null;
+  api_base: string | null;
+  reasoning_effort: string | null;
+  /** Whether a key is saved for this profile. The key itself is never returned. */
+  api_key_set: boolean;
+  active: boolean;
+}
+
+/** A static preset the server advertises; it only pre-fills the editor form. */
+export interface LlmPreset {
+  id: string;
+  label: string;
+  model_prefix: string;
+  example_models: string[];
+  /** A base-URL hint (may be null); pre-filled into the base field when present. */
+  default_base: string | null;
+  needs_key: boolean;
+  note: string;
+}
+
+/** GET /api/settings/profiles response (the whole profiles page state). */
+export interface ProfilesView {
+  profiles: LlmProfile[];
+  active_id: string | null;
+  presets: LlmPreset[];
+  max_profiles: number;
+  managed: boolean;
+  editable: boolean;
+  file_status: "ok" | "missing" | "unreadable";
+  config_path: string;
+  platform: string;
+  scan_active: boolean;
+  reasoning_choices: string[];
+  model_suggestions: string[];
+  /** Advisory save warnings (e.g. `model_unfamiliar`); present on a save. */
+  warnings: string[];
+}
+
+/**
+ * The POST /api/settings/profiles/save body. No `id` creates a profile; an
+ * `id` updates one (omitted fields stay unchanged). The key is included only
+ * when the user typed one; `clear` names fields to remove. Saving does NOT
+ * activate the profile.
+ */
+export interface ProfileSaveBody {
+  id?: string;
+  name: string;
+  preset?: string;
+  model?: string;
+  api_key?: string;
+  api_base?: string;
+  reasoning_effort?: string;
+  clear?: Array<"api_key" | "api_base" | "reasoning_effort">;
+}
+
+function parseProfileEntry(raw: unknown): LlmProfile | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === "string" ? r.id : "";
+  const name = typeof r.name === "string" ? r.name : "";
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    preset: typeof r.preset === "string" ? r.preset : "custom",
+    model: typeof r.model === "string" ? r.model : null,
+    api_base: typeof r.api_base === "string" ? r.api_base : null,
+    reasoning_effort: typeof r.reasoning_effort === "string" ? r.reasoning_effort : null,
+    api_key_set: r.api_key_set === true,
+    active: r.active === true,
+  };
+}
+
+function parsePresetEntry(raw: unknown): LlmPreset | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === "string" ? r.id : "";
+  if (!id) return null;
+  return {
+    id,
+    label: typeof r.label === "string" ? r.label : id,
+    model_prefix: typeof r.model_prefix === "string" ? r.model_prefix : "",
+    example_models: parseStringList(r.example_models),
+    default_base: typeof r.default_base === "string" && r.default_base ? r.default_base : null,
+    needs_key: r.needs_key === true,
+    note: typeof r.note === "string" ? r.note : "",
+  };
+}
+
+/** Normalise a raw profiles payload into a fully-typed `ProfilesView`. */
+function parseProfilesView(raw: unknown): ProfilesView {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const profiles = Array.isArray(r.profiles)
+    ? r.profiles.map(parseProfileEntry).filter((p): p is LlmProfile => p !== null)
+    : [];
+  const presets = Array.isArray(r.presets)
+    ? r.presets.map(parsePresetEntry).filter((p): p is LlmPreset => p !== null)
+    : [];
+  return {
+    profiles,
+    active_id: typeof r.active_id === "string" ? r.active_id : null,
+    presets,
+    max_profiles: typeof r.max_profiles === "number" ? r.max_profiles : 20,
+    managed: r.managed === true,
+    editable: r.editable === true,
+    file_status: parseFileStatus(r.file_status),
+    config_path: typeof r.config_path === "string" ? r.config_path : "",
+    platform: typeof r.platform === "string" ? r.platform : "",
+    scan_active: r.scan_active === true,
+    reasoning_choices: parseStringList(r.reasoning_choices),
+    model_suggestions: parseStringList(r.model_suggestions),
+    warnings: parseStringList(r.warnings),
+  };
+}
+
+/**
+ * GET /api/settings/profiles. Same-origin; throws a `SettingsError` on any
+ * non-200 (the caller inspects `status` to fall back to the single-form page
+ * on 404/403 from an older server).
+ */
+export async function fetchProfiles(): Promise<ProfilesView> {
+  const res = await fetch("/api/settings/profiles", {
+    cache: "no-store",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    let data: Record<string, unknown> = {};
+    try {
+      const parsed = await res.json();
+      if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw settingsErrorFrom(data, res.status);
+  }
+  return parseProfilesView(await res.json());
+}
+
+/**
+ * POST /api/settings/profiles/save. Sends only the fields present in `body`
+ * (the caller includes a field only when it changed, and the key only when
+ * typed). Resolves to the refreshed view (with `warnings`) on 200, else throws
+ * a `SettingsError`.
+ */
+export async function saveProfile(body: ProfileSaveBody): Promise<ProfilesView> {
+  const payload: Record<string, unknown> = { name: body.name };
+  if (body.id !== undefined) payload.id = body.id;
+  if (body.preset !== undefined) payload.preset = body.preset;
+  if (body.model !== undefined) payload.model = body.model;
+  if (body.api_key !== undefined) payload.api_key = body.api_key;
+  if (body.api_base !== undefined) payload.api_base = body.api_base;
+  if (body.reasoning_effort !== undefined) payload.reasoning_effort = body.reasoning_effort;
+  if (body.clear && body.clear.length > 0) payload.clear = body.clear;
+  const { ok, status, data } = await sendSettingsJson(
+    "/api/settings/profiles/save",
+    "POST",
+    payload
+  );
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseProfilesView(data);
+}
+
+/**
+ * POST /api/settings/profiles/activate. Mirrors the profile into the canonical
+ * names and sets it active. Resolves to the refreshed view on 200, else throws.
+ */
+export async function activateProfile(id: string): Promise<ProfilesView> {
+  const { ok, status, data } = await sendSettingsJson(
+    "/api/settings/profiles/activate",
+    "POST",
+    { id }
+  );
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseProfilesView(data);
+}
+
+/**
+ * POST /api/settings/profiles/delete. 409 `cannot_delete_active_profile` for
+ * the active one. Resolves to the refreshed view on 200, else throws.
+ */
+export async function deleteProfile(id: string): Promise<ProfilesView> {
+  const { ok, status, data } = await sendSettingsJson(
+    "/api/settings/profiles/delete",
+    "POST",
+    { id }
+  );
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseProfilesView(data);
+}

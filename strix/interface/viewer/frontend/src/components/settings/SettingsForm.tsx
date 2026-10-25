@@ -19,18 +19,26 @@ import { ResetConfirm } from "@/components/settings/ResetConfirm";
  * keyboard-reachable (NFR-8).
  */
 
-/** The four fields a server error code can target; `banner` is the catch-all. */
-export type SettingsFieldKey = "model" | "api_key" | "api_base" | "reasoning_effort" | "banner";
+/** The fields a server error code can target; `banner` is the catch-all. */
+export type SettingsFieldKey =
+  | "name"
+  | "model"
+  | "api_key"
+  | "api_base"
+  | "reasoning_effort"
+  | "banner";
 
 /** Per-field server error messages keyed by the field the code maps to. */
 export type SettingsFieldErrors = Partial<Record<SettingsFieldKey, string>>;
 
 /**
  * Map a server error `code` to the field it belongs to (frontend-components
- * §SettingsForm): `invalid_model` → model; key codes → key; base codes → base;
- * `invalid_reasoning_effort` → select; everything else → the banner.
+ * §SettingsForm): profile-name codes → name; `invalid_model` → model; key
+ * codes → key; base codes → base; `invalid_reasoning_effort` → select;
+ * everything else → the banner.
  */
 export function fieldForSettingsCode(code: string): SettingsFieldKey {
+  if (code === "invalid_profile_name" || code === "profile_name_taken") return "name";
   if (code === "invalid_model") return "model";
   if (code === "invalid_api_key" || code.startsWith("key_required")) return "api_key";
   if (code === "invalid_api_base" || code.startsWith("api_base_")) return "api_base";
@@ -356,7 +364,7 @@ export function SettingsForm(props: SettingsFormProps) {
   );
 }
 
-function inputClass(hasError: boolean): string {
+export function inputClass(hasError: boolean): string {
   return cn(
     "block w-full rounded-lg border bg-[rgba(255,255,255,0.03)] px-3 py-2 text-sm text-white placeholder:text-[#555] transition-colors focus:outline-none focus:ring-2 focus:ring-white/20 disabled:opacity-60",
     hasError ? "border-red-500/60" : "border-[#2a2a2a] focus:border-[#555]"
@@ -364,7 +372,7 @@ function inputClass(hasError: boolean): string {
 }
 
 /** A field-level error: an icon plus text, tied to its field by id (NFR-8). */
-function FieldError({ id, message, testId }: { id: string; message?: string; testId: string }) {
+export function FieldError({ id, message, testId }: { id: string; message?: string; testId: string }) {
   if (!message) return null;
   return (
     <p
