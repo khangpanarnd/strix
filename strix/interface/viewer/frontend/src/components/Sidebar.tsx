@@ -165,7 +165,7 @@ export default function Sidebar({
                   <span className="text-[10px] font-semibold text-white">S</span>
                 </span>
                 <span className="flex flex-1 flex-row items-center gap-2 min-w-0">
-                  <span className="truncate min-w-0 text-[14px] font-medium text-[#ededed]">PRDCV Strix Agents</span>
+                  <span className="truncate min-w-0 text-[14px] font-medium text-[#ededed]">P-hacker Strix Agents</span>
                   <span className="flex h-5 flex-shrink-0 items-center rounded px-2 text-[11px] font-medium text-[#888] bg-[rgba(255,255,255,0.08)]">
                     Local
                   </span>

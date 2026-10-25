@@ -43,7 +43,7 @@ import SettingsView from "@/components/settings/SettingsView";
 export type View = "overview" | "issues" | "agents" | "history" | "launch" | "settings";
 
 const TRUST_BANNER =
-  "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by PRDCV Strix Agents.";
+  "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by P-hacker Strix Agents.";
 
 const SEVERITY_ORDER: VulnerabilitySeverity[] = ["critical", "high", "medium", "low"];
 const POLL_MS = 500;
@@ -304,8 +304,8 @@ export default function App() {
         <div className="border-b border-[#222]">
           <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-4 flex items-center gap-1.5">
             <div className="flex items-center gap-1.5 opacity-90 lg:hidden">
-              <img src="./logo.png" alt="PRDCV Strix Agents" className="w-10 h-8 object-cover" />
-              <div className="text-base text-white font-medium tracking-tight">PRDCV Strix Agents</div>
+              <img src="./logo.png" alt="P-hacker Strix Agents" className="w-10 h-8 object-cover" />
+              <div className="text-base text-white font-medium tracking-tight">P-hacker Strix Agents</div>
             </div>
             {run && <LiveIndicator finished={run.finished} />}
             {activeRun && run && !run.finished && (

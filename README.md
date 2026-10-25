@@ -210,7 +210,7 @@ This fork tracks upstream Strix and adds a few things on top of it:
 - **Launch scans from the browser** - `strix view --launch` adds a **New scan** form with target safety checks, a budget cap, Stop, and report downloads (see [Launch a Scan from the Viewer](#launch-a-scan-from-the-viewer)).
 - **`--run-name`** - choose the run directory name for a headless scan, so automation knows where results land.
 - **Configure the LLM from the browser** - a Settings page for model, API key, API base URL and reasoning effort, applied to the next scan with no restart (see [Configure the LLM from the Viewer](#configure-the-llm-from-the-viewer)).
-- **A local-only viewer UI branded "PRDCV Strix Agents"** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
+- **A local-only viewer UI branded "P-hacker Strix Agents"** - the Strix Cloud promotions are gone: no Run in the cloud button, PR Security Reviews, Integrations or Members entries, upgrade dialogs, Feedback & support form, or links to app.strix.ai.
 
 ---
 
