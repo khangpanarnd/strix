@@ -33,6 +33,7 @@ import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
 import PastRunsView from "@/components/PastRunsView";
 import { RunDetails } from "@/components/RunDetails";
+import { SystemIntro } from "@/components/SystemIntro";
 import { TrustToast } from "@/components/TrustToast";
 
 import { LaunchView } from "@/components/launch/LaunchView";
@@ -382,7 +383,7 @@ export default function App() {
               {/* Tab strip: shown on small screens where the sidebar is hidden. */}
               <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
                 <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
-                  Pentest Overview
+                  Overview
                 </TabButton>
                 <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
                   Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
@@ -642,6 +643,8 @@ function OverviewTab({
 
   return (
     <div className="space-y-6">
+      <SystemIntro />
+
       <div className="animate-card-in">
         <RunDetails raw={raw} durationSeconds={summary.durationSeconds} />
       </div>

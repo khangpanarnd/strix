@@ -189,7 +189,7 @@ export default function Sidebar({
             )}
             <NavItem
               icon={<ProjectsIcon />}
-              label="Pentest Overview"
+              label="Overview"
               active={view === "overview"}
               onClick={() => onSelectView("overview")}
             />
