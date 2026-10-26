@@ -1,6 +1,7 @@
 import { History, ChevronRight, Terminal } from "lucide-react";
 import type { RunListEntry, RunsPayload, RunSeverityCounts } from "@/data/serverSource";
 import { runTitle } from "@/lib/target-utils";
+import { formatUtc, formatUtcShort, parseTimestamp } from "@/lib/time";
 
 
 /**
@@ -35,27 +36,17 @@ function SeverityChips({ counts }: { counts: RunSeverityCounts }) {
 }
 
 function formatDate(iso: string | null): string | null {
-  if (!iso) return null;
-  const normalized = iso.trim().replace(" UTC", "Z").replace(" ", "T");
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  const d = parseTimestamp(iso);
+  return d ? formatUtcShort(d) : null;
 }
 
 /**
  * Relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), falling back to
- * the absolute date for anything older than a week (mirrors the pro app).
+ * the absolute UTC date for anything older than a week (mirrors the pro app).
  */
 function formatTimeAgo(iso: string | null): string | null {
-  if (!iso) return null;
-  const normalized = iso.trim().replace(" UTC", "Z").replace(" ", "T");
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return null;
+  const d = parseTimestamp(iso);
+  if (!d) return null;
   const diffMs = Date.now() - d.getTime();
   const mins = Math.floor(diffMs / 60000);
   if (mins < 1) return "just now";
@@ -118,6 +109,8 @@ export default function PastRunsView({
       {runs.runs.map((run: RunListEntry) => {
         const active = run.name === activeRun;
         const date = formatTimeAgo(run.start_time) ?? formatTimeAgo(run.end_time);
+        const exactDate = parseTimestamp(run.start_time) ?? parseTimestamp(run.end_time);
+        const exactUtc = exactDate ? formatUtc(exactDate) : null;
         const title = runTitle(run.target, run.name);
         return (
           <button
@@ -141,7 +134,9 @@ export default function PastRunsView({
               <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#666]">
                 {run.scan_mode && <span className="capitalize">{run.scan_mode}</span>}
                 {run.scan_mode && (date || run.status) && <span className="text-[#333]">·</span>}
-                {date && <span>{date}</span>}
+                {date && (
+                  <span title={exactUtc ?? undefined}>{date}</span>
+                )}
                 {date && run.status && <span className="text-[#333]">·</span>}
                 {run.status && <span className="capitalize">{run.status}</span>}
               </div>

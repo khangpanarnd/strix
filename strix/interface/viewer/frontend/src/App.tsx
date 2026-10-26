@@ -33,6 +33,7 @@ import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
 import PastRunsView from "@/components/PastRunsView";
 import { RunDetails } from "@/components/RunDetails";
+import { ScanTimeline } from "@/components/ScanTimeline";
 import { SystemIntro } from "@/components/SystemIntro";
 import { TrustToast } from "@/components/TrustToast";
 
@@ -448,7 +449,7 @@ export default function App() {
             </div>
           ) : run && counts ? (
             <>
-              <SummaryHeader summary={run.summary} />
+              <SummaryHeader summary={run.summary} finished={run.finished} />
 
               {mobileTabs}
 
@@ -568,30 +569,27 @@ function LiveIndicator({ finished }: { finished: boolean }) {
   );
 }
 
-function formatDuration(seconds: number | null): string | null {
-  if (seconds == null) return null;
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-function SummaryHeader({ summary }: { summary: ParsedRunSummary }) {
-  const duration = formatDuration(summary.durationSeconds);
+function SummaryHeader({ summary, finished }: { summary: ParsedRunSummary; finished: boolean }) {
   return (
-    <div>
-      <h1 className="text-2xl font-semibold text-white">
-        {runTitle(summary.targets[0] ?? null, summary.runName ?? summary.runId ?? "Pentest results")}
-      </h1>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[#888]">
-        {summary.targets.length > 0 && (
-          <span className="font-mono text-[#aaa]">{summary.targets.join(", ")}</span>
-        )}
-        {summary.scanMode && <Meta label={summary.scanMode} />}
-        {duration && <Meta label={duration} />}
-        {summary.status && <Meta label={summary.status} />}
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-semibold text-white">
+          {runTitle(summary.targets[0] ?? null, summary.runName ?? summary.runId ?? "Pentest results")}
+        </h1>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[#888]">
+          {summary.targets.length > 0 && (
+            <span className="font-mono text-[#aaa]">{summary.targets.join(", ")}</span>
+          )}
+          {summary.scanMode && <Meta label={summary.scanMode} />}
+          {summary.status && <Meta label={summary.status} />}
+        </div>
       </div>
+      <ScanTimeline
+        startTime={summary.startTime}
+        endTime={summary.endTime}
+        status={summary.status}
+        finished={finished}
+      />
     </div>
   );
 }

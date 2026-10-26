@@ -183,6 +183,12 @@ export default function Sidebar({
         {/* Navigation */}
         <nav className="relative min-w-[160px] flex-1 overflow-y-auto overflow-x-clip scrollbar-thin pb-10 pt-2">
           <div className="relative flex flex-col gap-px px-2">
+            <NavItem
+              icon={<ProjectsIcon />}
+              label="Overview"
+              active={view === "overview"}
+              onClick={() => onSelectView("overview")}
+            />
             {scanLaunchAvailable && (
               <NavItem
                 icon={<Plus className="h-4 w-4" />}
@@ -192,12 +198,6 @@ export default function Sidebar({
                 testId="sidebar-new-scan"
               />
             )}
-            <NavItem
-              icon={<ProjectsIcon />}
-              label="Overview"
-              active={view === "overview"}
-              onClick={() => onSelectView("overview")}
-            />
             <NavItem
               icon={<ClipboardList className="h-4 w-4" />}
               label="Last scan"
@@ -211,6 +211,13 @@ export default function Sidebar({
               count={issuesCount > 0 ? issuesCount : undefined}
               active={view === "issues"}
               onClick={() => onSelectView("issues")}
+            />
+            <NavItem
+              icon={<History className="h-4 w-4" />}
+              label="Past runs"
+              count={runCount > 0 ? runCount : undefined}
+              active={view === "history"}
+              onClick={onOpenHistory}
             />
             {agentCount > 0 && (
               <NavItem
@@ -242,14 +249,6 @@ export default function Sidebar({
                 testId="sidebar-notifications"
               />
             )}
-            <NavItem
-              icon={<History className="h-4 w-4" />}
-              label="Past runs"
-              count={runCount > 0 ? runCount : undefined}
-              active={view === "history"}
-              onClick={onOpenHistory}
-            />
-
           </div>
         </nav>
 
