@@ -169,3 +169,12 @@
   .landing footer { border-top: 1px solid var(--rule); padding-block: 36px 56px; color: var(--slate); font-size: 0.9375rem; }
   .landing footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 40px; }
   .landing footer a { text-underline-offset: 4px; }
+
+/* ---------- first-scan layout additions ---------- */
+.landing .steps span b { color: var(--ink); font-weight: 600; }
+.landing .aside { color: var(--slate); font-size: 0.9375rem; margin: 28px 0 0; max-width: 62ch; }
+.landing .body > .cta { margin-top: 28px; }
+.landing .prereq.stack { grid-template-columns: minmax(0, 1fr); gap: 18px; margin: 0; }
+.landing .prereq.stack li { padding-left: 28px; max-width: 62ch; }
+.landing .prereq.stack li::before { top: .7em; }
+.landing .stage .player { margin: 0; }
