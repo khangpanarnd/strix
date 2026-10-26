@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Bot, History, Plus, Settings } from "lucide-react";
+import { AlertTriangle, Bot, ClipboardList, History, Plus, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpConnectionStatus } from "@/data/serverSource";
 import type { View } from "@/App";
@@ -192,6 +192,13 @@ export default function Sidebar({
               label="Overview"
               active={view === "overview"}
               onClick={() => onSelectView("overview")}
+            />
+            <NavItem
+              icon={<ClipboardList className="h-4 w-4" />}
+              label="Last scan"
+              active={view === "lastscan"}
+              onClick={() => onSelectView("lastscan")}
+              testId="sidebar-last-scan"
             />
             <NavItem
               icon={<AlertTriangle className="h-4 w-4" />}

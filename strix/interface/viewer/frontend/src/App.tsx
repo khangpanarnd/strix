@@ -41,7 +41,14 @@ import { StopScanButton } from "@/components/launch/StopScanButton";
 import { ReportDownloads } from "@/components/launch/ReportDownloads";
 import SettingsView from "@/components/settings/SettingsView";
 
-export type View = "overview" | "issues" | "agents" | "history" | "launch" | "settings";
+export type View =
+  | "overview"
+  | "lastscan"
+  | "issues"
+  | "agents"
+  | "history"
+  | "launch"
+  | "settings";
 
 const TRUST_BANNER =
   "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by P-hacker Strix Agents.";
@@ -207,8 +214,10 @@ export default function App() {
   }, [run]);
 
   // Per-run guard for the default view: land on Agents while a scan is live,
-  // Overview once it finishes. Applied at most once per run and never once the
-  // user has navigated manually (userSetView flips the guard).
+  // Last scan (the results) once it finishes. Overview is the run-independent
+  // product introduction and is never a run default. Applied at most once per
+  // run and never once the user has navigated manually (userSetView flips the
+  // guard).
   const initialViewAppliedRef = useRef(false);
 
   // Reset the guard whenever the active run changes so the newly selected run
@@ -221,7 +230,7 @@ export default function App() {
     if (initialViewAppliedRef.current || !run) return;
     if (run.finished) {
       initialViewAppliedRef.current = true;
-      setView("overview");
+      setView("lastscan");
     } else if (agentCount > 0) {
       // Live and agents have appeared: default to the agent graph. If it is
       // live but no agents exist yet, wait (do not apply, do not set the flag).
@@ -252,13 +261,13 @@ export default function App() {
     userSetView("launch");
   }, [userSetView]);
 
-  // A launch succeeded and the new run is watchable: select it and land on the
-  // overview, which immediately picks up the live-run defaults (Agents once
-  // agents appear). selectRun resets activeRun, which restarts the poll loop.
+  // A launch succeeded and the new run is watchable: select it and land on
+  // Last scan, which shows the new run's live details. selectRun resets
+  // activeRun, which restarts the poll loop.
   const onLaunched = useCallback(
     (runName: string) => {
       selectRun(runName);
-      userSetView("overview");
+      userSetView("lastscan");
     },
     [selectRun, userSetView]
   );
@@ -275,6 +284,27 @@ export default function App() {
     userSetView("settings");
   }, [userSetView]);
 
+
+  // Tab strip for small screens, where the sidebar is hidden. Shared by the
+  // Overview (which needs no run) and the run-backed views.
+  const mobileTabs = (
+    <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
+      <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
+        Overview
+      </TabButton>
+      <TabButton active={view === "lastscan"} onClick={() => userSetView("lastscan")}>
+        Last scan
+      </TabButton>
+      <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
+        Issues{(run?.vulnerabilities.length ?? 0) > 0 ? ` (${run?.vulnerabilities.length})` : ""}
+      </TabButton>
+      {agentCount > 0 && (
+        <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
+          Agents ({agentCount})
+        </TabButton>
+      )}
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-black text-white flex">
@@ -329,7 +359,7 @@ export default function App() {
         </div>
 
         <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "history" && view !== "launch" && view !== "settings" && (
+          {error && !run && view !== "overview" && view !== "history" && view !== "launch" && view !== "settings" && (
             <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
               <p className="text-sm text-red-300">{error}</p>
@@ -371,6 +401,27 @@ export default function App() {
                 onSelectRun={selectRun}
               />
             </div>
+          ) : view === "overview" ? (
+            <div className="space-y-6">
+              {mobileTabs}
+              <SystemIntro />
+            </div>
+          ) : !run && !error && activeRun === null && !initialRun ? (
+            <div
+              data-testid="no-scans-yet"
+              className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center"
+            >
+              <p className="text-sm text-[#888]">No scans yet.</p>
+              {scanLaunchAvailable && (
+                <button
+                  type="button"
+                  onClick={openLaunch}
+                  className="mt-4 inline-flex items-center rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-neutral-200"
+                >
+                  Start a new scan
+                </button>
+              )}
+            </div>
           ) : !run && !error ? (
             <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
               <div className="w-6 h-6 mx-auto mb-3 rounded-full border-2 border-[#333] border-t-white animate-spin" />
@@ -380,23 +431,10 @@ export default function App() {
             <>
               <SummaryHeader summary={run.summary} />
 
-              {/* Tab strip: shown on small screens where the sidebar is hidden. */}
-              <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
-                <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
-                  Overview
-                </TabButton>
-                <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
-                  Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
-                </TabButton>
-                {agentCount > 0 && (
-                  <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
-                    Agents ({agentCount})
-                  </TabButton>
-                )}
-              </div>
+              {mobileTabs}
 
-              {view === "overview" ? (
-                <OverviewTab
+              {view === "lastscan" ? (
+                <LastScanTab
                   summary={run.summary}
                   counts={counts}
                   total={run.vulnerabilities.length}
@@ -617,7 +655,7 @@ function dedupeHeadings(md: string): string {
   return out.join("\n");
 }
 
-function OverviewTab({
+function LastScanTab({
   summary,
   counts,
   total,
@@ -643,8 +681,6 @@ function OverviewTab({
 
   return (
     <div className="space-y-6">
-      <SystemIntro />
-
       <div className="animate-card-in">
         <RunDetails raw={raw} durationSeconds={summary.durationSeconds} />
       </div>
