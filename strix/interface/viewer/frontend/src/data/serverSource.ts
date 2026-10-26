@@ -231,6 +231,11 @@ export interface Capabilities {
    * server that predates this feature simply hides the Settings entry.
    */
   llm_settings: LlmSettingsCapability;
+  /**
+   * Whether the Notifications page is offered and editable (loopback bind).
+   * Defaults to unavailable so a server that predates it simply hides the entry.
+   */
+  notifications: LlmSettingsCapability;
 }
 
 /** The `llm_settings` capability block (GET /api/capabilities, FR-3). */
@@ -351,6 +356,7 @@ export async function fetchCapabilities(): Promise<Capabilities> {
     initial_run: obj?.initial_run !== false,
     scan_limits: parseScanLimits((obj as Record<string, unknown>)?.scan_limits),
     llm_settings: parseLlmSettings((obj as Record<string, unknown>)?.llm_settings),
+    notifications: parseLlmSettings((obj as Record<string, unknown>)?.notifications),
   };
 }
 
@@ -951,4 +957,174 @@ export async function deleteProfile(id: string): Promise<ProfilesView> {
   );
   if (!ok) throw settingsErrorFrom(data, status);
   return parseProfilesView(data);
+}
+
+
+// ---------------------------------------------------------------------------
+// Scan notifications (Slack / Microsoft Teams / Telegram)
+//
+// GET/PUT /api/notifications and POST /api/notifications/test back the
+// Notifications page. Webhook URLs and bot tokens are write-only: they are
+// sent on save/test but never returned; the view only says whether one is set
+// (plus a webhook's host). Errors reuse `SettingsError` with the server's code.
+// ---------------------------------------------------------------------------
+
+export type NotificationChannelKey = "slack" | "teams" | "telegram";
+export type NotificationEventKey = "started" | "progress" | "finished" | "stopped" | "failed";
+
+export const NOTIFICATION_CHANNELS: readonly NotificationChannelKey[] = [
+  "slack",
+  "teams",
+  "telegram",
+] as const;
+export const NOTIFICATION_EVENTS: readonly NotificationEventKey[] = [
+  "started",
+  "progress",
+  "finished",
+  "stopped",
+  "failed",
+] as const;
+
+/** One destination as the server reports it. Never carries a secret. */
+export interface NotificationChannelView {
+  enabled: boolean;
+  /** Everything needed to send is saved. */
+  configured: boolean;
+  /** Slack / Teams: the saved webhook's host (e.g. `hooks.slack.com`), else null. */
+  host: string | null;
+  /** Telegram: whether a bot token is saved. */
+  token_set: boolean;
+  /** Telegram: the saved chat id (not a secret), else an empty string. */
+  chat_id: string;
+}
+
+/** GET /api/notifications (and the body returned after a save). */
+export interface NotificationsView {
+  enabled: boolean;
+  events: Record<NotificationEventKey, boolean>;
+  progress_interval_minutes: number;
+  interval_min: number;
+  interval_max: number;
+  channels: Record<NotificationChannelKey, NotificationChannelView>;
+  /** Editable only on a loopback bind; otherwise read-only. */
+  editable: boolean;
+  /** `unreadable` means the file is not valid JSON; Save is blocked. */
+  file_status: "ok" | "missing" | "unreadable";
+  config_path: string;
+}
+
+/** The PUT body: any subset; secrets are included only when the user typed one. */
+export interface NotificationsUpdate {
+  enabled?: boolean;
+  events?: Partial<Record<NotificationEventKey, boolean>>;
+  progress_interval_minutes?: number;
+  channels?: {
+    slack?: { enabled?: boolean; webhook_url?: string };
+    teams?: { enabled?: boolean; webhook_url?: string };
+    telegram?: { enabled?: boolean; bot_token?: string; chat_id?: string };
+  };
+  /** Secrets to remove, as `<channel>.<field>`. */
+  clear?: Array<"slack.webhook_url" | "teams.webhook_url" | "telegram.bot_token" | "telegram.chat_id">;
+}
+
+/** The test body: a channel plus optional typed values that override saved ones. */
+export interface NotificationTestBody {
+  channel: NotificationChannelKey;
+  webhook_url?: string;
+  bot_token?: string;
+  chat_id?: string;
+}
+
+/** POST /api/notifications/test. A failed delivery is `ok: false`, not an error. */
+export interface NotificationTestResult {
+  ok: boolean;
+  message: string;
+  status: number | null;
+}
+
+function parseNotificationChannel(raw: unknown): NotificationChannelView {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return {
+    enabled: r.enabled === true,
+    configured: r.configured === true,
+    host: typeof r.host === "string" && r.host ? r.host : null,
+    token_set: r.token_set === true,
+    chat_id: typeof r.chat_id === "string" ? r.chat_id : "",
+  };
+}
+
+/** Normalise a raw notifications payload into a fully-typed `NotificationsView`. */
+function parseNotificationsView(raw: unknown): NotificationsView {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const events = (r.events && typeof r.events === "object" ? r.events : {}) as Record<string, unknown>;
+  const channels = (r.channels && typeof r.channels === "object" ? r.channels : {}) as Record<
+    string,
+    unknown
+  >;
+  const interval = typeof r.progress_interval_minutes === "number" ? r.progress_interval_minutes : 15;
+  return {
+    enabled: r.enabled === true,
+    events: Object.fromEntries(
+      NOTIFICATION_EVENTS.map((key) => [key, events[key] === true])
+    ) as Record<NotificationEventKey, boolean>,
+    progress_interval_minutes: interval,
+    interval_min: typeof r.interval_min === "number" ? r.interval_min : 5,
+    interval_max: typeof r.interval_max === "number" ? r.interval_max : 240,
+    channels: Object.fromEntries(
+      NOTIFICATION_CHANNELS.map((key) => [key, parseNotificationChannel(channels[key])])
+    ) as Record<NotificationChannelKey, NotificationChannelView>,
+    editable: r.editable === true,
+    file_status: parseFileStatus(r.file_status),
+    config_path: typeof r.config_path === "string" ? r.config_path : "",
+  };
+}
+
+/** GET /api/notifications. Throws a `SettingsError` on any non-200. */
+export async function fetchNotifications(): Promise<NotificationsView> {
+  const res = await fetch("/api/notifications", { cache: "no-store", credentials: "same-origin" });
+  if (!res.ok) {
+    let data: Record<string, unknown> = {};
+    try {
+      const parsed = await res.json();
+      if (parsed && typeof parsed === "object") data = parsed as Record<string, unknown>;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw settingsErrorFrom(data, res.status);
+  }
+  return parseNotificationsView(await res.json());
+}
+
+/** PUT /api/notifications. Resolves to the refreshed view, else throws a `SettingsError`. */
+export async function saveNotifications(update: NotificationsUpdate): Promise<NotificationsView> {
+  const { ok, status, data } = await sendSettingsJson(
+    "/api/notifications",
+    "PUT",
+    update as Record<string, unknown>
+  );
+  if (!ok) throw settingsErrorFrom(data, status);
+  return parseNotificationsView(data);
+}
+
+/**
+ * POST /api/notifications/test. Resolves to the delivery result (also when the
+ * destination rejected the message); throws a `SettingsError` for a bad request
+ * (400) or the 6-per-minute limit (429).
+ */
+export async function testNotification(
+  body: NotificationTestBody,
+  signal?: AbortSignal
+): Promise<NotificationTestResult> {
+  const { ok, status, data } = await sendSettingsJson(
+    "/api/notifications/test",
+    "POST",
+    body as unknown as Record<string, unknown>,
+    signal
+  );
+  if (!ok) throw settingsErrorFrom(data, status);
+  return {
+    ok: data.ok === true,
+    message: typeof data.message === "string" ? data.message : "",
+    status: typeof data.status === "number" ? data.status : null,
+  };
 }

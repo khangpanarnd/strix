@@ -118,9 +118,7 @@ def _parse_budget(body: Mapping[str, object], limits: LaunchLimits) -> float | N
         return None
     # bool is a subtype of int in Python; reject it so true/false is not a budget.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LaunchError(
-            "invalid_budget", "max_budget_usd must be a number or null", status=400
-        )
+        raise LaunchError("invalid_budget", "max_budget_usd must be a number or null", status=400)
     budget = float(value)
     if not math.isfinite(budget) or budget <= 0:
         raise LaunchError(

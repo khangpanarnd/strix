@@ -40,6 +40,7 @@ import { LaunchView } from "@/components/launch/LaunchView";
 import { StopScanButton } from "@/components/launch/StopScanButton";
 import { ReportDownloads } from "@/components/launch/ReportDownloads";
 import SettingsView from "@/components/settings/SettingsView";
+import NotificationsPage from "@/components/notifications/NotificationsView";
 
 export type View =
   | "overview"
@@ -48,7 +49,8 @@ export type View =
   | "agents"
   | "history"
   | "launch"
-  | "settings";
+  | "settings"
+  | "notifications";
 
 const TRUST_BANNER =
   "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by P-hacker Strix Agents.";
@@ -76,6 +78,8 @@ export default function App() {
   // Whether the LLM Settings page is offered (loopback or not). Read once from
   // capabilities; the Sidebar shows the entry only when available.
   const [llmSettingsAvailable, setLlmSettingsAvailable] = useState(false);
+  // Whether the Notifications page is offered; also read once from capabilities.
+  const [notificationsAvailable, setNotificationsAvailable] = useState(false);
   // Resolved once capabilities land, so the no-run guard only fires after we
   // actually know whether a run exists.
   const [capsLoaded, setCapsLoaded] = useState(false);
@@ -99,6 +103,7 @@ export default function App() {
         setScanLimits(caps.scan_limits);
         setInitialRun(caps.initial_run);
         setLlmSettingsAvailable(caps.llm_settings.available);
+        setNotificationsAvailable(caps.notifications.available);
         // Empty workspace in launch mode: open the launch view straight away
         // rather than spinning on a run that does not exist yet.
         if (caps.scan_launch_available && !caps.initial_run) {
@@ -284,6 +289,11 @@ export default function App() {
     userSetView("settings");
   }, [userSetView]);
 
+  // Open the Notifications page (Sidebar entry). Needs no run.
+  const openNotifications = useCallback(() => {
+    userSetView("notifications");
+  }, [userSetView]);
+
 
   // Tab strip for small screens, where the sidebar is hidden. Shared by the
   // Overview (which needs no run) and the run-backed views.
@@ -322,6 +332,8 @@ export default function App() {
         onOpenLaunch={openLaunch}
         llmSettingsAvailable={llmSettingsAvailable}
         onOpenSettings={openSettings}
+        notificationsAvailable={notificationsAvailable}
+        onOpenNotifications={openNotifications}
         issuesCount={run?.vulnerabilities.length ?? 0}
         agentCount={agentCount}
         mcpConnections={mcpConnections}
@@ -364,7 +376,7 @@ export default function App() {
         </div>
 
         <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "overview" && view !== "history" && view !== "launch" && view !== "settings" && (
+          {error && !run && view !== "overview" && view !== "history" && view !== "launch" && view !== "settings" && view !== "notifications" && (
             <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
               <p className="text-sm text-red-300">{error}</p>
@@ -394,6 +406,8 @@ export default function App() {
             )
           ) : view === "settings" ? (
             <SettingsView />
+          ) : view === "notifications" ? (
+            <NotificationsPage />
           ) : view === "history" ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2">

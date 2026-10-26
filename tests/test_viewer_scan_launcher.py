@@ -354,6 +354,66 @@ def test_exit_code_mapping(tmp_path: Path, exit_code: int, expected: ScanState) 
     assert status["stoppable"] is False
 
 
+# --- snapshot (read-only view for observers) --------------------------------
+
+
+def test_snapshot_reports_live_child_without_instruction(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    run_name = launcher.launch(_request(instruction="SECRET-INSTRUCTION-TEXT"))
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.run_name == run_name
+    assert snap.target == "https://example.com"
+    assert snap.mode == "quick"
+    assert snap.state == ScanState.STARTING.value
+    assert snap.exit_code is None
+    assert "SECRET-INSTRUCTION-TEXT" not in repr(snap)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected"),
+    [(0, ScanState.FINISHED), (2, ScanState.FINISHED), (1, ScanState.FAILED)],
+)
+def test_snapshot_folds_an_exited_child_into_its_terminal_state(
+    tmp_path: Path, exit_code: int, expected: ScanState
+) -> None:
+    # No status() call: snapshot() itself must reap, since the notification
+    # service never polls /api/scans/status.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, spawned = _make_launcher(runs)
+    launcher.launch(_request())
+    spawned[0].finish(exit_code)
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.state == expected.value
+    assert snap.exit_code == exit_code
+
+
+def test_snapshot_reports_a_requested_stop_as_stopped(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, spawned = _make_launcher(runs)
+    run_name = launcher.launch(_request())
+    launcher.stop(run_name)
+    spawned[0].finish(-2)
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.state == ScanState.STOPPED.value
+
+
+def test_snapshot_is_empty_before_any_launch(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    assert launcher.snapshot() == []
+
+
 def test_status_unknown_for_non_launched_run(tmp_path: Path) -> None:
     runs = tmp_path / "strix_runs"
     runs.mkdir()

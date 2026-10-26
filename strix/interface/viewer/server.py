@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from strix.interface.viewer.llm_connection_test import ConnectionTester
     from strix.interface.viewer.llm_profiles import ProfileStore
     from strix.interface.viewer.llm_settings import SettingsStore
+    from strix.interface.viewer.notifications import NotificationService
     from strix.interface.viewer.scan_launcher import ScanLauncher
 
 
@@ -146,6 +147,7 @@ class _ViewerState:
         settings_store: SettingsStore | None = None,
         connection_tester: ConnectionTester | None = None,
         profile_store: ProfileStore | None = None,
+        notifier: NotificationService | None = None,
     ) -> None:
         # The run the viewer was started on, or None in launch mode with no run
         # at start. Handlers go through ``default_run()`` (DD-8), never this
@@ -159,6 +161,10 @@ class _ViewerState:
         # ``_handle_settings_*``). They never gate the pre-existing endpoints.
         self.settings_store = settings_store
         self.connection_tester = connection_tester
+        # The scan-notification service (Slack / Teams / Telegram). Optional: when
+        # None the /api/notifications routes answer 403 ``notifications_unavailable``
+        # and ``/api/capabilities`` reports ``notifications.available=false``.
+        self.notifier = notifier
         # The named-profiles layer over ``settings_store`` (same lock/file). It
         # is optional: when not passed it is built lazily from ``settings_store``
         # by ``profiles()`` so existing call sites keep working. When there is no
@@ -265,6 +271,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "/api/settings/profiles/save": self._handle_profiles_save,
                 "/api/settings/profiles/activate": self._handle_profiles_activate,
                 "/api/settings/profiles/delete": self._handle_profiles_delete,
+                "/api/notifications/test": self._handle_notifications_test,
             }
             try:
                 handler = routes.get(path)
@@ -284,6 +291,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             try:
                 if path == "/api/settings":
                     self._handle_settings_put()
+                elif path == "/api/notifications":
+                    self._handle_notifications_put()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
             except BrokenPipeError:
@@ -351,14 +360,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if path == "/api/capabilities":
                 self._send_json(HTTPStatus.OK, self._capabilities_payload())
                 return
-            if path == "/api/settings":
-                self._handle_settings_get()
-                return
-            if path == "/api/settings/profiles":
-                self._handle_profiles_get()
-                return
-            if path == "/api/auth/status":
-                self._handle_auth_status()
+            # Each of these checks the session cookie itself (or deliberately
+            # answers without one, for auth status), so they sit before the
+            # blanket gate below.
+            own_gate_routes = {
+                "/api/settings": self._handle_settings_get,
+                "/api/settings/profiles": self._handle_profiles_get,
+                "/api/notifications": self._handle_notifications_get,
+                "/api/auth/status": self._handle_auth_status,
+            }
+            own_gate_handler = own_gate_routes.get(path)
+            if own_gate_handler is not None:
+                own_gate_handler()
                 return
 
             # All remaining GET endpoints expose run metadata or scan output.
@@ -605,6 +618,12 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 # read-only (BR-2). Unauthenticated, like the rest of this body.
                 "llm_settings": {
                     "available": state.settings_store is not None,
+                    "editable": self._is_loopback_bind(),
+                },
+                # Scan notifications (Slack / Teams / Telegram): same read-only
+                # rule as the LLM settings on a non-loopback bind.
+                "notifications": {
+                    "available": state.notifier is not None,
                     "editable": self._is_loopback_bind(),
                 },
             }
@@ -1031,6 +1050,108 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             "vulnerabilities.json": "vulnerabilities.json",
         }
 
+        # --- Scan notifications (Slack / Microsoft Teams / Telegram) ---
+
+        def _notifications_gate_error(self) -> tuple[HTTPStatus, str] | None:
+            """First failing gate for a notifications change/test, or None if all pass.
+
+            Same order as the settings gate: cookie → service wired → editable
+            (loopback bind) → Origin/Host → Content-Type → Content-Length. The
+            body is never read until every header check passes.
+            """
+            if not self._has_session():
+                return HTTPStatus.FORBIDDEN, "forbidden"
+            if state.notifier is None:
+                return HTTPStatus.FORBIDDEN, "notifications_unavailable"
+            if not self._is_loopback_bind():
+                return HTTPStatus.FORBIDDEN, "notifications_read_only"
+            if not self._origin_ok():
+                return HTTPStatus.FORBIDDEN, "bad_origin"
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "invalid_content_type"
+            return self._content_length_error()
+
+        def _notifications_precheck(self) -> bool:
+            error = self._notifications_gate_error()
+            if error is None:
+                return True
+            status, code = error
+            self._send_json(status, {"error": code})
+            return False
+
+        def _handle_notifications_get(self) -> None:
+            """GET /api/notifications — flags and hints only; secrets are never returned."""
+            if not self._has_session():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if state.notifier is None:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "notifications_unavailable"})
+                return
+            view = state.notifier.store.view(editable=self._is_loopback_bind())
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_notifications_put(self) -> None:
+            """PUT /api/notifications — validate and save a partial update."""
+            if not self._notifications_precheck():
+                return
+            assert state.notifier is not None
+            if not self._settings_change_rate_ok():
+                return
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            try:
+                view = state.notifier.store.apply(body)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            view["editable"] = self._is_loopback_bind()
+            self._send_json(HTTPStatus.OK, view)
+
+        def _handle_notifications_test(self) -> None:
+            """POST /api/notifications/test — send one sample message to one channel.
+
+            Body: ``{"channel": "slack"|"teams"|"telegram"}`` plus optional typed
+            values (``webhook_url`` / ``bot_token`` / ``chat_id``) that override
+            the saved ones, so a destination can be tested before it is saved.
+            A failed delivery is still HTTP 200 with ``ok: false``; only a bad
+            request or the 6/min limit maps to an error status.
+            """
+            if not self._notifications_precheck():
+                return
+            assert state.notifier is not None
+            try:
+                body = self._read_settings_body()
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            channel = body.get("channel")
+            if not isinstance(channel, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_channel", "message": "channel must be a string"},
+                )
+                return
+            try:
+                resolved = state.notifier.store.resolve_test_channel(channel, body)
+                result = state.notifier.send_test(resolved)
+            except LaunchError as exc:
+                self._send_launch_error(exc)
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": result.ok, "message": result.message, "status": result.status},
+            )
+
         def _handle_run_artifacts(self, query: dict[str, list[str]]) -> None:
             """GET /api/run/artifacts?run= — which allow-listed files exist (BR-32)."""
             run_dir = self._resolve_artifact_run(query)
@@ -1197,6 +1318,7 @@ def serve(
     settings_store: SettingsStore | None = None,
     connection_tester: ConnectionTester | None = None,
     profile_store: ProfileStore | None = None,
+    notifier: NotificationService | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -1227,6 +1349,11 @@ def serve(
     ``profile_store`` is the optional named-profiles layer; when omitted it is
     built lazily from ``settings_store`` by ``_ViewerState.profiles()`` so
     existing callers need not change.
+
+    ``notifier`` is the optional scan-notification service (Slack / Teams /
+    Telegram). When omitted, ``/api/notifications*`` answers 403
+    ``notifications_unavailable`` and ``/api/capabilities`` reports
+    ``notifications.available=false``. The caller owns its start/stop.
     """
     if runs_dir is None:
         if run_dir is None:
@@ -1243,6 +1370,7 @@ def serve(
         settings_store=settings_store,
         connection_tester=connection_tester,
         profile_store=profile_store,
+        notifier=notifier,
     )
     handler = _make_handler(state)
 

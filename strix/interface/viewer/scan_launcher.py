@@ -99,6 +99,21 @@ class ScanState(StrEnum):
 _TERMINAL_STATES = frozenset({ScanState.FINISHED, ScanState.FAILED, ScanState.STOPPED})
 
 
+@dataclass(frozen=True)
+class ScanSnapshot:
+    """A point-in-time, read-only view of one launched child (for observers).
+
+    Carries no instruction text and no process handle, so the notification
+    service can hold it without being able to affect or leak the scan.
+    """
+
+    run_name: str
+    target: str
+    mode: str
+    state: str
+    exit_code: int | None
+
+
 class ProcessHandle(Protocol):
     """The subprocess surface the launcher uses; lets tests inject a fake Popen.
 
@@ -438,6 +453,31 @@ class ScanLauncher:
             "error_tail": error_tail,
         }
 
+    def snapshot(self) -> list[ScanSnapshot]:
+        """A read-only view of every child this viewer launched, with states brought up to date.
+
+        Used by the notification service to notice starts and exits without any
+        browser polling ``/api/scans/status``. Each child is reaped first (the
+        same idempotent fold the status endpoint performs), so a child that
+        exited since the last look is reported in its terminal state. The launch
+        lock is held only to copy the table, never while reaping.
+        """
+        with self._lock:
+            children = list(self._children.values())
+        snapshots: list[ScanSnapshot] = []
+        for child in children:
+            exit_code = self._reap(child)
+            snapshots.append(
+                ScanSnapshot(
+                    run_name=child.run_name,
+                    target=child.target,
+                    mode=child.mode,
+                    state=child.state.value,
+                    exit_code=exit_code,
+                )
+            )
+        return snapshots
+
     def _reap(self, child: ScanChild) -> int | None:
         """Fold a finished process into a terminal state; return its exit code or None.
 
@@ -702,4 +742,4 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-__all__ = ["ProcessHandle", "ScanChild", "ScanLauncher", "ScanState"]
+__all__ = ["ProcessHandle", "ScanChild", "ScanLauncher", "ScanSnapshot", "ScanState"]

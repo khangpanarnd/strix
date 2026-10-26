@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Bot, ClipboardList, History, Plus, Settings } from "lucide-react";
+import { AlertTriangle, Bell, Bot, ClipboardList, History, Plus, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpConnectionStatus } from "@/data/serverSource";
 import type { View } from "@/App";
@@ -28,6 +28,9 @@ interface SidebarProps {
   /** Whether the LLM Settings page is offered (FR-1, FR-3). */
   llmSettingsAvailable: boolean;
   onOpenSettings: () => void;
+  /** Whether the Notifications page is offered (Slack / Teams / Telegram). */
+  notificationsAvailable: boolean;
+  onOpenNotifications: () => void;
   issuesCount: number;
   agentCount: number;
   mcpConnections: McpConnectionStatus[];
@@ -53,6 +56,8 @@ export default function Sidebar({
   onOpenLaunch,
   llmSettingsAvailable,
   onOpenSettings,
+  notificationsAvailable,
+  onOpenNotifications,
   issuesCount,
   agentCount,
   mcpConnections,
@@ -226,6 +231,15 @@ export default function Sidebar({
                 active={view === "settings"}
                 onClick={onOpenSettings}
                 testId="sidebar-settings"
+              />
+            )}
+            {notificationsAvailable && (
+              <NavItem
+                icon={<Bell className="h-4 w-4" />}
+                label="Notifications"
+                active={view === "notifications"}
+                onClick={onOpenNotifications}
+                testId="sidebar-notifications"
               />
             )}
             <NavItem

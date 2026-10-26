@@ -25,6 +25,8 @@ from strix.interface.viewer.launch_request import LaunchLimits
 from strix.interface.viewer.llm_connection_test import ConnectionTester
 from strix.interface.viewer.llm_profiles import ProfileStore
 from strix.interface.viewer.llm_settings import SettingsStore
+from strix.interface.viewer.notification_store import NotificationStore
+from strix.interface.viewer.notifications import NotificationService
 from strix.interface.viewer.scan_launcher import ScanLauncher
 from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
 from strix.interface.viewer.transcript import read_run_summary
@@ -111,6 +113,11 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
     """
     settings_store = SettingsStore()
     connection_tester = ConnectionTester()
+    # Fixed-run mode has no launcher, so there is nothing to watch; the service
+    # still backs the Notifications page (configure + send a test) because the
+    # config file is shared with launch-mode viewers.
+    notifier = NotificationService(NotificationStore())
+    notifier.start()
     httpd, url, token = serve(
         run_dir,
         host=args.host,
@@ -119,6 +126,7 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
         settings_store=settings_store,
         connection_tester=connection_tester,
         profile_store=ProfileStore(settings_store),
+        notifier=notifier,
     )
     open_url = authorized_url(url, token)
 
@@ -136,7 +144,9 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
     console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
     console.print()
 
-    _run_forever(console, httpd, launcher=None, connection_tester=connection_tester)
+    _run_forever(
+        console, httpd, launcher=None, connection_tester=connection_tester, notifier=notifier
+    )
 
 
 def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
@@ -154,6 +164,10 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         child_env_builder=settings_store.child_env,
         pre_launch_check=settings_store.pre_launch_check,
     )
+    # Watches the launcher's children and sends Slack / Teams / Telegram
+    # notifications. Built after the launcher so it can observe it.
+    notifier = NotificationService(NotificationStore(), launcher=launcher, runs_dir=runs_dir)
+    notifier.start()
 
     httpd, url, token = serve(
         None,
@@ -165,6 +179,7 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         settings_store=settings_store,
         connection_tester=connection_tester,
         profile_store=ProfileStore(settings_store),
+        notifier=notifier,
     )
     open_url = authorized_url(url, token)
 
@@ -185,7 +200,9 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         )
     console.print()
 
-    _run_forever(console, httpd, launcher=launcher, connection_tester=connection_tester)
+    _run_forever(
+        console, httpd, launcher=launcher, connection_tester=connection_tester, notifier=notifier
+    )
 
 
 def _run_forever(
@@ -194,11 +211,14 @@ def _run_forever(
     *,
     launcher: ScanLauncher | None,
     connection_tester: ConnectionTester | None = None,
+    notifier: NotificationService | None = None,
 ) -> None:
     """Block until Ctrl-C, then stop launched children before the server stops.
 
     The launcher is shut down first (FR-28) so every child it started receives
-    the graceful-then-force sequence before the HTTP server is torn down.
+    the graceful-then-force sequence before the HTTP server is torn down. The
+    notifier stops right after, so scans the shutdown just stopped are still
+    announced ("Scan stopped") before the process exits.
 
     A connection test in flight is handled by the tester itself: it runs one
     child at a time under a 90-second hard wall-clock limit and kills the whole
@@ -217,6 +237,8 @@ def _run_forever(
     finally:
         if launcher is not None:
             launcher.shutdown()
+        if notifier is not None:
+            notifier.stop()
         _ = connection_tester  # no shutdown hook today; see the docstring.
         httpd.shutdown()
         httpd.server_close()
