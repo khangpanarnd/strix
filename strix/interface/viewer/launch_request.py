@@ -65,11 +65,16 @@ class LaunchLimits:
 
 @dataclass(frozen=True)
 class LaunchRequest:
-    """A validated launch request, ready to drive target validation and spawn."""
+    """A validated launch request, ready to drive target validation and spawn.
+
+    ``max_budget_usd`` is ``None`` when the user opted out of a budget cap ("no
+    limit"); the scan then runs uncapped, exactly as the CLI behaves when
+    ``--max-budget`` is omitted. A float is the chosen ceiling in USD.
+    """
 
     target: str
     scan_mode: str
-    max_budget_usd: float
+    max_budget_usd: float | None
     instruction: str | None
     authorized: bool
     allow_private: bool
@@ -97,13 +102,25 @@ def _parse_scan_mode(body: Mapping[str, object], limits: LaunchLimits) -> str:
     return str(mode)
 
 
-def _parse_budget(body: Mapping[str, object], limits: LaunchLimits) -> float:
+def _parse_budget(body: Mapping[str, object], limits: LaunchLimits) -> float | None:
+    """Resolve the budget cap: absent -> default, explicit ``null`` -> no limit.
+
+    An explicit JSON ``null`` means the user chose *not* to cap spend; the scan
+    runs uncapped (the CLI's behaviour when ``--max-budget`` is omitted). This is
+    the common case for local LLMs, which have no per-token cost. A number is
+    validated against the configured ceiling (BR-8); ``0``, negatives, and
+    non-finite values are still rejected.
+    """
     if "max_budget_usd" not in body:
         return limits.default_budget_usd
     value = body["max_budget_usd"]
+    if value is None:
+        return None
     # bool is a subtype of int in Python; reject it so true/false is not a budget.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LaunchError("invalid_budget", "max_budget_usd must be a number", status=400)
+        raise LaunchError(
+            "invalid_budget", "max_budget_usd must be a number or null", status=400
+        )
     budget = float(value)
     if not math.isfinite(budget) or budget <= 0:
         raise LaunchError(

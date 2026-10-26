@@ -243,7 +243,12 @@ export interface LlmSettingsCapability {
 export interface LaunchValues {
   target: string;
   scan_mode: ScanMode;
-  max_budget_usd: number;
+  /**
+   * The budget ceiling in USD, or `null` for no limit. `null` is sent as JSON
+   * `null` and the server runs the scan uncapped (the common case for local
+   * LLMs, which have no per-token cost).
+   */
+  max_budget_usd: number | null;
   instruction: string;
   authorized: boolean;
   allow_private: boolean;

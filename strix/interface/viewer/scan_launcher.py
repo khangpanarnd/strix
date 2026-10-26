@@ -261,13 +261,16 @@ class ScanLauncher:
 
         # The audit line is written after the child exists but carries no
         # instruction text (BR-31). Outside the lock: it is pure logging.
+        budget_display = (
+            f"{request.max_budget_usd:g}" if request.max_budget_usd is not None else "none"
+        )
         logger.info(
-            "viewer launch run=%s target=%s addresses=%s mode=%s budget=%g allow_private=%s",
+            "viewer launch run=%s target=%s addresses=%s mode=%s budget=%s allow_private=%s",
             run_name,
             validated.normalized,
             ",".join(validated.addresses),
             request.scan_mode,
-            request.max_budget_usd,
+            budget_display,
             request.allow_private,
         )
         return run_name
@@ -349,9 +352,12 @@ class ScanLauncher:
             "-n",
             f"--target={target}",
             f"--scan-mode={request.scan_mode}",
-            f"--max-budget={request.max_budget_usd:g}",
-            f"--run-name={run_name}",
         ]
+        # A None budget means "no limit": omit the flag so the child runs
+        # uncapped, exactly as the CLI does when --max-budget is not given.
+        if request.max_budget_usd is not None:
+            scan_args.append(f"--max-budget={request.max_budget_usd:g}")
+        scan_args.append(f"--run-name={run_name}")
         if request.instruction:
             scan_args.append(f"--instruction={request.instruction}")
 

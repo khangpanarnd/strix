@@ -201,6 +201,18 @@ def test_argv_omits_instruction_when_absent(tmp_path: Path) -> None:
     assert not any(a.startswith("--instruction=") for a in spawned[0].argv)
 
 
+def test_argv_omits_budget_when_unlimited(tmp_path: Path) -> None:
+    # A None budget ("no limit") must not emit a --max-budget flag; the child
+    # then runs uncapped like a CLI run with the flag omitted.
+    launcher, spawned = _make_launcher(tmp_path / "strix_runs")
+    (tmp_path / "strix_runs").mkdir()
+    launcher.launch(_request(max_budget_usd=None))
+    assert not any(a.startswith("--max-budget") for a in spawned[0].argv)
+    # The other flags are still present and intact.
+    assert "--scan-mode=quick" in spawned[0].argv
+    assert any(a.startswith("--run-name=") for a in spawned[0].argv)
+
+
 def test_run_name_is_web_prefixed_hex(tmp_path: Path) -> None:
     launcher, _ = _make_launcher(tmp_path / "strix_runs")
     (tmp_path / "strix_runs").mkdir()
@@ -509,6 +521,20 @@ def test_audit_line_excludes_instruction(tmp_path: Path, caplog: pytest.LogCaptu
     assert "SECRET-INSTRUCTION-TEXT" not in audit
     # The audit line records the resolved address (NFR-7, BR-31).
     assert "93.184.216.34" in audit
+
+
+def test_audit_line_reports_unlimited_budget_as_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A None budget must render as budget=none in the audit line rather than
+    # raising on %g formatting.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    with caplog.at_level("INFO", logger="strix.interface.viewer.scan_launcher"):
+        launcher.launch(_request(max_budget_usd=None))
+    audit = "\n".join(record.message for record in caplog.records)
+    assert "budget=none" in audit
 
 
 class _NeverReapsPopen(FakePopen):

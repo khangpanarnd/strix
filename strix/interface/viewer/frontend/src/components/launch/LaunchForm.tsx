@@ -75,6 +75,7 @@ export function LaunchForm({
     target: `${uid}-target`,
     targetErr: `${uid}-target-err`,
     modeLegend: `${uid}-mode-legend`,
+    limitBudget: `${uid}-limit-budget`,
     budget: `${uid}-budget`,
     budgetErr: `${uid}-budget-err`,
     instruction: `${uid}-instruction`,
@@ -92,6 +93,13 @@ export function LaunchForm({
 
   const [target, setTarget] = useState(initialValues?.target ?? "");
   const [scanMode, setScanMode] = useState<ScanMode>(modeFromInitial);
+  // Whether to cap spend. Off means "no limit" (max_budget_usd: null) — the
+  // usual choice for local LLMs, which cost nothing per token. An explicit null
+  // in initialValues (an "Edit and retry" of an unlimited run) starts it off;
+  // a number or absence starts it on, preserving the prior safe default.
+  const [limitBudget, setLimitBudget] = useState<boolean>(
+    initialValues?.max_budget_usd !== null
+  );
   const [budget, setBudget] = useState<string>(
     String(initialValues?.max_budget_usd ?? limits.default_budget_usd)
   );
@@ -121,7 +129,11 @@ export function LaunchForm({
     onSubmit({
       target: trimmedTarget,
       scan_mode: scanMode,
-      max_budget_usd: budgetInRange ? budgetNumber : limits.default_budget_usd,
+      max_budget_usd: limitBudget
+        ? budgetInRange
+          ? budgetNumber
+          : limits.default_budget_usd
+        : null,
       instruction: instruction.trim(),
       authorized,
       allow_private: allowPrivate,
@@ -213,32 +225,64 @@ export function LaunchForm({
       </fieldset>
 
       {/* Budget */}
-      <div className="space-y-1.5">
-        <label htmlFor={ids.budget} className="block text-sm font-medium text-white">
-          Budget (USD)
+      <div className="space-y-2">
+        <span className="block text-sm font-medium text-white">Budget</span>
+        <label
+          htmlFor={ids.limitBudget}
+          className="flex cursor-pointer items-start gap-3 text-sm text-[#ddd]"
+        >
+          <input
+            id={ids.limitBudget}
+            data-testid="launch-limit-budget-checkbox"
+            type="checkbox"
+            checked={limitBudget}
+            onChange={(e) => setLimitBudget(e.target.checked)}
+            disabled={disabled}
+            className="mt-0.5 h-4 w-4 flex-shrink-0 accent-emerald-400"
+          />
+          <span className="min-w-0">
+            <span className="block">Set a maximum LLM budget</span>
+            <span className="mt-0.5 block text-xs text-[#888]">
+              Recommended for cloud providers. Local models have no per-token cost, so you can
+              leave this off to run without a limit.
+            </span>
+          </span>
         </label>
-        <input
-          id={ids.budget}
-          data-testid="launch-budget-input"
-          type="number"
-          inputMode="decimal"
-          step={0.5}
-          min={0.5}
-          max={limits.max_budget_usd}
-          value={budget}
-          onChange={(e) => setBudget(e.target.value)}
-          disabled={disabled}
-          aria-invalid={fieldErrors.budget ? true : undefined}
-          aria-describedby={fieldErrors.budget ? ids.budgetErr : undefined}
-          className={cn(
-            "block w-40 rounded-lg border bg-[rgba(255,255,255,0.03)] px-3 py-2 text-sm text-white transition-colors focus:outline-none focus:ring-2 focus:ring-white/20 disabled:opacity-60",
-            fieldErrors.budget ? "border-red-500/60" : "border-[#2a2a2a] focus:border-[#555]"
-          )}
-        />
-        <p className="text-xs text-[#666]">
-          Maximum {limits.max_budget_usd.toFixed(2)} USD. The server rejects values out of range.
-        </p>
-        <FieldError id={ids.budgetErr} message={fieldErrors.budget} testId="launch-budget-error" />
+
+        {limitBudget ? (
+          <div className="space-y-1.5 pl-7" data-testid="launch-budget-fields">
+            <label htmlFor={ids.budget} className="block text-xs font-medium text-[#bbb]">
+              Maximum spend (USD)
+            </label>
+            <input
+              id={ids.budget}
+              data-testid="launch-budget-input"
+              type="number"
+              inputMode="decimal"
+              step={0.5}
+              min={0.5}
+              max={limits.max_budget_usd}
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              disabled={disabled}
+              aria-invalid={fieldErrors.budget ? true : undefined}
+              aria-describedby={fieldErrors.budget ? ids.budgetErr : undefined}
+              className={cn(
+                "block w-40 rounded-lg border bg-[rgba(255,255,255,0.03)] px-3 py-2 text-sm text-white transition-colors focus:outline-none focus:ring-2 focus:ring-white/20 disabled:opacity-60",
+                fieldErrors.budget ? "border-red-500/60" : "border-[#2a2a2a] focus:border-[#555]"
+              )}
+            />
+            <p className="text-xs text-[#666]">
+              Maximum {limits.max_budget_usd.toFixed(2)} USD. The scan stops cleanly when this limit
+              is reached.
+            </p>
+            <FieldError id={ids.budgetErr} message={fieldErrors.budget} testId="launch-budget-error" />
+          </div>
+        ) : (
+          <p className="pl-7 text-xs text-[#666]" data-testid="launch-budget-unlimited-note">
+            No budget limit — the scan runs until it finishes or you stop it.
+          </p>
+        )}
       </div>
 
       {/* Instructions */}
