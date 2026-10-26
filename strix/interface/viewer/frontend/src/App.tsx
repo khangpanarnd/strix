@@ -338,11 +338,16 @@ export default function App() {
               <img src="./logo.png" alt="P-hacker Strix Agents" className="w-10 h-8 object-cover" />
               <div className="text-base text-white font-medium tracking-tight">P-hacker Strix Agents</div>
             </div>
-            {run && <LiveIndicator finished={run.finished} />}
+            {/* The Overview is the run-independent intro, so the finished-run
+                status text and report downloads are hidden there. A live scan's
+                indicator and Stop button stay visible on every view. */}
+            {run && !(view === "overview" && run.finished) && (
+              <LiveIndicator finished={run.finished} />
+            )}
             {activeRun && run && !run.finished && (
               <StopScanButton runName={activeRun} finished={run.finished} />
             )}
-            {activeRun && run && run.finished && (
+            {activeRun && run && run.finished && view !== "overview" && (
               <ReportDownloads runName={activeRun} finished={run.finished} />
             )}
             <div className="ml-auto flex items-center gap-3">
