@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Showcase } from "./Showcase";
 import "./landing.css";
 
 /**
@@ -50,6 +51,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
             Strix<small>Internal guide</small>
           </a>
           <nav aria-label="Page sections">
+            <a href="#preview">What a scan looks like</a>
             <a href="#how">First scan in 3 steps</a>
             <a href="#before">Before you start</a>
             <a href="#overview">Watch the video</a>
@@ -76,6 +78,8 @@ export function LandingPage({ onScan }: LandingPageProps) {
             </div>
           </div>
         </section>
+
+        <Showcase />
 
         <section className="row" id="how">
           <div className="wrap">
