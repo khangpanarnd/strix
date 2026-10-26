@@ -1128,3 +1128,85 @@ export async function testNotification(
     status: typeof data.status === "number" ? data.status : null,
   };
 }
+
+
+// ---------------------------------------------------------------------------
+// Server log (GET /api/log)
+//
+// The scan writes a timestamped log to <run>/strix.log. The viewer streams it
+// by polling with a byte-offset cursor: omit `after` for the most recent lines,
+// then pass back the `offset` of the previous chunk to receive only new ones.
+// ---------------------------------------------------------------------------
+
+/** One parsed log record. `continuation` lines belong to the record before them. */
+export interface RunLogEntry {
+  ts: string | null;
+  level: string;
+  agent: string | null;
+  logger: string;
+  message: string;
+  continuation: boolean;
+}
+
+export interface RunLogChunk {
+  /** False while the scan has not created its log yet. */
+  exists: boolean;
+  entries: RunLogEntry[];
+  /** Send this as `after` on the next call. */
+  offset: number;
+  /** The file was replaced (it is now shorter than the cursor): drop what you have. */
+  reset: boolean;
+  /** More unread data is waiting: poll again at once. */
+  more: boolean;
+  /** A first read left earlier lines out. */
+  truncated_head: boolean;
+  /** When the log file last changed, UTC ISO. */
+  updated_at: string | null;
+  /** The server's clock when answering, UTC ISO (to correct for client clock skew). */
+  now: string | null;
+}
+
+function parseLogEntry(raw: unknown): RunLogEntry | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.message !== "string") return null;
+  return {
+    ts: typeof r.ts === "string" ? r.ts : null,
+    level: typeof r.level === "string" ? r.level : "",
+    agent: typeof r.agent === "string" && r.agent ? r.agent : null,
+    logger: typeof r.logger === "string" ? r.logger : "",
+    message: r.message,
+    continuation: r.continuation === true,
+  };
+}
+
+/** GET /api/log. Throws on a non-200 so the caller can back off and retry. */
+export async function fetchRunLog(
+  runName: string | null,
+  after: number | null,
+  signal?: AbortSignal
+): Promise<RunLogChunk> {
+  const params = new URLSearchParams();
+  if (runName) params.set("run", runName);
+  if (after !== null) params.set("after", String(after));
+  const query = params.toString();
+  const res = await fetch("/api/log" + (query ? `?${query}` : ""), {
+    cache: "no-store",
+    credentials: "same-origin",
+    signal,
+  });
+  if (!res.ok) throw new Error(`/api/log responded ${res.status}`);
+  const r = (await res.json()) as Record<string, unknown>;
+  return {
+    exists: r.exists === true,
+    entries: Array.isArray(r.entries)
+      ? r.entries.map(parseLogEntry).filter((e): e is RunLogEntry => e !== null)
+      : [],
+    offset: typeof r.offset === "number" && r.offset >= 0 ? r.offset : 0,
+    reset: r.reset === true,
+    more: r.more === true,
+    truncated_head: r.truncated_head === true,
+    updated_at: typeof r.updated_at === "string" ? r.updated_at : null,
+    now: typeof r.now === "string" ? r.now : null,
+  };
+}

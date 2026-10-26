@@ -71,6 +71,31 @@ A message contains the target, scan mode, run name, elapsed time, finding counts
 
 Webhook URLs must be public `https` addresses. Strix refuses hosts that resolve to private or cloud-metadata addresses, does not follow redirects, and gives each request 10 seconds. A destination that fails never affects the scan. The reason is logged and shown by **Send test message**. Like the LLM settings, the page is read-only unless you open the viewer from `localhost`.
 
+## Landing Page And Sign-In
+
+Opening the viewer's link shows a landing page: a short introduction, an overview video, and a **Scan your project** button. The button leads to a sign-in page, and signing in opens the **New scan** form. A browser that is already signed in (for example after a refresh) goes straight to the dashboard.
+
+Sign-in is checked by the viewer, not by the page, and is a second lock on top of the private link:
+
+- The sign-in endpoint only answers a browser that opened the viewer's private link, so the password cannot be guessed from the network.
+- Every dashboard request needs both the private link's session and a valid sign-in. Signing out ends the session on the server.
+- Five wrong passwords lock the form for 60 seconds. A sign-in lasts 12 hours, and restarting the viewer signs everyone out.
+- The viewer stores only a salted PBKDF2-SHA256 hash. No password is kept in the code, the page or the logs.
+
+The built-in account has the username `prdcv`; its password is not in the repository. To use your own account, create a hash and set two environment variables before starting the viewer:
+
+```bash
+python -m strix.interface.viewer.login          # prompts for a password and prints a hash
+export STRIX_VIEWER_USERNAME="your-name"
+export STRIX_VIEWER_PASSWORD_HASH="pbkdf2_sha256$600000$..."
+```
+
+Set both or neither: a username without a hash, or a malformed hash, stops the viewer with an error instead of silently using a different password. To turn sign-in off, for example on a single-user machine, set `STRIX_VIEWER_LOGIN=off`; the private link then grants access on its own, as before.
+
+<Note>
+  Anyone who can read the source can run offline guesses against the built-in hash. For anything beyond one trusted machine, set your own account.
+</Note>
+
 ## Sharing The Link
 
 <Warning>

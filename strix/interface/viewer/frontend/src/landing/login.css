@@ -1,0 +1,69 @@
+/*
+ * Sign-in page. Reuses the landing page's design tokens (--paper, --ink, --signal, ...),
+ * which landing.css defines on .landing, so the two pages read as one product.
+ * Every rule is scoped under .landing.login-page.
+ */
+
+.landing.login-page { min-height: 100vh; display: flex; flex-direction: column; }
+.landing.login-page .login-main { flex: 1; display: grid; place-items: start center; padding: clamp(32px, 8vw, 96px) 20px 64px; }
+
+.landing.login-page .login-card {
+  width: min(440px, 100%);
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: clamp(24px, 4vw, 36px);
+}
+.landing.login-page .login-card h1 {
+  font: 700 clamp(1.5rem, 3.4vw, 1.875rem)/1.15 var(--serif);
+  letter-spacing: -0.015em;
+  max-width: none;
+  margin: 0 0 12px;
+}
+.landing.login-page .login-lede { color: var(--slate); font-size: 0.9375rem; margin: 0 0 24px; }
+
+.landing.login-page .login-notice {
+  margin: 0 0 18px; padding: 10px 14px; font-size: 0.9375rem;
+  border: 1px solid var(--rule); border-left: 4px solid var(--ink); border-radius: 4px;
+}
+.landing.login-page .login-problem {
+  margin: 0 0 18px; padding: 12px 14px; font-size: 0.9375rem; max-width: none;
+  border: 1px solid var(--signal); border-left-width: 5px; border-radius: 4px;
+}
+.landing.login-page .login-problem p { margin: 6px 0 0; max-width: none; color: var(--slate); }
+
+.landing.login-page .login-field { margin-bottom: 18px; }
+.landing.login-page .login-field label { display: block; font-weight: 600; font-size: 0.9375rem; margin-bottom: 6px; }
+.landing.login-page input[type="text"],
+.landing.login-page input[type="password"] {
+  display: block; width: 100%; font: inherit; font-size: 1rem; color: var(--ink);
+  background: var(--paper); border: 1px solid var(--rule); border-radius: 4px; padding: 11px 12px;
+}
+.landing.login-page input:hover:not(:disabled) { border-color: var(--slate); }
+.landing.login-page input:disabled { opacity: 0.6; }
+.landing.login-page input[aria-invalid="true"] { border-color: var(--signal); }
+
+.landing.login-page .login-password { position: relative; }
+.landing.login-page .login-password input { padding-right: 72px; }
+.landing.login-page .login-reveal {
+  position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+  font: 600 0.8125rem/1 var(--sans); color: var(--slate); background: transparent;
+  border: 0; border-radius: 3px; padding: 8px 10px; cursor: pointer;
+}
+.landing.login-page .login-reveal:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+.landing.login-page .login-submit { width: 100%; margin-top: 4px; }
+.landing.login-page .login-submit:disabled { background: var(--rule); color: var(--slate); cursor: not-allowed; }
+.landing.login-page .login-submit:disabled:hover { background: var(--rule); color: var(--slate); }
+
+.landing.login-page .login-foot { margin: 20px 0 0; max-width: none; text-align: center; }
+.landing.login-page .login-back {
+  font: inherit; font-size: 0.9375rem; color: var(--slate); background: transparent; border: 0;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 4px;
+}
+.landing.login-page .login-back:hover { color: var(--ink); }
+
+.landing .sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}

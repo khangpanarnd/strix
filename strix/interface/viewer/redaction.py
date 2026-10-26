@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 
 REPLACEMENT = "[REDACTED]"
@@ -56,6 +56,29 @@ def _secret_values(env: Mapping[str, str]) -> list[str]:
     return sorted(set(fragments), key=len, reverse=True)[:_MAX_FRAGMENTS]
 
 
+def make_redactor(env: Mapping[str, str] | None = None) -> Callable[[str], str]:
+    """Build a redaction function whose secret list is computed once.
+
+    ``redact`` rebuilds that list on every call, which is wasteful for a batch
+    such as a streamed log. This does the same masking, with the fragments
+    gathered up front. ``env`` defaults to ``os.environ`` read now.
+    """
+    environment = os.environ if env is None else env
+    fragments = _secret_values(environment)
+
+    def _redact(text: str) -> str:
+        if not text:
+            return text
+        redacted = text
+        for value in fragments:
+            redacted = redacted.replace(value, REPLACEMENT)
+        for pattern in _PATTERNS:
+            redacted = pattern.sub(REPLACEMENT, redacted)
+        return redacted
+
+    return _redact
+
+
 def redact(text: str, env: Mapping[str, str] | None = None) -> str:
     """Return ``text`` with secret-named env values and secret patterns masked.
 
@@ -63,11 +86,4 @@ def redact(text: str, env: Mapping[str, str] | None = None) -> str:
     """
     if not text:
         return text
-    environment = os.environ if env is None else env
-
-    redacted = text
-    for value in _secret_values(environment):
-        redacted = redacted.replace(value, REPLACEMENT)
-    for pattern in _PATTERNS:
-        redacted = pattern.sub(REPLACEMENT, redacted)
-    return redacted
+    return make_redactor(env)(text)

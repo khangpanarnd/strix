@@ -9,10 +9,12 @@ any child the launcher started before the server stops (FR-28, NFR-6).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+from rich.markup import escape
 
 from strix.core.paths import (
     RUNS_DIR_NAME,
@@ -25,6 +27,7 @@ from strix.interface.viewer.launch_request import LaunchLimits
 from strix.interface.viewer.llm_connection_test import ConnectionTester
 from strix.interface.viewer.llm_profiles import ProfileStore
 from strix.interface.viewer.llm_settings import SettingsStore
+from strix.interface.viewer.login import LoginConfig, LoginManager
 from strix.interface.viewer.notification_store import NotificationStore
 from strix.interface.viewer.notifications import NotificationService
 from strix.interface.viewer.scan_launcher import ScanLauncher
@@ -57,11 +60,46 @@ def run_view(argv: list[str]) -> None:
         raise SystemExit(1)
 
     run_dir = _resolve_run_dir(args.run, console, launch=args.launch)
+    # Built before anything starts so a bad STRIX_VIEWER_* value fails fast and clearly.
+    login = _build_login(console)
 
     if run_dir is None:
-        _serve_launch_mode(args, console)
+        _serve_launch_mode(args, console, login)
     else:
-        _serve_run(args, run_dir, console)
+        _serve_run(args, run_dir, console, login)
+
+
+def _build_login(console: Console) -> LoginManager | None:
+    """The sign-in manager from the environment, or None when login is switched off.
+
+    A malformed ``STRIX_VIEWER_PASSWORD_HASH`` (or a username without a hash) stops
+    the viewer with a clear message rather than quietly falling back to a different
+    password than the operator set. The message never contains a credential.
+    """
+    try:
+        config = LoginConfig.from_env(os.environ)
+    except ValueError as exc:
+        console.print(f"[bold red]Cannot start the viewer:[/] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+    return LoginManager(config) if config is not None else None
+
+
+def _print_login_note(console: Console, login: LoginManager | None) -> None:
+    """Tell the operator whether sign-in is on, without ever printing a secret."""
+    if login is None:
+        console.print(
+            "[bold yellow]Sign-in is off[/] "
+            "[dim](STRIX_VIEWER_LOGIN=off): the link alone grants access.[/]"
+        )
+        return
+    console.print(
+        f"[dim]Sign-in is on. Username:[/] {escape(login.username)}"
+        "  [dim]Set STRIX_VIEWER_USERNAME and STRIX_VIEWER_PASSWORD_HASH to use your own;[/]"
+    )
+    console.print(
+        "[dim]create a hash with[/] python -m strix.interface.viewer.login"
+        "  [dim]or turn sign-in off with STRIX_VIEWER_LOGIN=off.[/]"
+    )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -104,7 +142,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> None:
+def _serve_run(
+    args: argparse.Namespace,
+    run_dir: Path,
+    console: Console,
+    login: LoginManager | None = None,
+) -> None:
     """Serve a fixed run (``--launch`` absent, a run exists), plus the settings page.
 
     The settings page works whenever the viewer runs (Step 6.1), so a store and
@@ -127,6 +170,7 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
         connection_tester=connection_tester,
         profile_store=ProfileStore(settings_store),
         notifier=notifier,
+        login=login,
     )
     open_url = authorized_url(url, token)
 
@@ -142,6 +186,7 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
     console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
     console.print("[dim]This link authorizes the browser; anyone you share it with can steer[/]")
     console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
+    _print_login_note(console, login)
     console.print()
 
     _run_forever(
@@ -149,7 +194,9 @@ def _serve_run(args: argparse.Namespace, run_dir: Path, console: Console) -> Non
     )
 
 
-def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
+def _serve_launch_mode(
+    args: argparse.Namespace, console: Console, login: LoginManager | None = None
+) -> None:
     """Serve the launch form (FR-1, FR-2); build a launcher and clean up its children."""
     runs_dir = runs_base_dir()
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +227,7 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
         connection_tester=connection_tester,
         profile_store=ProfileStore(settings_store),
         notifier=notifier,
+        login=login,
     )
     open_url = authorized_url(url, token)
 
@@ -192,6 +240,7 @@ def _serve_launch_mode(args: argparse.Namespace, console: Console) -> None:
     console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
     console.print("[dim]Open the link to start a scan from the browser. This link authorizes[/]")
     console.print("[dim]the browser; anyone you share it with can start scans. Ctrl-C to stop.[/]")
+    _print_login_note(console, login)
     if args.host not in _LOOPBACK_HOSTS:
         # NFR-6: a non-loopback bind is reachable over the network.
         console.print(

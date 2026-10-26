@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Bell, Bot, ClipboardList, History, Plus, Settings } from "lucide-react";
+import {
+  AlertTriangle,
+  Bell,
+  Bot,
+  ClipboardList,
+  History,
+  LogOut,
+  Plus,
+  Settings,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpConnectionStatus } from "@/data/serverSource";
 import type { View } from "@/App";
@@ -33,10 +42,14 @@ interface SidebarProps {
   onOpenNotifications: () => void;
   issuesCount: number;
   agentCount: number;
+  /** Show the Agents entry (agents exist, or the scan is live and the log is useful). */
+  agentsAvailable: boolean;
   mcpConnections: McpConnectionStatus[];
   mcpInUse: Set<string>;
   runCount: number;
   onOpenHistory: () => void;
+  /** The signed-in account; present only when the viewer requires sign-in. */
+  account?: { username: string; onSignOut: () => void };
 }
 
 function readInt(key: string, fallback: number): number {
@@ -60,10 +73,12 @@ export default function Sidebar({
   onOpenNotifications,
   issuesCount,
   agentCount,
+  agentsAvailable,
   mcpConnections,
   mcpInUse,
   runCount,
   onOpenHistory,
+  account,
 }: SidebarProps) {
   const [width, setWidth] = useState(() => {
     const w = readInt(WIDTH_KEY, DEFAULT_WIDTH);
@@ -219,11 +234,11 @@ export default function Sidebar({
               active={view === "history"}
               onClick={onOpenHistory}
             />
-            {agentCount > 0 && (
+            {agentsAvailable && (
               <NavItem
                 icon={<Bot className="h-4 w-4" />}
                 label="Agents"
-                count={agentCount}
+                count={agentCount > 0 ? agentCount : undefined}
                 active={view === "agents"}
                 onClick={() => onSelectView("agents")}
               />
@@ -252,7 +267,7 @@ export default function Sidebar({
           </div>
         </nav>
 
-        {/* Footer: this viewer has no accounts. */}
+        {/* Footer: the signed-in account with Sign out, or a plain label when sign-in is off. */}
         <section className="flex min-w-[160px] flex-col gap-0.5">
           <div className="p-2">
             <div className="flex items-center gap-2 rounded-md px-2.5 py-2">
@@ -260,11 +275,30 @@ export default function Sidebar({
                 className="flex flex-shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-cyan-500"
                 style={{ width: 20, height: 20 }}
               >
-                <span className="text-[9px] font-semibold text-white">S</span>
+                <span className="text-[9px] font-semibold uppercase text-white">
+                  {(account?.username ?? "S").charAt(0)}
+                </span>
               </span>
               <span className="flex min-w-0 flex-1 flex-col text-left">
-                <span className="truncate text-[13px] font-medium text-[#ededed]">Local viewer</span>
+                <span
+                  className="truncate text-[13px] font-medium text-[#ededed]"
+                  data-testid="sidebar-account"
+                  title={account?.username}
+                >
+                  {account ? account.username : "Local viewer"}
+                </span>
               </span>
+              {account && (
+                <button
+                  type="button"
+                  onClick={account.onSignOut}
+                  data-testid="sidebar-sign-out"
+                  className="flex flex-none items-center gap-1 rounded-md px-2 py-1 text-[12px] font-medium text-[#888] transition-colors hover:bg-[rgba(255,255,255,0.08)] hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+                >
+                  <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                  Sign out
+                </button>
+              )}
             </div>
           </div>
         </section>

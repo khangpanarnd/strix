@@ -659,6 +659,22 @@ class SettingsStore:
             ),
         }
 
+    # --- redaction support ---------------------------------------------------
+
+    def redaction_env(self) -> dict[str, str]:
+        """The config file's ``env`` values, for masking secrets in streamed logs.
+
+        A scan reads its LLM key from this file itself, so the key is in neither
+        the viewer's ``os.environ`` nor the launched child's environment. The
+        log stream builds its redactor from this plus ``os.environ`` so a saved
+        key can never be echoed back through it. The result is used only to
+        mask text; it is never returned to a client. An unreadable or missing
+        file yields an empty mapping.
+        """
+        with self._lock:
+            block, _status = self._read_env_block()
+        return {name: value for name, value in block.items() if isinstance(value, str) and value}
+
     # --- launch environment (section 6) ------------------------------------
 
     def child_env(self, base: Mapping[str, str]) -> dict[str, str]:

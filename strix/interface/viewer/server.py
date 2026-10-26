@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import secrets
 import threading
 import time
@@ -30,8 +31,11 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from strix.core.paths import run_record_path
 from strix.interface.viewer import auth
+from strix.interface.viewer.http_range import UNSATISFIABLE, parse_byte_range
 from strix.interface.viewer.launch_errors import LaunchError
 from strix.interface.viewer.launch_request import parse_launch_request
+from strix.interface.viewer.redaction import make_redactor
+from strix.interface.viewer.run_log import InvalidCursorError, parse_cursor, read_log_chunk
 from strix.interface.viewer.transcript import (
     build_run_state,
     primary_target,
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
     from strix.interface.viewer.llm_connection_test import ConnectionTester
     from strix.interface.viewer.llm_profiles import ProfileStore
     from strix.interface.viewer.llm_settings import SettingsStore
+    from strix.interface.viewer.login import LoginManager
     from strix.interface.viewer.notifications import NotificationService
     from strix.interface.viewer.scan_launcher import ScanLauncher
 
@@ -135,6 +140,17 @@ def resolve_run_dir(
 # otherwise share one cookie slot and clobber each other's session.
 SESSION_COOKIE_PREFIX = "strix_viewer_session"
 
+# Cookie carrying the login session (second factor). Port-suffixed in ``serve()``
+# for the same reason as the session cookie above.
+LOGIN_COOKIE_PREFIX = "strix_viewer_login"
+
+# Types served with an explicit type because the platform's mimetypes table may
+# not know them (Windows reads the registry).
+_EXTRA_MIME_TYPES = {".mp4": "video/mp4", ".webm": "video/webm", ".webp": "image/webp"}
+
+# Static files are streamed in chunks this size rather than read whole.
+_STATIC_CHUNK_BYTES = 64 * 1024
+
 
 class _ViewerState:
     def __init__(
@@ -148,6 +164,7 @@ class _ViewerState:
         connection_tester: ConnectionTester | None = None,
         profile_store: ProfileStore | None = None,
         notifier: NotificationService | None = None,
+        login: LoginManager | None = None,
     ) -> None:
         # The run the viewer was started on, or None in launch mode with no run
         # at start. Handlers go through ``default_run()`` (DD-8), never this
@@ -165,6 +182,11 @@ class _ViewerState:
         # None the /api/notifications routes answer 403 ``notifications_unavailable``
         # and ``/api/capabilities`` reports ``notifications.available=false``.
         self.notifier = notifier
+        # Username/password sign-in, the SECOND factor on top of the session token
+        # (see ``login.py``). When None the viewer behaves exactly as before.
+        # The cookie name gets the bound port appended in ``serve()``.
+        self.login = login
+        self.login_cookie_name = LOGIN_COOKIE_PREFIX
         # The named-profiles layer over ``settings_store`` (same lock/file). It
         # is optional: when not passed it is built lazily from ``settings_store``
         # by ``profiles()`` so existing call sites keep working. When there is no
@@ -245,7 +267,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     self._handle_api(path, parse_qs(parts.query))
                 else:
                     self._handle_static(path, parse_qs(parts.query))
-            except BrokenPipeError:
+            except ConnectionError:
                 # The browser closed the connection mid-response (e.g. it
                 # navigated away between polls). Not an error.
                 logger.debug("viewer client disconnected during %s", path)
@@ -272,6 +294,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "/api/settings/profiles/activate": self._handle_profiles_activate,
                 "/api/settings/profiles/delete": self._handle_profiles_delete,
                 "/api/notifications/test": self._handle_notifications_test,
+                "/api/login": self._handle_login,
+                "/api/logout": self._handle_logout,
             }
             try:
                 handler = routes.get(path)
@@ -279,7 +303,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     handler()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
-            except BrokenPipeError:
+            except ConnectionError:
                 logger.debug("viewer client disconnected during POST %s", path)
             except Exception:
                 # A bad request must never kill the worker thread.
@@ -295,7 +319,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     self._handle_notifications_put()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
-            except BrokenPipeError:
+            except ConnectionError:
                 logger.debug("viewer client disconnected during PUT %s", path)
             except Exception:
                 # A bad request must never kill the worker thread.
@@ -367,6 +391,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "/api/settings": self._handle_settings_get,
                 "/api/settings/profiles": self._handle_profiles_get,
                 "/api/notifications": self._handle_notifications_get,
+                "/api/login/status": self._handle_login_status,
                 "/api/auth/status": self._handle_auth_status,
             }
             own_gate_handler = own_gate_routes.get(path)
@@ -425,6 +450,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, {"markdown": read_report_markdown(run_dir)})
             elif path == "/api/transcript":
                 self._send_json(HTTPStatus.OK, build_run_state(run_dir))
+            elif path == "/api/log":
+                self._handle_run_log(run_dir, query)
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
 
@@ -1050,6 +1077,147 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             "vulnerabilities.json": "vulnerabilities.json",
         }
 
+        # --- Sign-in (second factor; see login.py) ---
+
+        def _login_cookie_header(self, value: str, max_age: int) -> dict[str, str]:
+            # HttpOnly (script never needs it), SameSite=Strict (never sent cross-site).
+            return {
+                "Set-Cookie": (
+                    f"{state.login_cookie_name}={value}; Path=/; HttpOnly; "
+                    f"SameSite=Strict; Max-Age={max_age}"
+                ),
+                "Cache-Control": "no-store",
+            }
+
+        def _handle_login_status(self) -> None:
+            """GET /api/login/status — what the sign-in page needs to decide what to show.
+
+            Public by design: it returns three booleans and, only once the caller
+            is signed in, their own username. ``authorized_browser`` is false when
+            this browser never opened the viewer's secret link, so the page can
+            say so instead of showing a form that cannot work.
+            """
+            first = self._has_first_factor()
+            authenticated = first and self._is_logged_in()
+            username = state.login.username if state.login is not None and authenticated else None
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "login_required": state.login is not None,
+                    "authenticated": authenticated,
+                    "authorized_browser": first,
+                    "username": username,
+                },
+                extra_headers={"Cache-Control": "no-store"},
+            )
+
+        def _handle_login(self) -> None:
+            """POST /api/login — check the username and password, open a login session.
+
+            Gate order: session cookie → login enabled → Origin/Host → Content-Type
+            → Content-Length; the body is not read until all pass. The session
+            cookie is required so the password cannot be guessed by anyone who has
+            not got the secret link. Wrong username and wrong password give the
+            same answer. Failures are rate-limited (429 + Retry-After).
+            """
+            if not self._has_first_factor():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            login = state.login
+            if login is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "login_disabled"})
+                return
+            gate = self._login_gate_error()
+            if gate is not None:
+                self._send_json(gate[0], {"error": gate[1]})
+                return
+            try:
+                body = self._read_settings_body()
+            except ValueError:  # bad JSON, or bytes that are not UTF-8
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+
+            result = login.attempt(body.get("username"), body.get("password"))
+            if result.ok and result.token is not None:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "username": login.username},
+                    extra_headers=self._login_cookie_header(result.token, int(login.session_ttl)),
+                )
+            elif result.retry_after is not None:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {
+                        "error": "rate_limited",
+                        "message": "Too many failed attempts. Try again shortly.",
+                        "retry_after": result.retry_after,
+                    },
+                    extra_headers={
+                        "Retry-After": str(result.retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
+            else:
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "invalid_credentials", "message": "Incorrect username or password."},
+                    extra_headers={"Cache-Control": "no-store"},
+                )
+
+        def _login_gate_error(self) -> tuple[HTTPStatus, str] | None:
+            """Origin → Content-Type → Content-Length for the login body."""
+            if not self._origin_ok():
+                return HTTPStatus.FORBIDDEN, "bad_origin"
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "invalid_content_type"
+            return self._content_length_error()
+
+        def _handle_logout(self) -> None:
+            """POST /api/logout — end the login session and clear its cookie.
+
+            Needs the session cookie and a same-origin request (so another site
+            cannot sign the user out). Always succeeds if those hold, whether or
+            not a login session existed.
+            """
+            if not self._has_first_factor():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            if not self._origin_ok():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "bad_origin"})
+                return
+            if state.login is not None:
+                state.login.logout(self._cookies().get(state.login_cookie_name))
+            self._send_json(
+                HTTPStatus.OK, {"ok": True}, extra_headers=self._login_cookie_header("", 0)
+            )
+
+        def _handle_run_log(self, run_dir: Path, query: dict[str, list[str]]) -> None:
+            """GET /api/log?run=&after= — new lines of the run's ``strix.log``.
+
+            Session-gated by ``_handle_authed_get``. ``after`` is the byte offset
+            returned by the previous call (absent: the most recent lines). Every
+            line is redacted against the viewer's environment AND the saved
+            config file's values, because a scan reads its LLM key from that file
+            and the key is in neither ``os.environ`` nor the child's environment.
+            """
+            after_values = query.get("after")
+            try:
+                after = parse_cursor(after_values[0] if after_values else None)
+            except InvalidCursorError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_cursor", "message": "after must be a non-negative integer"},
+                )
+                return
+            env: dict[str, str] = dict(os.environ)
+            if state.settings_store is not None:
+                env.update(state.settings_store.redaction_env())
+            self._send_json(HTTPStatus.OK, read_log_chunk(run_dir, after, make_redactor(env)))
+
         # --- Scan notifications (Slack / Microsoft Teams / Telegram) ---
 
         def _notifications_gate_error(self) -> tuple[HTTPStatus, str] | None:
@@ -1216,15 +1384,30 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     jar[name] = value
             return jar
 
-        def _has_session(self) -> bool:
+        def _has_first_factor(self) -> bool:
             """True when the request carries this process's session capability.
 
-            The cookie is set only when the SPA is served (index.html), so only
-            the browser this process handed the page to can pass. A direct
+            The cookie is set only when the SPA is served with the bootstrap token,
+            so only the browser this process handed the page to can pass. A direct
             caller on an exposed port has no cookie and is rejected.
             """
             supplied = self._cookies().get(state.cookie_name, "")
             return bool(supplied) and secrets.compare_digest(supplied, state.session_token)
+
+        def _is_logged_in(self) -> bool:
+            """True when login is off, or the request carries a live login session."""
+            if state.login is None:
+                return True
+            return state.login.is_valid(self._cookies().get(state.login_cookie_name))
+
+        def _has_session(self) -> bool:
+            """True when the caller may read or change viewer data.
+
+            Needs the session capability (first factor) and, when login is on, a
+            valid login session as well (second factor). Every data endpoint goes
+            through here, so turning login on protects all of them at once.
+            """
+            return self._has_first_factor() and self._is_logged_in()
 
         def _token_presented(self, query: dict[str, list[str]]) -> bool:
             """True when the request carries the correct bootstrap token.
@@ -1246,11 +1429,31 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if not target.is_file():
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
-            content = target.read_bytes()
-            content_type, _ = mimetypes.guess_type(str(target))
-            self.send_response(HTTPStatus.OK)
+            size = target.stat().st_size
+            content_type = (
+                _EXTRA_MIME_TYPES.get(target.suffix.lower()) or mimetypes.guess_type(str(target))[0]
+            )
+
+            # Byte ranges let a <video> seek before it has downloaded everything.
+            # The SPA shell is always sent whole.
+            byte_range = None if is_index else parse_byte_range(self.headers.get("Range"), size)
+            if byte_range == UNSATISFIABLE:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if isinstance(byte_range, tuple):
+                first, last = byte_range
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
+            else:
+                first, last = 0, size - 1
+                self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type or "application/octet-stream")
-            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Length", str(max(0, last - first + 1)))
+            if not is_index:
+                self.send_header("Accept-Ranges", "bytes")
             if is_index and self._token_presented(query):
                 # Exchange the bootstrap token for the per-process session
                 # capability. Issued only when the correct token is presented,
@@ -1262,7 +1465,21 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     f"{state.cookie_name}={state.session_token}; Path=/; HttpOnly; SameSite=Strict",
                 )
             self.end_headers()
-            self.wfile.write(content)
+            self._write_file_range(target, first, last)
+
+        def _write_file_range(self, target: Path, first: int, last: int) -> None:
+            """Stream bytes ``first..last`` (inclusive) of ``target`` in bounded chunks."""
+            remaining = last - first + 1
+            if remaining <= 0:
+                return
+            with target.open("rb") as handle:
+                handle.seek(first)
+                while remaining > 0:
+                    chunk = handle.read(min(_STATIC_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
         def _resolve_asset(self, path: str) -> Path | None:
             rel = unquote(path).lstrip("/")
@@ -1319,6 +1536,7 @@ def serve(
     connection_tester: ConnectionTester | None = None,
     profile_store: ProfileStore | None = None,
     notifier: NotificationService | None = None,
+    login: LoginManager | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
     """Start the viewer server on a background thread; return (server, url, token).
 
@@ -1354,6 +1572,10 @@ def serve(
     Telegram). When omitted, ``/api/notifications*`` answers 403
     ``notifications_unavailable`` and ``/api/capabilities`` reports
     ``notifications.available=false``. The caller owns its start/stop.
+
+    ``login`` turns on username/password sign-in as a second factor on top of the
+    session token: every data endpoint then also needs a valid login session,
+    obtained from ``POST /api/login``. Left ``None`` the viewer behaves as before.
     """
     if runs_dir is None:
         if run_dir is None:
@@ -1371,6 +1593,7 @@ def serve(
         connection_tester=connection_tester,
         profile_store=profile_store,
         notifier=notifier,
+        login=login,
     )
     handler = _make_handler(state)
 
@@ -1385,6 +1608,7 @@ def serve(
     httpd.daemon_threads = True
     bound_port = int(httpd.server_address[1])
     state.cookie_name = f"{SESSION_COOKIE_PREFIX}_{bound_port}"
+    state.login_cookie_name = f"{LOGIN_COOKIE_PREFIX}_{bound_port}"
     url = f"http://{host}:{bound_port}"
     # Record the bound origin so the Origin/Host check (BR-2) has the truth.
     state.origin = url

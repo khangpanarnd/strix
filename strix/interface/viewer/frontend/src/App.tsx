@@ -16,6 +16,7 @@ import AgentGraph from "@/components/live/AgentGraph";
 import { buildGraphAgents } from "@/components/live/AgentTranscript";
 import AgentDetailModal from "@/components/live/AgentDetailModal";
 import { ScanPromptComposer } from "@/components/live/ScanPromptComposer";
+import { ServerLogPanel } from "@/components/live/ServerLogPanel";
 import { severityCounts, type ParsedRunSummary } from "@/lib/local-run-parser";
 import {
   fetchAll,
@@ -59,12 +60,23 @@ const TRUST_BANNER =
 const SEVERITY_ORDER: VulnerabilitySeverity[] = ["critical", "high", "medium", "low"];
 const POLL_MS = 500;
 
-export default function App() {
+export interface AppProps {
+  /**
+   * The view to open on first render (the landing page's "Scan your project" opens
+   * the New scan form). Without it the app opens on Overview and picks a default
+   * from the run, as before.
+   */
+  entryView?: View;
+  /** The signed-in account, when the viewer requires sign-in; enables "Sign out". */
+  account?: { username: string; onSignOut: () => void };
+}
+
+export default function App({ entryView, account }: AppProps = {}) {
   const [activeRun, setActiveRun] = useState<string | null>(null);
   const [run, setRun] = useState<LoadedRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("overview");
+  const [view, setView] = useState<View>(entryView ?? "overview");
   const [runs, setRuns] = useState<RunsPayload | null>(null);
   // Whether this viewer can steer a live scan (true only inside the in-TUI
   // launcher that shares the running scan's coordinator + event loop).
@@ -197,6 +209,10 @@ export default function App() {
   );
   const selected = run?.vulnerabilities.find((v) => v.id === selectedId) ?? null;
   const agentCount = run?.transcript.agents.length ?? 0;
+  // The Agents page also carries the server log, which matters most before the
+  // first agent exists (image pull, sandbox start, a slow first model reply), so
+  // it is offered for any live scan, not only once agents have appeared.
+  const agentsAvailable = agentCount > 0 || (run !== null && !run.finished);
 
   // The run's persisted MCP roster (from run.json via /api/run), plus the set of
   // connections with a tool call currently in flight. "In use" is derived here
@@ -224,12 +240,17 @@ export default function App() {
   // product introduction and is never a run default. Applied at most once per
   // run and never once the user has navigated manually (userSetView flips the
   // guard).
-  const initialViewAppliedRef = useRef(false);
+  // An explicit entry view (the landing page's "Scan your project") counts as the
+  // user having chosen a view, so the run's default must not override it.
+  const entryViewRef = useRef(entryView);
+  const initialViewAppliedRef = useRef(entryView !== undefined);
 
   // Reset the guard whenever the active run changes so the newly selected run
-  // gets its own default.
+  // gets its own default. Before any run is selected (activeRun is null), an
+  // entry view keeps the guard set. Derived from the ref rather than "skip the
+  // first call", so React StrictMode's double-invoked effects give the same result.
   useEffect(() => {
-    initialViewAppliedRef.current = false;
+    initialViewAppliedRef.current = activeRun === null && entryViewRef.current !== undefined;
   }, [activeRun]);
 
   useEffect(() => {
@@ -237,13 +258,13 @@ export default function App() {
     if (run.finished) {
       initialViewAppliedRef.current = true;
       setView("lastscan");
-    } else if (agentCount > 0) {
-      // Live and agents have appeared: default to the agent graph. If it is
-      // live but no agents exist yet, wait (do not apply, do not set the flag).
+    } else {
+      // Live: default to Agents, which shows the agent graph and the server log
+      // (so there is something to watch even before the first agent appears).
       initialViewAppliedRef.current = true;
       setView("agents");
     }
-  }, [run, agentCount]);
+  }, [run]);
 
   // User-initiated navigation: mark the default guard applied so the per-run
   // default effect never yanks the user off the view they chose.
@@ -309,9 +330,9 @@ export default function App() {
       <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
         Issues{(run?.vulnerabilities.length ?? 0) > 0 ? ` (${run?.vulnerabilities.length})` : ""}
       </TabButton>
-      {agentCount > 0 && (
+      {agentsAvailable && (
         <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
-          Agents ({agentCount})
+          Agents{agentCount > 0 ? ` (${agentCount})` : ""}
         </TabButton>
       )}
     </div>
@@ -337,10 +358,12 @@ export default function App() {
         onOpenNotifications={openNotifications}
         issuesCount={run?.vulnerabilities.length ?? 0}
         agentCount={agentCount}
+        agentsAvailable={agentsAvailable}
         mcpConnections={mcpConnections}
         mcpInUse={mcpInUse}
         runCount={runs?.count ?? 0}
         onOpenHistory={openHistory}
+        account={account}
       />
 
       <div className="flex-1 min-w-0">
@@ -391,7 +414,12 @@ export default function App() {
             className="animate-page-in space-y-6"
           >
           {view === "launch" ? (
-            scanLimits ? (
+            !capsLoaded ? (
+              <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
+                <div className="w-6 h-6 mx-auto mb-3 rounded-full border-2 border-[#333] border-t-white animate-spin" />
+                <p className="text-sm text-[#888]">Loading…</p>
+              </div>
+            ) : scanLimits ? (
               <LaunchView
                 limits={scanLimits}
                 onLaunched={onLaunched}
@@ -402,6 +430,13 @@ export default function App() {
               <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
                 <p className="text-sm text-[#888]">
                   Launching scans is not available in this viewer.
+                </p>
+                <p className="mt-2 text-sm text-[#666]">
+                  Start the viewer with{" "}
+                  <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[#aaa]">
+                    strix view --launch
+                  </code>{" "}
+                  to scan a project from the browser.
                 </p>
               </div>
             )
@@ -461,8 +496,8 @@ export default function App() {
                   reportMarkdown={run.reportMarkdown}
                   raw={run.raw}
                 />
-              ) : view === "agents" && agentCount > 0 ? (
-                <AgentsTab run={run} canSteer={canSteer} />
+              ) : view === "agents" && agentsAvailable ? (
+                <AgentsTab run={run} canSteer={canSteer} runName={activeRun} />
               ) : selected ? (
                 <div className="space-y-4">
                   <button
@@ -751,7 +786,15 @@ function TabButton({
   );
 }
 
-function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
+function AgentsTab({
+  run,
+  canSteer,
+  runName,
+}: {
+  run: LoadedRun;
+  canSteer: boolean;
+  runName: string | null;
+}) {
   const { agents, events } = run.transcript;
   const graphAgents = useMemo(() => buildGraphAgents(agents, events), [agents, events]);
   // Clicking a graph node opens the agent's transcript in a modal; no node selected means no modal.
@@ -760,6 +803,9 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
 
   // Live steering is only possible in-process (canSteer) while the scan runs.
   const steerable = canSteer && !run.finished;
+
+  // Log lines carry agent ids; show the agents' names instead.
+  const agentNames = useMemo(() => new Map(agents.map((a) => [a.id, a.name])), [agents]);
 
   return (
     <div className="space-y-5">
@@ -772,7 +818,9 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
           </span>
         </div>
         <p className="mt-1 mb-4 text-xs text-[#666]">
-          Click an agent to open its full transcript.
+          {agents.length === 0
+            ? "Agents appear here once the scan starts them. The server log below shows what is happening in the meantime."
+            : "Click an agent to open its full transcript."}
         </p>
         <div className="h-[480px] rounded-lg border border-[#1a1a1a] overflow-hidden">
           <AgentGraph
@@ -788,6 +836,9 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
 
       {/* Live steering: only in-process while the scan runs. Otherwise omitted. */}
       {steerable && <ScanPromptComposer agents={agents} />}
+
+      {/* What is running on the server side: the scan's own log, streamed. */}
+      <ServerLogPanel runName={runName} finished={run.finished} agentNames={agentNames} />
 
       <AgentDetailModal
         open={selectedAgent !== null}
