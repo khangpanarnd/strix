@@ -51,6 +51,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
             Strix<small>Internal guide</small>
           </a>
           <nav aria-label="Page sections">
+            <a href="#get">What you get</a>
             <a href="#preview">What a scan looks like</a>
             <a href="#how">First scan in 3 steps</a>
             <a href="#before">Before you start</a>
@@ -75,6 +76,66 @@ export function LandingPage({ onScan }: LandingPageProps) {
               <a className="textlink" href="#how">
                 See how it works
               </a>
+            </div>
+            <ul className="trust" aria-label="What Strix gives you">
+              <li>Runs on your machine</li>
+              <li>Every finding proven with an exploit</li>
+              <li>CLI-first, pipeline-ready</li>
+            </ul>
+          </div>
+        </section>
+
+        <section className="band" aria-label="Strix at a glance">
+          <div className="wrap">
+            <dl className="metrics">
+              <div>
+                <dt>100%</dt>
+                <dd>runs on your machine</dd>
+              </div>
+              <div>
+                <dt>44</dt>
+                <dd>tools in the agent sandbox</dd>
+              </div>
+              <div>
+                <dt>PoC</dt>
+                <dd>request + response per finding</dd>
+              </div>
+              <div>
+                <dt>
+                  <code>exit 2</code>
+                </dt>
+                <dd>non-zero when it finds bugs</dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+
+        <section className="row" id="get">
+          <div className="wrap">
+            <div>
+              <h2>What you get</h2>
+              <p className="note">A pentest team, not a scanner.</p>
+            </div>
+            <div className="body">
+              <ul className="prereq stack">
+                <li>
+                  <b>Every finding is proven.</b> Agents build a working exploit and save the
+                  request and response, so you triage facts instead of guesses.
+                </li>
+                <li>
+                  <b>It runs in a local sandbox.</b> The agents attack from inside a Docker
+                  container on your machine — nothing deploys to a vendor cloud.
+                </li>
+                <li>
+                  <b>The viewer explains itself.</b> A live agent graph, validated vulnerabilities,
+                  run history and reports — all on this screen.
+                </li>
+                <li>
+                  <b>It drops into your pipeline.</b> Run headless with <code>-n</code>; it exits
+                  non-zero on findings and writes Markdown, HTML and <code>findings.sarif</code>{" "}
+                  (SARIF 2.1.0) into <code>strix_runs/</code>.
+                </li>
+              </ul>
             </div>
           </div>
         </section>
@@ -158,6 +219,48 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   Scan your project
                 </button>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="row" id="privacy">
+          <div className="wrap">
+            <div>
+              <h2>Data &amp; privacy</h2>
+              <p className="note">You know where your data goes.</p>
+            </div>
+            <div className="body">
+              <div className="split">
+                <div>
+                  <h3>Stays on your machine</h3>
+                  <ul>
+                    <li>The sandbox, where the agents run and attack.</li>
+                    <li>
+                      Every finding, log and report in <code>strix_runs/</code>.
+                    </li>
+                    <li>
+                      This viewer, which listens only on <code>127.0.0.1</code> behind a private
+                      tokened link.
+                    </li>
+                  </ul>
+                </div>
+                <div className="out">
+                  <h3>Goes to your model provider</h3>
+                  <ul>
+                    <li>The agents’ prompts, which include the code and responses they analyse.</li>
+                    <li>This applies to any hosted model you configure.</li>
+                    <li>
+                      Point <code>LLM_API_BASE</code> at an approved internal endpoint or a local
+                      model such as Ollama if the code is sensitive.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+              <p className="caution">
+                Only test apps you own or have written permission to test. Strix runs{" "}
+                <b>real exploits</b> against its target — prefer a staging environment and a
+                dedicated test account over production data and real credentials.
+              </p>
             </div>
           </div>
         </section>
