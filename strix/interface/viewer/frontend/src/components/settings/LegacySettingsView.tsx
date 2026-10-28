@@ -327,9 +327,9 @@ function Notices({ view }: { view: SettingsViewData }) {
     <div className="space-y-3">
       {readOnly && (
         <NoticeCard tone="info" testId="settings-readonly-notice">
-          Settings can be changed only from a viewer started on this machine (bound to a loopback
-          address). This viewer is reachable over the network, so the fields are read-only. You can
-          see the settings here, but not the API key.
+          Settings are read-only here. This viewer is reachable over the network with sign-in off,
+          so configuration is locked. Turn sign-in on (the default) to edit settings remotely, open
+          the viewer from this machine, or unset STRIX_VIEWER_REMOTE_CONFIG=off.
         </NoticeCard>
       )}
 

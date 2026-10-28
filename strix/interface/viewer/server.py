@@ -149,6 +149,23 @@ _PASSWORD_POLICY_MESSAGES = {
     "password_unchanged": "Choose a password other than the default.",
 }
 
+
+def _remote_config_disabled() -> bool:
+    """True when the operator opted out of editing config over the network.
+
+    Set ``STRIX_VIEWER_REMOTE_CONFIG`` to off/0/false/no to keep settings,
+    profiles and notifications read-only on any non-loopback bind, matching the
+    original loopback-only behaviour. Any other value (or unset) leaves remote
+    editing enabled for authenticated users.
+    """
+    return os.environ.get("STRIX_VIEWER_REMOTE_CONFIG", "").strip().lower() in {
+        "off",
+        "0",
+        "false",
+        "no",
+    }
+
+
 # Types served with an explicit type because the platform's mimetypes table may
 # not know them (Windows reads the registry).
 _EXTRA_MIME_TYPES = {".mp4": "video/mp4", ".webm": "video/webm", ".webp": "image/webp"}
@@ -635,17 +652,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "scan_limits": None,
                 # The settings page is available whenever the store was wired
                 # (launch and fixed-run mode). ``editable`` tells the SPA whether
-                # to render the write controls; a non-loopback bind shows them
-                # read-only (BR-2). Unauthenticated, like the rest of this body.
+                # to render the write controls; it is true on a loopback bind and,
+                # off-loopback, when sign-in protects writes (unless remote config
+                # is disabled). Unauthenticated, like the rest of this body.
                 "llm_settings": {
                     "available": state.settings_store is not None,
-                    "editable": self._is_loopback_bind(),
+                    "editable": self._config_editable(),
                 },
-                # Scan notifications (Slack / Teams / Telegram): same read-only
-                # rule as the LLM settings on a non-loopback bind.
+                # Scan notifications (Slack / Teams / Telegram): same editability
+                # rule as the LLM settings.
                 "notifications": {
                     "available": state.notifier is not None,
-                    "editable": self._is_loopback_bind(),
+                    "editable": self._config_editable(),
                 },
             }
             if launch_available:
@@ -768,6 +786,26 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         def _is_loopback_bind(self) -> bool:
             return state.bound_host in ("127.0.0.1", "localhost", "::1")
 
+        def _config_editable(self) -> bool:
+            """Whether settings / profiles / notifications may be WRITTEN now.
+
+            These panels hold secrets (LLM keys) and control scan cost, so a
+            viewer exposed to the network historically served them read-only.
+            Now that sign-in is a real factor, an authenticated user may edit
+            them remotely too: editing is allowed on a loopback bind, or when
+            login is on (so only a signed-in caller reaches a write), or when
+            remote config is explicitly enabled. Set
+            ``STRIX_VIEWER_REMOTE_CONFIG=off`` to restore the strict
+            loopback-only rule even with login on.
+            """
+            if self._is_loopback_bind():
+                return True
+            if _remote_config_disabled():
+                return False
+            # Off-loopback: only a sign-in-protected viewer may be edited
+            # remotely, so an exposed port without login stays read-only.
+            return state.login is not None
+
         def _acceptable_origins(self) -> set[str]:
             origins = {state.origin}
             if self._is_loopback_bind():
@@ -876,7 +914,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             # active-scan flag first, then build the view.
             scan_active = state.launcher is not None and state.launcher.active_run() is not None
             view = state.settings_store.view(
-                editable=self._is_loopback_bind(), scan_active=scan_active
+                editable=self._config_editable(), scan_active=scan_active
             )
             self._send_json(HTTPStatus.OK, view)
 
@@ -892,7 +930,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return HTTPStatus.FORBIDDEN, "forbidden"
             if state.settings_store is None:
                 return HTTPStatus.FORBIDDEN, "settings_unavailable"
-            if not self._is_loopback_bind():
+            if not self._config_editable():
                 return HTTPStatus.FORBIDDEN, "settings_read_only"
             if not self._origin_ok():
                 return HTTPStatus.FORBIDDEN, "bad_origin"
@@ -966,8 +1004,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_launch_error(exc)
                 return
             # ``apply`` returns the view with ``editable=True``; override with the
-            # real bind so a race on the toggle cannot mislead the SPA.
-            view["editable"] = self._is_loopback_bind()
+            # real editability so a race on the toggle cannot mislead the SPA.
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_settings_reset(self) -> None:
@@ -992,7 +1030,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_settings_test(self) -> None:
@@ -1050,7 +1088,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
             scan_active = state.launcher is not None and state.launcher.active_run() is not None
             try:
-                view = profiles.view(editable=self._is_loopback_bind(), scan_active=scan_active)
+                view = profiles.view(editable=self._config_editable(), scan_active=scan_active)
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
@@ -1085,7 +1123,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_profiles_save(self) -> None:
@@ -1345,7 +1383,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return HTTPStatus.FORBIDDEN, "forbidden"
             if state.notifier is None:
                 return HTTPStatus.FORBIDDEN, "notifications_unavailable"
-            if not self._is_loopback_bind():
+            if not self._config_editable():
                 return HTTPStatus.FORBIDDEN, "notifications_read_only"
             if not self._origin_ok():
                 return HTTPStatus.FORBIDDEN, "bad_origin"
@@ -1370,7 +1408,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if state.notifier is None:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "notifications_unavailable"})
                 return
-            view = state.notifier.store.view(editable=self._is_loopback_bind())
+            view = state.notifier.store.view(editable=self._config_editable())
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_notifications_put(self) -> None:
@@ -1393,7 +1431,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_notifications_test(self) -> None:

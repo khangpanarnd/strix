@@ -124,6 +124,7 @@ def _serve(
     *,
     host: str = "127.0.0.1",
     with_notifier: bool = True,
+    with_login: bool = True,
 ) -> tuple[Any, str, NotificationService | None, RecordingSender]:
     _bundle(tmp_path, monkeypatch)
     runs_dir = tmp_path / "strix_runs"
@@ -143,7 +144,7 @@ def _serve(
         open_browser=False,
         runs_dir=runs_dir,
         notifier=notifier,
-        login=_login_manager(),
+        login=_login_manager() if with_login else None,
     )
     return httpd, url, notifier, sender
 
@@ -205,16 +206,44 @@ def test_capabilities_advertise_notifications(
         _close(httpd)
 
 
-def test_non_loopback_bind_is_read_only_but_get_works(
+def test_non_loopback_bind_with_login_is_editable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Exposed on 0.0.0.0 but sign-in protected: an authenticated user may edit.
     httpd, _url, _n, _s = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
     try:
         port = httpd.server_address[1]
         loopback = f"http://127.0.0.1:{port}"
-        cookie = _login_cookie(loopback, origin=f"http://0.0.0.0:{port}")
+        origin = f"http://0.0.0.0:{port}"
+        cookie = _login_cookie(loopback, origin=origin)
 
         status, payload = _request(loopback, "/api/notifications", cookie=cookie)
+        assert status == 200
+        assert json.loads(payload)["editable"] is True
+
+        status, _ = _request(
+            loopback,
+            "/api/notifications",
+            method="PUT",
+            body={"enabled": True},
+            cookie=cookie,
+            headers={"Origin": origin},
+        )
+        assert status == 200
+    finally:
+        _close(httpd)
+
+
+def test_non_loopback_bind_without_login_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exposed on 0.0.0.0 with sign-in OFF: configuration stays locked.
+    httpd, _url, _n, _s = _serve(tmp_path, monkeypatch, host="0.0.0.0", with_login=False)  # nosec B104
+    try:
+        port = httpd.server_address[1]
+        loopback = f"http://127.0.0.1:{port}"
+
+        status, payload = _request(loopback, "/api/notifications")
         assert status == 200
         assert json.loads(payload)["editable"] is False
 
@@ -222,7 +251,7 @@ def test_non_loopback_bind_is_read_only_but_get_works(
             ("PUT", "/api/notifications", {"enabled": True}),
             ("POST", "/api/notifications/test", {"channel": "slack", "webhook_url": SLACK_URL}),
         ):
-            status, payload = _request(loopback, path, method=method, body=body, cookie=cookie)
+            status, payload = _request(loopback, path, method=method, body=body)
             assert status == 403, f"{method} {path}"
             assert json.loads(payload)["error"] == "notifications_read_only"
     finally:

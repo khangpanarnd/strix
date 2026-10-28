@@ -4,11 +4,11 @@ These run a real ``ThreadingHTTPServer`` (like ``test_viewer_launch_api``) with 
 real :class:`SettingsStore` on a temp config path, a fake resolver (no DNS), a
 fake :class:`ConnectionTester` (no child process, no network), and the launch
 feature's ``FakeLauncher`` for the ``scan_active`` wiring. They assert the gate
-order, the read-only (non-loopback) behaviour, every error code, the happy-path
-round trip, the key-required rules, the rate limit, capabilities in both modes,
-the connection-test result/error mapping, and — across every endpoint including
-error responses, the server logs, and the static handler — that a recognisable
-API key never leaks.
+order, the read-only (exposed-without-login) behaviour, every error code, the
+happy-path round trip, the key-required rules, the rate limit, capabilities in
+both modes, the connection-test result/error mapping, and — across every
+endpoint including error responses, the server logs, and the static handler —
+that a recognisable API key never leaks.
 """
 
 from __future__ import annotations
@@ -23,9 +23,11 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from strix.interface.viewer import credentials_store
 from strix.interface.viewer.launch_errors import LaunchError
 from strix.interface.viewer.launch_request import LaunchLimits
 from strix.interface.viewer.llm_settings import SettingsStore
+from strix.interface.viewer.login import LoginConfig, LoginManager, hash_password
 from strix.interface.viewer.server import serve
 
 
@@ -38,6 +40,9 @@ if TYPE_CHECKING:
 # log line, or on-disk-served asset (BR-12, NFR-1). Not a real credential.
 SECRET_KEY = "sk-SECRETKEY1234567890abcdefONE"  # noqa: S105 - test-only fake secret
 SECRET_KEY_TWO = "sk-SECRETKEY1234567890abcdefTWO"  # noqa: S105 - test-only fake secret
+
+_TEST_USER = "alice"
+_TEST_PW = "pw-correct-horse"  # test-only fake password
 
 
 class FakeLauncher:
@@ -84,11 +89,28 @@ def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
 
-def _session_cookie(url: str, token: str) -> str:
-    bootstrap = f"{url}/?token={token}"
-    with urllib.request.urlopen(bootstrap) as resp:  # noqa: S310  # nosec B310
-        raw = str(resp.headers.get("Set-Cookie", ""))
-    return raw.split(";", 1)[0]
+@pytest.fixture(autouse=True)
+def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        credentials_store, "CREDENTIALS_PATH", tmp_path / ".strix" / "viewer-users.db"
+    )
+
+
+def _login_manager() -> LoginManager:
+    return LoginManager(LoginConfig(_TEST_USER, hash_password(_TEST_PW, iterations=1000)))
+
+
+def _login_cookie(url: str, *, origin: str | None = None) -> str:
+    body = json.dumps({"username": _TEST_USER, "password": _TEST_PW}).encode()
+    headers = {"Content-Type": "application/json"}
+    if origin:
+        headers["Origin"] = origin
+    req = urllib.request.Request(  # noqa: S310
+        url + "/api/login", data=body, headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
+        assert resp.status == 200
+        return str(resp.headers.get("Set-Cookie", "")).split(";", 1)[0]
 
 
 def _request(
@@ -122,9 +144,10 @@ def _serve(
     host: str = "127.0.0.1",
     with_store: bool = True,
     with_tester: bool = True,
+    with_login: bool = True,
     launcher: FakeLauncher | None = None,
     environ: dict[str, str] | None = None,
-) -> tuple[Any, str, str, SettingsStore | None, FakeTester | None]:
+) -> tuple[Any, str, SettingsStore | None, FakeTester | None]:
     """Start a real server with a temp-path store and a fake tester."""
     _bundle(tmp_path, monkeypatch)
     runs_dir = tmp_path / "strix_runs"
@@ -136,7 +159,7 @@ def _serve(
         else None
     )
     tester = FakeTester() if with_tester else None
-    httpd, url, token = serve(
+    httpd, url, _empty = serve(
         None,
         host=host,
         open_browser=False,
@@ -144,15 +167,16 @@ def _serve(
         launcher=launcher,  # type: ignore[arg-type]
         settings_store=store,
         connection_tester=tester,  # type: ignore[arg-type]
+        login=_login_manager() if with_login else None,
     )
-    return httpd, url, token, store, tester
+    return httpd, url, store, tester
 
 
 # --- authorization (BR-1) ---------------------------------------------------
 
 
 def test_all_four_routes_require_cookie(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, _token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
         checks: list[tuple[str, str, dict[str, object] | None]] = [
             ("GET", "/api/settings", None),
@@ -169,20 +193,70 @@ def test_all_four_routes_require_cookie(tmp_path: Path, monkeypatch: pytest.Monk
         httpd.server_close()
 
 
-# --- read-only (non-loopback) bind (BR-2) -----------------------------------
+# --- read-only when exposed without sign-in (BR-2) --------------------------
 
 
-def test_non_loopback_bind_is_read_only_but_get_works(
+def test_non_loopback_bind_with_login_is_editable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, _url, token, _store, _tester = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
+    # A 0.0.0.0 bind WITH sign-in is editable: only a signed-in caller reaches a
+    # write, so remote editing is allowed (the inverse of the old rule).
+    httpd, _url, store, _tester = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
+    assert store is not None
     try:
         port = httpd.server_address[1]
         loopback = f"http://127.0.0.1:{port}"
-        cookie = _session_cookie(loopback, token)
+        origin = f"http://0.0.0.0:{port}"
+        cookie = _login_cookie(loopback, origin=origin)
 
-        # GET works and reports editable=false.
+        # GET works and reports editable=true.
         status, _, payload = _request(loopback, "/api/settings", cookie=cookie)
+        assert status == 200
+        assert json.loads(payload)["editable"] is True
+
+        # A valid PUT (sent with the matching Origin) is accepted, not 403 —
+        # proof the config is writable over the exposed bind. (The PUT response's
+        # own ``editable`` field is pinned to the raw loopback bind by the
+        # handler, so only the 200 and the GET/capabilities views below assert
+        # the editable semantic.)
+        status, _, payload = _request(
+            loopback,
+            "/api/settings",
+            method="PUT",
+            body={"model": "openai/gpt-5", "api_key": SECRET_KEY},
+            cookie=cookie,
+            headers={"Origin": origin},
+        )
+        assert status == 200, payload
+
+        # Capabilities also report editable=true.
+        status, _, payload = _request(loopback, "/api/capabilities")
+        assert status == 200
+        assert json.loads(payload)["llm_settings"]["editable"] is True
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_non_loopback_bind_without_login_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exposed on 0.0.0.0 with NO sign-in: login is off so data is open (no
+    # cookie), but config stays read-only to protect the exposed-without-auth
+    # case (the original protection).
+    httpd, _url, store, _tester = _serve(
+        tmp_path,
+        monkeypatch,
+        host="0.0.0.0",  # nosec B104
+        with_login=False,
+    )
+    assert store is not None
+    try:
+        port = httpd.server_address[1]
+        loopback = f"http://127.0.0.1:{port}"
+
+        # GET works (routes open) and reports editable=false.
+        status, _, payload = _request(loopback, "/api/settings")
         assert status == 200
         assert json.loads(payload)["editable"] is False
 
@@ -192,9 +266,40 @@ def test_non_loopback_bind_is_read_only_but_get_works(
             ("POST", "/api/settings/reset", {"confirm": True}),
             ("POST", "/api/settings/test", {"model": "openai/gpt-5"}),
         ):
-            status, _, payload = _request(loopback, path, method=method, body=body, cookie=cookie)
+            status, _, payload = _request(loopback, path, method=method, body=body)
             assert status == 403, f"{method} {path}"
             assert json.loads(payload)["error"] == "settings_read_only"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_remote_config_can_be_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Even with sign-in on, STRIX_VIEWER_REMOTE_CONFIG=off restores the strict
+    # loopback-only rule: a 0.0.0.0 bind becomes read-only again.
+    monkeypatch.setenv("STRIX_VIEWER_REMOTE_CONFIG", "off")
+    httpd, _url, store, _tester = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
+    assert store is not None
+    try:
+        port = httpd.server_address[1]
+        loopback = f"http://127.0.0.1:{port}"
+        origin = f"http://0.0.0.0:{port}"
+        cookie = _login_cookie(loopback, origin=origin)
+
+        status, _, payload = _request(loopback, "/api/settings", cookie=cookie)
+        assert status == 200
+        assert json.loads(payload)["editable"] is False
+
+        status, _, payload = _request(
+            loopback,
+            "/api/settings",
+            method="PUT",
+            body={"model": "openai/gpt-5", "api_key": SECRET_KEY},
+            cookie=cookie,
+            headers={"Origin": origin},
+        )
+        assert status == 403, payload
+        assert json.loads(payload)["error"] == "settings_read_only"
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -204,9 +309,9 @@ def test_non_loopback_bind_is_read_only_but_get_works(
 
 
 def test_foreign_origin_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(
             url,
             "/api/settings",
@@ -223,9 +328,9 @@ def test_foreign_origin_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_wrong_content_type_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         data = json.dumps({"model": "openai/gpt-5"}).encode()
         req = urllib.request.Request(  # noqa: S310
             url + "/api/settings",
@@ -246,9 +351,9 @@ def test_wrong_content_type_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         parsed = urlsplit(url)
         conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port or 80)
         conn.putrequest("PUT", "/api/settings")
@@ -268,9 +373,9 @@ def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_oversized_body_is_413(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         big = {"model": "openai/gpt-5", "api_key": "x" * 20_000}
         status, _, payload = _request(url, "/api/settings", method="PUT", body=big, cookie=cookie)
         assert status == 413
@@ -281,9 +386,9 @@ def test_oversized_body_is_413(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_unknown_field_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(
             url, "/api/settings", method="PUT", body={"bogus": 1}, cookie=cookie
         )
@@ -298,10 +403,10 @@ def test_unknown_field_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_save_then_get_reflects_ui_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, store, _tester = _serve(tmp_path, monkeypatch)
     assert store is not None
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(
             url,
             "/api/settings",
@@ -337,9 +442,9 @@ def test_scan_active_reflected_from_launcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launcher = FakeLauncher(active="web-live")
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch, launcher=launcher)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch, launcher=launcher)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(url, "/api/settings", cookie=cookie)
         assert status == 200
         assert json.loads(payload)["scan_active"] is True
@@ -354,12 +459,12 @@ def test_scan_active_reflected_from_launcher(
 def test_key_never_appears_in_any_response_log_or_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    httpd, url, token, store, tester = _serve(tmp_path, monkeypatch)
+    httpd, url, store, tester = _serve(tmp_path, monkeypatch)
     assert store is not None and tester is not None
     tester.error = None
     collected: list[bytes] = []
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         with caplog.at_level(logging.DEBUG):
             # Save with the key.
             _, _, body = _request(
@@ -420,9 +525,9 @@ def test_key_never_appears_in_any_response_log_or_asset(
 def test_base_change_with_saved_key_requires_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # Save a key first.
         _request(
             url,
@@ -451,11 +556,9 @@ def test_first_save_with_shell_only_key_requires_key(
 ) -> None:
     # The key exists only in the viewer's shell environment, never in the file;
     # the first managed save must re-enter it (BR-14).
-    httpd, url, token, _store, _tester = _serve(
-        tmp_path, monkeypatch, environ={"LLM_API_KEY": SECRET_KEY}
-    )
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch, environ={"LLM_API_KEY": SECRET_KEY})
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(
             url,
             "/api/settings",
@@ -474,9 +577,9 @@ def test_first_save_with_shell_only_key_requires_key(
 
 
 def test_clear_field_then_reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         _request(
             url,
             "/api/settings",
@@ -503,9 +606,9 @@ def test_clear_field_then_reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def test_reset_without_confirm_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, payload = _request(
             url, "/api/settings/reset", method="POST", body={"confirm": False}, cookie=cookie
         )
@@ -522,9 +625,9 @@ def test_reset_without_confirm_is_400(tmp_path: Path, monkeypatch: pytest.Monkey
 def test_change_rate_limit_is_429_with_retry_after(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # 30 successful changes.
         for i in range(30):
             status, _, _ = _request(
@@ -552,9 +655,9 @@ def test_test_endpoint_not_counted_against_change_limit(
 ) -> None:
     # The connection test has its own 6/min window inside the tester, so it must
     # NOT consume the 10/min change window. Fire 20 tests, then a save still works.
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         for _ in range(20):
             status, _, _ = _request(
                 url,
@@ -579,7 +682,7 @@ def test_test_endpoint_not_counted_against_change_limit(
 def test_capabilities_reports_llm_settings_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, _token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
         status, _, payload = _request(url, "/api/capabilities")
         assert status == 200
@@ -593,9 +696,7 @@ def test_capabilities_reports_llm_settings_available(
 def test_capabilities_reports_llm_settings_unavailable_without_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _store, _tester = _serve(
-        tmp_path, monkeypatch, with_store=False, with_tester=False
-    )
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch, with_store=False, with_tester=False)
     try:
         status, _, payload = _request(url, "/api/capabilities")
         assert status == 200
@@ -603,7 +704,7 @@ def test_capabilities_reports_llm_settings_unavailable_without_store(
         assert caps["available"] is False
 
         # And the routes answer settings_unavailable with the cookie present.
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         for method, path, body in (
             ("GET", "/api/settings", None),
             ("PUT", "/api/settings", {"model": "openai/gpt-5"}),
@@ -622,7 +723,7 @@ def test_capabilities_reports_llm_settings_unavailable_without_store(
 
 
 def test_test_maps_tester_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _store, tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, tester = _serve(tmp_path, monkeypatch)
     assert tester is not None
     tester.result = {
         "ok": False,
@@ -632,7 +733,7 @@ def test_test_maps_tester_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         "message": "The provider rejected the API key (HTTP 401).",
     }
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # An ok:false result is still HTTP 200.
         status, _, payload = _request(
             url, "/api/settings/test", method="POST", body={"model": "openai/gpt-5"}, cookie=cookie
@@ -651,13 +752,13 @@ def test_test_maps_tester_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 def test_test_maps_tester_launch_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, http_status: int
 ) -> None:
-    httpd, url, token, _store, tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, tester = _serve(tmp_path, monkeypatch)
     assert tester is not None
     name = "test_in_progress" if code == 409 else "rate_limited"
     extra = {"retry_after": 60} if code == 429 else None
     tester.error = LaunchError(name, "nope", status=code, extra=extra)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, headers, payload = _request(
             url, "/api/settings/test", method="POST", body={"model": "openai/gpt-5"}, cookie=cookie
         )
@@ -675,10 +776,10 @@ def test_test_key_required_for_base_change_is_400(
 ) -> None:
     # A saved key, a typed base that differs, and no typed key -> 400 and no
     # process is started (the fake tester is never called).
-    httpd, url, token, _store, tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, tester = _serve(tmp_path, monkeypatch)
     assert tester is not None
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         _request(
             url,
             "/api/settings",
@@ -706,9 +807,9 @@ def test_static_handler_cannot_read_config_after_second_save(
 ) -> None:
     # Save twice (two different keys); neither key is reachable through the
     # static asset handler by any ``../`` style path.
-    httpd, url, token, _store, _tester = _serve(tmp_path, monkeypatch)
+    httpd, url, _store, _tester = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         _request(
             url,
             "/api/settings",

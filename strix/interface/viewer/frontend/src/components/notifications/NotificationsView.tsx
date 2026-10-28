@@ -189,8 +189,9 @@ export function NotificationsPage() {
 
       {readOnly && (
         <Notice testId="notifications-readonly-note">
-          This viewer is reachable over the network, so notification settings are read-only here.
-          Open it from this machine (localhost) to change them.
+          This viewer is reachable over the network with sign-in off, so notification settings are
+          read-only. Turn sign-in on (the default) to change them remotely, or open the viewer from
+          this machine.
         </Notice>
       )}
       {view.file_status === "unreadable" && (

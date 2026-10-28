@@ -549,7 +549,9 @@ function EmptyState({
         </button>
       ) : (
         <p className="mt-4 text-xs text-[#666]">
-          Profiles can be created only from a viewer started on this machine.
+          Profiles are read-only here: this viewer is reachable over the network with sign-in off.
+          Turn sign-in on (the default) to manage profiles remotely, or open the viewer from this
+          machine.
         </p>
       )}
     </div>
@@ -572,9 +574,9 @@ function Notices({ view, activatedNote }: { view: ProfilesViewData; activatedNot
     <div className="space-y-3">
       {readOnly && (
         <NoticeCard tone="info" testId="settings-readonly-notice">
-          Settings can be changed only from a viewer started on this machine (bound to a loopback
-          address). This viewer is reachable over the network, so the profiles are read-only. You
-          can see them here, but not the API keys.
+          Profiles are read-only here. This viewer is reachable over the network with sign-in off,
+          so configuration is locked. Turn sign-in on (the default) to edit profiles remotely, or
+          open the viewer from this machine. You can see them here, but not the API keys.
         </NoticeCard>
       )}
 
