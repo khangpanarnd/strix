@@ -1,9 +1,9 @@
 """Tests for how the ``strix view`` command wires up sign-in.
 
 The default account now comes from the persisted credential store, so every
-test points ``credentials_store.CREDENTIALS_PATH`` at a throwaway file under
+test points ``credentials_store.CREDENTIALS_PATH`` at a throwaway database under
 ``tmp_path``. Nothing here ever reads or writes the real
-``~/.strix/viewer-credentials.json``.
+``~/.strix/viewer-users.db``.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from strix.interface.viewer.login import (
     DEFAULT_USERNAME,
     LoginManager,
     hash_password,
+    verify_password,
 )
 
 
@@ -32,9 +33,9 @@ PASSWORD = "an-example-password-for-tests"  # noqa: S105 - test-only value, not 
 
 @pytest.fixture(autouse=True)
 def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect the store at a tmp file. ``cli`` reads it via the module, so
+    """Redirect the store at a tmp database. ``cli`` reads it via the module, so
     patching the one attribute covers every reference."""
-    path = tmp_path / ".strix" / "viewer-credentials.json"
+    path = tmp_path / ".strix" / "viewer-users.db"
     monkeypatch.setattr(credentials_store, "CREDENTIALS_PATH", path)
     return path
 
@@ -76,7 +77,7 @@ def test_the_first_run_default_account_must_change_its_password(
     text = buffer.getvalue()
     assert DEFAULT_USERNAME in text
     assert "First sign-in" in text  # the note warns about the forced change
-    assert "set a new one" in text
+    assert "set a new password" in text
 
 
 def test_sign_in_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,3 +142,57 @@ def test_markup_in_a_username_cannot_inject_console_formatting() -> None:
     )
     cli._print_login_note(console, login)
     assert "[bold red]x[/]" in buffer.getvalue()  # printed literally, not interpreted
+
+
+# --- --reset-login (locked-out recovery) -------------------------------------------
+
+
+def test_parse_args_reset_login_variants() -> None:
+    # Bare flag -> empty string (restore default); with a value -> that value;
+    # absent -> None (no reset).
+    assert cli._parse_args(["--reset-login"]).reset_login == ""
+    assert cli._parse_args(["--reset-login", "my-new-password"]).reset_login == "my-new-password"
+    assert cli._parse_args([]).reset_login is None
+
+
+def test_reset_login_bare_restores_the_default_admin_account(
+    _tmp_credentials: Path,
+) -> None:
+    # Seed and change away from the default first, then reset back.
+    account = credentials_store.set_password(credentials_store.load_or_seed(), PASSWORD)
+    assert account.must_change is False
+    console, buffer = _console()
+
+    cli._apply_login_reset(console, "")
+
+    restored = credentials_store.read()
+    assert restored is not None
+    assert restored.username == DEFAULT_USERNAME
+    assert restored.must_change is True
+    assert verify_password(DEFAULT_SEED_PASSWORD, restored.password_hash) is True
+    assert "admin" in buffer.getvalue()
+
+
+def test_reset_login_with_a_password_sets_it_without_forcing_a_change(
+    _tmp_credentials: Path,
+) -> None:
+    credentials_store.load_or_seed()
+    console, buffer = _console()
+
+    cli._apply_login_reset(console, "a-brand-new-strong-password")
+
+    stored = credentials_store.read()
+    assert stored is not None
+    assert stored.must_change is False
+    assert verify_password("a-brand-new-strong-password", stored.password_hash) is True
+    text = buffer.getvalue()
+    assert "Password reset" in text
+    assert "a-brand-new-strong-password" not in text  # the secret is never printed
+
+
+def test_reset_login_rejects_a_too_short_password(_tmp_credentials: Path) -> None:
+    credentials_store.load_or_seed()
+    console, _ = _console()
+    with pytest.raises(SystemExit) as exc:
+        cli._apply_login_reset(console, "short")
+    assert exc.value.code == 1
