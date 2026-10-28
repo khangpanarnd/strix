@@ -85,7 +85,9 @@ def test_sign_in_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli._build_login(console) is None
 
 
-def test_env_account_replaces_the_stored_one(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_credential_env_vars_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The old env-account path is gone: even with both vars set, sign-in uses
+    # the stored default and those values have no effect.
     monkeypatch.delenv("STRIX_VIEWER_LOGIN", raising=False)
     monkeypatch.setenv("STRIX_VIEWER_USERNAME", "bob")
     monkeypatch.setenv("STRIX_VIEWER_PASSWORD_HASH", hash_password(PASSWORD, iterations=1000))
@@ -94,47 +96,22 @@ def test_env_account_replaces_the_stored_one(monkeypatch: pytest.MonkeyPatch) ->
     login = cli._build_login(console)
 
     assert login is not None
-    assert login.username == "bob"
-    assert login.attempt("bob", PASSWORD).ok is True
-    # The stored default account is gone, and an env account never owes a change.
-    assert login.attempt(DEFAULT_USERNAME, DEFAULT_SEED_PASSWORD).ok is False
-    assert login.must_change_password is False
+    assert login.username == DEFAULT_USERNAME
+    assert login.attempt("bob", PASSWORD).ok is False
+    assert login.attempt(DEFAULT_USERNAME, DEFAULT_SEED_PASSWORD).ok is True
 
 
-@pytest.mark.parametrize(
-    "env",
-    [
-        {"STRIX_VIEWER_PASSWORD_HASH": "not-a-hash-at-all"},
-        {"STRIX_VIEWER_USERNAME": "bob"},  # a name with no hash
-    ],
-)
-def test_a_bad_configuration_stops_the_viewer_with_exit_code_1(
-    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
-) -> None:
+def test_a_bad_env_hash_no_longer_stops_the_viewer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A junk STRIX_VIEWER_PASSWORD_HASH used to abort startup; now it is simply
+    # ignored and the stored account is used.
     monkeypatch.delenv("STRIX_VIEWER_LOGIN", raising=False)
-    monkeypatch.delenv("STRIX_VIEWER_USERNAME", raising=False)
-    monkeypatch.delenv("STRIX_VIEWER_PASSWORD_HASH", raising=False)
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    console, buffer = _console()
+    monkeypatch.setenv("STRIX_VIEWER_PASSWORD_HASH", "not-a-hash-at-all")
+    console, _ = _console()
 
-    with pytest.raises(SystemExit) as exc:
-        cli._build_login(console)
+    login = cli._build_login(console)
 
-    assert exc.value.code == 1
-    assert "Cannot start the viewer" in buffer.getvalue()
-
-
-def test_the_error_does_not_echo_the_bad_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("STRIX_VIEWER_LOGIN", raising=False)
-    monkeypatch.setenv("STRIX_VIEWER_PASSWORD_HASH", "oops-this-might-be-a-real-password")
-    console, buffer = _console()
-    with pytest.raises(SystemExit):
-        cli._build_login(console)
-    assert "oops-this-might-be-a-real-password" not in buffer.getvalue()
-
-
-def test_the_console_note_names_the_user_but_never_a_secret() -> None:
+    assert login is not None
+    assert login.username == DEFAULT_USERNAME
     console, buffer = _console()
     login = LoginManager(
         cli.LoginConfig(username="carol", password_hash=hash_password(PASSWORD, iterations=1000))

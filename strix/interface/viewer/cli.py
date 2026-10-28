@@ -29,7 +29,6 @@ from strix.interface.viewer.llm_connection_test import ConnectionTester
 from strix.interface.viewer.llm_profiles import ProfileStore
 from strix.interface.viewer.llm_settings import SettingsStore
 from strix.interface.viewer.login import (
-    USE_STORE,
     LoginConfig,
     LoginManager,
     env_login_config,
@@ -75,44 +74,32 @@ def run_view(argv: list[str]) -> None:
         _serve_run(args, run_dir, console, login)
 
 
-def _build_login(console: Console) -> LoginManager | None:
+def _build_login(console: Console) -> LoginManager | None:  # noqa: ARG001 - kept for call-site symmetry
     """The sign-in manager, or None when login is switched off.
 
-    Resolution: ``STRIX_VIEWER_LOGIN=off`` disables sign-in; an env-configured
-    username+hash is used as-is; otherwise the persisted credential store is
-    used, seeded with the default ``admin`` / ``admin`` (change forced) on first
-    run. A malformed env hash, or only one of the two env vars, stops the viewer
-    with a clear message that never contains a credential. When the store backs
-    the account, a successful password change is written back to disk.
+    Resolution: ``STRIX_VIEWER_LOGIN=off`` disables sign-in; otherwise the
+    persisted credential store is used, seeded with the default ``admin`` /
+    ``admin`` (change forced) on first run. A successful password change is
+    written back to the store.
     """
-    try:
-        resolved = env_login_config(os.environ)
-    except ValueError as exc:
-        console.print(f"[bold red]Cannot start the viewer:[/] {escape(str(exc))}")
-        raise SystemExit(1) from exc
-
+    resolved = env_login_config(os.environ)
     if resolved is None:
         return None
 
-    if resolved is USE_STORE:
-        account = credentials_store.load_or_seed()
-        config = LoginConfig(
-            username=account.username,
-            password_hash=account.password_hash,
-            must_change=account.must_change,
-        )
+    account = credentials_store.load_or_seed()
+    config = LoginConfig(
+        username=account.username,
+        password_hash=account.password_hash,
+        must_change=account.must_change,
+    )
 
-        def _persist(new_password: str) -> None:
-            # Re-read so a hand-edit between startup and the change is respected,
-            # then store the new hash and clear the forced-change flag.
-            current = credentials_store.read() or account
-            credentials_store.set_password(current, new_password)
+    def _persist(new_password: str) -> None:
+        # Re-read so a change between startup and now is respected, then store
+        # the new hash and clear the forced-change flag.
+        current = credentials_store.read() or account
+        credentials_store.set_password(current, new_password)
 
-        return LoginManager(config, on_password_changed=_persist)
-
-    # An explicit env account: used as-is, never asked to change, not persisted.
-    assert isinstance(resolved, LoginConfig)
-    return LoginManager(resolved)
+    return LoginManager(config, on_password_changed=_persist)
 
 
 def _print_login_note(console: Console, login: LoginManager | None) -> None:
@@ -130,11 +117,8 @@ def _print_login_note(console: Console, login: LoginManager | None) -> None:
             "[bold]admin[/] [dim]— you will be asked to set a new one before the app opens.[/]"
         )
     console.print(
-        "[dim]Set STRIX_VIEWER_USERNAME and STRIX_VIEWER_PASSWORD_HASH to use your own account[/]"
-    )
-    console.print(
-        "[dim]create a hash with[/] python -m strix.interface.viewer.login"
-        "  [dim]or turn sign-in off with STRIX_VIEWER_LOGIN=off.[/]"
+        "[dim]Change the password from the sign-in screen; it is stored on this machine.[/]"
+        "  [dim]Turn sign-in off with STRIX_VIEWER_LOGIN=off.[/]"
     )
 
 

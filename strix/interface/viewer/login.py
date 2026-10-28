@@ -24,13 +24,12 @@ Design points:
 
 Configuration (environment, read when the viewer starts):
 
-* ``STRIX_VIEWER_LOGIN=off``           turn login off entirely (no sign-in at all).
-* ``STRIX_VIEWER_USERNAME``            the username.
-* ``STRIX_VIEWER_PASSWORD_HASH``       the hash, from ``python -m strix.interface.viewer.login``.
+* ``STRIX_VIEWER_LOGIN=off``           turn sign-in off entirely (no login at all).
 
-With both set, that account is used and no password change is ever forced. With
-neither set, the persisted account is used: on first run that is ``admin`` /
-``admin`` with a forced change at first sign-in.
+That is the only environment switch. The account itself (username, password hash,
+first-login flag) lives in the persisted credential store, not the environment;
+on first run it is ``admin`` / ``admin`` with a forced change at first sign-in.
+Change the password from the viewer's sign-in screen.
 """
 
 from __future__ import annotations
@@ -157,47 +156,26 @@ class LoginConfig:
         )
 
 
-#: Sentinel returned by :meth:`EnvLogin.resolve` meaning "no env account was set;
-#: fall back to the persisted credential store".
+#: Sentinel returned by :func:`env_login_config` meaning "sign-in is on; use the
+#: persisted credential store for the account" (the only non-off outcome now).
 USE_STORE = object()
 
 
-def env_login_config(environ: Mapping[str, str]) -> LoginConfig | object | None:
-    """Resolve the login account from the environment.
+def env_login_config(environ: Mapping[str, str]) -> object | None:
+    """Resolve how sign-in is configured from the environment.
 
     Returns:
-      * ``None`` when ``STRIX_VIEWER_LOGIN=off`` — sign-in is disabled entirely.
-      * a :class:`LoginConfig` when BOTH username and password hash are set.
-      * :data:`USE_STORE` when neither is set — the caller should load the
-        persisted credential store (default ``admin`` / ``admin`` on first run).
+      * ``None`` when ``STRIX_VIEWER_LOGIN=off`` -- sign-in is disabled entirely.
+      * :data:`USE_STORE` otherwise -- the account comes from the persisted
+        credential store (default ``admin`` / ``admin`` on first run).
 
-    An invalid hash, or a username without a hash, raises ``ValueError`` rather
-    than silently falling back: a typo must not quietly leave the viewer
-    protected by a different account than the operator intended.
+    Credentials are no longer taken from the environment: there is no
+    ``STRIX_VIEWER_USERNAME`` / ``STRIX_VIEWER_PASSWORD_HASH`` path.
+    ``STRIX_VIEWER_LOGIN`` is the only switch, and it only turns sign-in off.
     """
     if environ.get("STRIX_VIEWER_LOGIN", "").strip().lower() in {"off", "0", "false", "no"}:
         return None
-    username = environ.get("STRIX_VIEWER_USERNAME", "").strip()
-    password_hash = environ.get("STRIX_VIEWER_PASSWORD_HASH", "").strip()
-    if not username and not password_hash:
-        return USE_STORE
-    if password_hash and parse_hash(password_hash) is None:
-        raise ValueError(
-            "STRIX_VIEWER_PASSWORD_HASH is not a valid hash; generate one with "
-            "'python -m strix.interface.viewer.login'"
-        )
-    if not password_hash:
-        raise ValueError(
-            "STRIX_VIEWER_USERNAME is set without STRIX_VIEWER_PASSWORD_HASH; "
-            "set both, or neither to use the stored account"
-        )
-    if not username:
-        raise ValueError(
-            "STRIX_VIEWER_PASSWORD_HASH is set without STRIX_VIEWER_USERNAME; "
-            "set both, or neither to use the stored account"
-        )
-    # An env-configured account is trusted as-is; no forced change.
-    return LoginConfig(username=username, password_hash=password_hash, must_change=False)
+    return USE_STORE
 
 
 # --- sessions and rate limiting ------------------------------------------------------
@@ -383,18 +361,32 @@ class LoginManager:
 
 
 def _main() -> int:  # pragma: no cover - interactive helper
-    """``python -m strix.interface.viewer.login``: print a hash for STRIX_VIEWER_PASSWORD_HASH."""
+    """``python -m strix.interface.viewer.login``: set the viewer password.
+
+    A convenience for resetting the account from the terminal (e.g. a forgotten
+    password) without the browser. It writes the new hash straight into the
+    persisted credential store and clears the forced-change flag.
+    """
+    # Local import: credentials_store imports from this module at load time, so
+    # a top-level import here would be circular.
+    from strix.interface.viewer import credentials_store  # noqa: PLC0415
+
     password = getpass.getpass("New viewer password: ")
-    if len(password) < 8:
-        sys.stderr.write("Use at least 8 characters.\n")
+    if len(password) < credentials_store.MIN_PASSWORD_CHARS:
+        sys.stderr.write(f"Use at least {credentials_store.MIN_PASSWORD_CHARS} characters.\n")
         return 1
     if getpass.getpass("Repeat it: ") != password:
         sys.stderr.write("The passwords do not match.\n")
         return 1
+    error = credentials_store.validate_new_password(password)
+    if error is not None:
+        sys.stderr.write("That password cannot be used; choose another.\n")
+        return 1
+    account = credentials_store.load_or_seed()
+    credentials_store.set_password(account, password)
     sys.stdout.write(
-        "\nSet these before starting the viewer:\n\n"
-        "  STRIX_VIEWER_USERNAME=<your username>\n"
-        f"  STRIX_VIEWER_PASSWORD_HASH={hash_password(password)}\n"
+        f"\nPassword updated for user '{account.username}'. "
+        "Start the viewer and sign in with it.\n"
     )
     return 0
 

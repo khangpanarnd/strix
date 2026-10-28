@@ -1,36 +1,34 @@
-"""Persisted viewer account: username, password hash, and a first-login flag.
+"""Persisted viewer account, stored in SQLite.
 
-The viewer no longer uses a URL token as a first factor. The username/password
-is the ONLY gate, so the credential has to live somewhere durable rather than in
-an environment variable the operator must set every time. This module owns that
-file.
+The viewer's sign-in account (username, password hash, first-login flag) lives in
+a small SQLite database at ``~/.strix/viewer-users.db`` (file mode 0600). SQLite
+is used rather than a flat file so the store can grow into real user management
+later without changing its home or callers; today it holds exactly one account.
 
-State lives in ``~/.strix/viewer-credentials.json`` (0600), holding::
-
-    {"username": "...", "password_hash": "pbkdf2_sha256$...", "must_change": true}
-
-On first run the file does not exist, so :func:`load_or_seed` creates it with the
-default account ``admin`` / ``admin`` and ``must_change=true``. The default
+On first run the ``users`` table is empty, so :func:`load_or_seed` inserts the
+default account ``admin`` / ``admin`` with ``must_change=1``. The default
 password is intentionally well known so a fresh install can be opened; the
 ``must_change`` flag forces the operator to replace it at first sign-in, and no
 data endpoint unlocks until they do.
 
-Environment overrides still win over this file (see ``login.LoginConfig``): an
-operator who sets ``STRIX_VIEWER_USERNAME`` + ``STRIX_VIEWER_PASSWORD_HASH`` is
-trusted and never asked to change anything.
+There are no credential environment variables any more: the account is defined
+entirely by this database. ``STRIX_VIEWER_LOGIN=off`` (handled in ``login.py``)
+still disables sign-in altogether.
 
-The password itself is never written here, only a salted PBKDF2-SHA256 hash.
+Only a salted PBKDF2-SHA256 hash is stored, never a password.
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
+import sqlite3
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from strix.utils.secret_files import write_secret_text
+from strix.utils.secret_files import SECRET_FILE_MODE
 
 from .login import (
     DEFAULT_SEED_PASSWORD,
@@ -41,15 +39,33 @@ from .login import (
 )
 
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
 logger = logging.getLogger(__name__)
 
-#: Where the account is stored. Sibling of the other ``~/.strix`` state files.
-CREDENTIALS_PATH = Path.home() / ".strix" / "viewer-credentials.json"
+#: Where the account database lives. Sibling of the other ``~/.strix`` state.
+CREDENTIALS_PATH = Path.home() / ".strix" / "viewer-users.db"
+
+#: Shortest password the operator may set when replacing the default.
+MIN_PASSWORD_CHARS = 8
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    must_change   INTEGER NOT NULL DEFAULT 0,
+    role          TEXT NOT NULL DEFAULT 'admin',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+)
+"""
 
 
 @dataclass(frozen=True)
 class StoredAccount:
-    """The account persisted on disk. Holds a hash, never a password."""
+    """The account persisted in the database. Holds a hash, never a password."""
 
     username: str
     password_hash: str
@@ -63,47 +79,77 @@ class StoredAccount:
         )
 
 
-def _parse(data: object) -> StoredAccount | None:
-    """Validate a decoded JSON object into a :class:`StoredAccount`, or None."""
-    if not isinstance(data, dict):
-        return None
-    username = data.get("username")
-    password_hash = data.get("password_hash")
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+@contextlib.contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Open the users DB, creating the parent dir and schema, with 0600 perms.
+
+    The file is created with owner-only permissions the first time it appears,
+    matching the old flat-file behaviour; SQLite's later writes keep the mode.
+    """
+    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    newly_created = not CREDENTIALS_PATH.exists()
+    conn = sqlite3.connect(str(CREDENTIALS_PATH))
+    try:
+        if newly_created:
+            with contextlib.suppress(OSError):
+                CREDENTIALS_PATH.chmod(SECRET_FILE_MODE)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(_SCHEMA)
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _row_to_account(row: tuple[str, str, int]) -> StoredAccount | None:
+    username, password_hash, must_change = row
     if not isinstance(username, str) or not username:
         return None
     if not isinstance(password_hash, str) or parse_hash(password_hash) is None:
         return None
-    # A missing/invalid flag is read as "no change required": only an explicit
-    # ``true`` keeps forcing the prompt, so a hand-edited file never locks out.
-    must_change = data.get("must_change") is True
     return StoredAccount(
-        username=username, password_hash=password_hash, must_change=must_change
+        username=username, password_hash=password_hash, must_change=bool(must_change)
     )
 
 
 def read() -> StoredAccount | None:
-    """Return the stored account, or None when the file is absent or unreadable."""
+    """Return the single stored account, or None when the table is empty/invalid.
+
+    "The account" is the first row by creation time; the schema holds one today.
+    A structurally invalid row (blank name, unparseable hash) reads as None, the
+    same fail-safe the flat file had.
+    """
     try:
-        raw = CREDENTIALS_PATH.read_text(encoding="utf-8")
-    except OSError:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT username, password_hash, must_change "
+                "FROM users ORDER BY created_at, username LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        logger.warning("could not read the viewer users database", exc_info=True)
         return None
-    try:
-        return _parse(json.loads(raw))
-    except json.JSONDecodeError:
-        logger.warning("viewer credentials file is not valid JSON; ignoring it")
-        return None
+    return _row_to_account(row) if row else None
 
 
 def write(account: StoredAccount) -> None:
-    """Atomically persist the account with 0600 permissions."""
-    payload = json.dumps(
-        {
-            "username": account.username,
-            "password_hash": account.password_hash,
-            "must_change": account.must_change,
-        }
-    )
-    write_secret_text(CREDENTIALS_PATH, payload)
+    """Persist ``account`` as the single stored user (upsert by username)."""
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (username, password_hash, must_change, role, created_at, updated_at)
+            VALUES (?, ?, ?, 'admin', ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                must_change   = excluded.must_change,
+                updated_at    = excluded.updated_at
+            """,
+            (account.username, account.password_hash, int(account.must_change), now, now),
+        )
 
 
 def seed_default() -> StoredAccount:
@@ -118,10 +164,10 @@ def seed_default() -> StoredAccount:
 def load_or_seed() -> StoredAccount:
     """Return the stored account, creating the default one on first run.
 
-    A readable existing file is returned as-is. When the file is missing or
-    corrupt it is (re)written with the default ``admin`` / ``admin`` account and
-    ``must_change=true`` so a fresh install can be opened and is then forced to
-    pick a real password.
+    A readable existing account is returned as-is. When the table is empty (or
+    the file cannot be read) it is seeded with the default ``admin`` / ``admin``
+    account and ``must_change=true`` so a fresh install can be opened and is then
+    forced to pick a real password.
     """
     existing = read()
     if existing is not None:
@@ -137,15 +183,9 @@ def set_password(account: StoredAccount, new_password: str) -> StoredAccount:
     Also persists it. The caller is expected to have already verified the current
     password and validated the new one (see :func:`validate_new_password`).
     """
-    updated = replace(
-        account, password_hash=hash_password(new_password), must_change=False
-    )
+    updated = replace(account, password_hash=hash_password(new_password), must_change=False)
     write(updated)
     return updated
-
-
-#: Shortest password the operator may set when replacing the default.
-MIN_PASSWORD_CHARS = 8
 
 
 def validate_new_password(new_password: object) -> str | None:
@@ -168,14 +208,14 @@ def _try_write(account: StoredAccount) -> None:
     account still works for this run; only the forced change cannot be
     remembered across restarts.
     """
-    with contextlib.suppress(OSError):
+    try:
         write(account)
-        return
-    logger.warning(
-        "could not write %s; the default account works for this run but a "
-        "password change will not persist",
-        CREDENTIALS_PATH,
-    )
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "could not write %s; the default account works for this run but a "
+            "password change will not persist",
+            CREDENTIALS_PATH,
+        )
 
 
 __all__ = [
