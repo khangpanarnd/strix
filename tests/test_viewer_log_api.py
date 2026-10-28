@@ -1,7 +1,7 @@
 """HTTP tests for ``GET /api/log`` (the viewer's streamed server log).
 
 A real ``ThreadingHTTPServer`` over a temp runs directory, like the other viewer
-API tests. The important ones: the route is session-gated, ``?run=`` cannot
+API tests. The important ones: the route is login-gated, ``?run=`` cannot
 escape the runs directory, the cursor works over HTTP, and a saved LLM key is
 masked even though it is in neither the viewer's nor the scan child's environment.
 """
@@ -15,12 +15,29 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from strix.interface.viewer import credentials_store
 from strix.interface.viewer.llm_settings import SettingsStore
+from strix.interface.viewer.login import LoginConfig, LoginManager, hash_password
 from strix.interface.viewer.server import serve
 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+_TEST_USER = "alice"
+_TEST_PW = "pw-correct-horse"
+
+
+@pytest.fixture(autouse=True)
+def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        credentials_store, "CREDENTIALS_PATH", tmp_path / ".strix" / "viewer-credentials.json"
+    )
+
+
+def _login_manager() -> LoginManager:
+    return LoginManager(LoginConfig(_TEST_USER, hash_password(_TEST_PW, iterations=1000)))
 
 
 SAVED_KEY = (
@@ -48,9 +65,18 @@ def _make_run(runs: Path, name: str, log: str | None) -> Path:
     return run
 
 
-def _cookie(url: str, token: str) -> str:
-    with urllib.request.urlopen(f"{url}/?token={token}") as resp:  # noqa: S310  # nosec B310
-        return str(resp.headers.get("Set-Cookie", "")).split(";", 1)[0]
+def _cookie(url: str) -> str:
+    body = json.dumps({"username": _TEST_USER, "password": _TEST_PW}).encode()
+    req = urllib.request.Request(  # noqa: S310
+        url + "/api/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
+        assert resp.status == 200
+        raw = str(resp.headers.get("Set-Cookie", ""))
+    return raw.split(";", 1)[0]
 
 
 def _get(url: str, path: str, cookie: str | None = None) -> tuple[int, Any]:
@@ -72,16 +98,18 @@ def served(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-
     config = tmp_path / "cli-config.json"
     config.write_text(json.dumps({"env": {"LLM_API_KEY": SAVED_KEY, "STRIX_LLM": "x/y"}}), "utf-8")
     store = SettingsStore(path=config, environ={})
-    httpd, url, token = serve(None, open_browser=False, runs_dir=runs, settings_store=store)
+    httpd, url, _empty = serve(
+        None, open_browser=False, runs_dir=runs, settings_store=store, login=_login_manager()
+    )
     try:
-        yield runs, url, token
+        yield runs, url
     finally:
         httpd.shutdown()
         httpd.server_close()
 
 
-def test_requires_the_session_cookie(served: Any) -> None:
-    runs, url, _token = served
+def test_requires_a_login_cookie(served: Any) -> None:
+    runs, url = served
     _make_run(runs, "web-1", _line("hello"))
     status, body = _get(url, "/api/log")
     assert status == 403
@@ -89,18 +117,18 @@ def test_requires_the_session_cookie(served: Any) -> None:
 
 
 def test_no_run_is_404(served: Any) -> None:
-    _runs, url, token = served
-    status, body = _get(url, "/api/log", _cookie(url, token))
+    _runs, url = served
+    status, body = _get(url, "/api/log", _cookie(url))
     assert status == 404
     assert body["error"] == "no_run"
 
 
 def test_returns_the_latest_runs_log_with_a_cursor(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     log = _line("starting") + _line("scanning", "WARNING")
     run = _make_run(runs, "web-1", log)
 
-    status, body = _get(url, "/api/log", _cookie(url, token))
+    status, body = _get(url, "/api/log", _cookie(url))
 
     assert status == 200
     assert body["exists"] is True
@@ -112,9 +140,9 @@ def test_returns_the_latest_runs_log_with_a_cursor(served: Any) -> None:
 
 
 def test_after_returns_only_new_lines(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     run = _make_run(runs, "web-1", _line("one"))
-    cookie = _cookie(url, token)
+    cookie = _cookie(url)
     first = _get(url, "/api/log", cookie)[1]
 
     with (run / "strix.log").open("a", encoding="utf-8") as handle:
@@ -126,10 +154,10 @@ def test_after_returns_only_new_lines(served: Any) -> None:
 
 
 def test_run_parameter_selects_a_specific_run(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     _make_run(runs, "web-a", _line("from-a"))
     _make_run(runs, "web-b", _line("from-b"))
-    cookie = _cookie(url, token)
+    cookie = _cookie(url)
 
     body = _get(url, "/api/log?run=web-a", cookie)[1]
 
@@ -138,23 +166,23 @@ def test_run_parameter_selects_a_specific_run(served: Any) -> None:
 
 @pytest.mark.parametrize("run", ["../outside", "..", "web-1/..", "%2e%2e%2fetc", "/etc", "nope"])
 def test_run_parameter_cannot_escape_the_runs_directory(served: Any, run: str) -> None:
-    runs, url, token = served
+    runs, url = served
     _make_run(runs, "web-1", _line("inside"))
     outside = runs.parent / "outside"
     outside.mkdir(exist_ok=True)
     (outside / "run.json").write_text("{}", "utf-8")
     (outside / "strix.log").write_text(_line("OUTSIDE-SECRET"), "utf-8")
 
-    status, body = _get(url, f"/api/log?run={run}", _cookie(url, token))
+    status, body = _get(url, f"/api/log?run={run}", _cookie(url))
 
     assert status == 404
     assert "OUTSIDE-SECRET" not in json.dumps(body)
 
 
 def test_a_run_without_a_log_yet_reports_not_exists(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     _make_run(runs, "web-1", None)
-    status, body = _get(url, "/api/log", _cookie(url, token))
+    status, body = _get(url, "/api/log", _cookie(url))
     assert status == 200
     assert body["exists"] is False
     assert body["entries"] == []
@@ -162,15 +190,15 @@ def test_a_run_without_a_log_yet_reports_not_exists(served: Any) -> None:
 
 @pytest.mark.parametrize("after", ["-1", "abc", "1.5", "0x10"])
 def test_invalid_cursor_is_400(served: Any, after: str) -> None:
-    runs, url, token = served
+    runs, url = served
     _make_run(runs, "web-1", _line("x"))
-    status, body = _get(url, f"/api/log?after={after}", _cookie(url, token))
+    status, body = _get(url, f"/api/log?after={after}", _cookie(url))
     assert status == 400
     assert body["error"] == "invalid_cursor"
 
 
 def test_a_saved_llm_key_is_masked_in_the_stream(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     _make_run(
         runs,
         "web-1",
@@ -178,7 +206,7 @@ def test_a_saved_llm_key_is_masked_in_the_stream(served: Any) -> None:
         + f"  repr(headers)={{'Authorization': 'Bearer {SAVED_KEY}'}}\n",
     )
 
-    status, body = _get(url, "/api/log", _cookie(url, token))
+    status, body = _get(url, "/api/log", _cookie(url))
 
     assert status == 200
     dumped = json.dumps(body)
@@ -187,9 +215,9 @@ def test_a_saved_llm_key_is_masked_in_the_stream(served: Any) -> None:
 
 
 def test_a_saved_key_is_masked_across_a_cursor_boundary(served: Any) -> None:
-    runs, url, token = served
+    runs, url = served
     run = _make_run(runs, "web-1", _line("first"))
-    cookie = _cookie(url, token)
+    cookie = _cookie(url)
     offset = _get(url, "/api/log", cookie)[1]["offset"]
     with (run / "strix.log").open("a", encoding="utf-8") as handle:
         handle.write(_line(f"leaked {SAVED_KEY}"))

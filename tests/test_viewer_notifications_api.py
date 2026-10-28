@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from strix.interface.viewer import credentials_store
+from strix.interface.viewer.login import LoginConfig, LoginManager, hash_password
 from strix.interface.viewer.notification_store import NotificationStore
 from strix.interface.viewer.notifications import NotificationService, ScanNotice, SendResult
 from strix.interface.viewer.server import serve
@@ -30,6 +32,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from strix.interface.viewer.notification_store import ChannelConfig
+
+
+_TEST_USER = "alice"
+_TEST_PW = "pw-correct-horse"
 
 
 # Recognisable fake secrets. Not real credentials.
@@ -53,6 +59,17 @@ def _ok_resolver(_host: str, _timeout: float) -> list[str]:
     return ["93.184.216.34"]
 
 
+@pytest.fixture(autouse=True)
+def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        credentials_store, "CREDENTIALS_PATH", tmp_path / ".strix" / "viewer-credentials.json"
+    )
+
+
+def _login_manager() -> LoginManager:
+    return LoginManager(LoginConfig(_TEST_USER, hash_password(_TEST_PW, iterations=1000)))
+
+
 def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assets = tmp_path / "bundle"
     assets.mkdir(exist_ok=True)
@@ -60,8 +77,19 @@ def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
 
-def _session_cookie(url: str, token: str) -> str:
-    with urllib.request.urlopen(f"{url}/?token={token}") as resp:  # noqa: S310  # nosec B310
+def _login_cookie(url: str, origin: str | None = None) -> str:
+    body = json.dumps({"username": _TEST_USER, "password": _TEST_PW}).encode()
+    headers = {"Content-Type": "application/json"}
+    if origin is not None:
+        headers["Origin"] = origin
+    req = urllib.request.Request(  # noqa: S310
+        url + "/api/login",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
+        assert resp.status == 200
         raw = str(resp.headers.get("Set-Cookie", ""))
     return raw.split(";", 1)[0]
 
@@ -96,7 +124,7 @@ def _serve(
     *,
     host: str = "127.0.0.1",
     with_notifier: bool = True,
-) -> tuple[Any, str, str, NotificationService | None, RecordingSender]:
+) -> tuple[Any, str, NotificationService | None, RecordingSender]:
     _bundle(tmp_path, monkeypatch)
     runs_dir = tmp_path / "strix_runs"
     runs_dir.mkdir(exist_ok=True)
@@ -109,10 +137,15 @@ def _serve(
         if with_notifier
         else None
     )
-    httpd, url, token = serve(
-        None, host=host, open_browser=False, runs_dir=runs_dir, notifier=notifier
+    httpd, url, _empty = serve(
+        None,
+        host=host,
+        open_browser=False,
+        runs_dir=runs_dir,
+        notifier=notifier,
+        login=_login_manager(),
     )
-    return httpd, url, token, notifier, sender
+    return httpd, url, notifier, sender
 
 
 def _close(httpd: Any) -> None:
@@ -126,7 +159,7 @@ def _close(httpd: Any) -> None:
 def test_every_route_requires_the_session_cookie(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, _t, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
         for method, path, body in (
             ("GET", "/api/notifications", None),
@@ -143,9 +176,9 @@ def test_every_route_requires_the_session_cookie(
 def test_routes_answer_unavailable_when_no_notifier_is_wired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch, with_notifier=False)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch, with_notifier=False)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         for method, path, body in (
             ("GET", "/api/notifications", None),
             ("PUT", "/api/notifications", {"enabled": True}),
@@ -163,7 +196,7 @@ def test_routes_answer_unavailable_when_no_notifier_is_wired(
 def test_capabilities_advertise_notifications(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, _t, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
         status, payload = _request(url, "/api/capabilities")
         assert status == 200
@@ -175,10 +208,11 @@ def test_capabilities_advertise_notifications(
 def test_non_loopback_bind_is_read_only_but_get_works(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, _url, token, _n, _s = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
+    httpd, _url, _n, _s = _serve(tmp_path, monkeypatch, host="0.0.0.0")  # nosec B104
     try:
-        loopback = f"http://127.0.0.1:{httpd.server_address[1]}"
-        cookie = _session_cookie(loopback, token)
+        port = httpd.server_address[1]
+        loopback = f"http://127.0.0.1:{port}"
+        cookie = _login_cookie(loopback, origin=f"http://0.0.0.0:{port}")
 
         status, payload = _request(loopback, "/api/notifications", cookie=cookie)
         assert status == 200
@@ -199,9 +233,9 @@ def test_non_loopback_bind_is_read_only_but_get_works(
 
 
 def test_foreign_origin_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         for method, path, body in (
             ("PUT", "/api/notifications", {"enabled": True}),
             ("POST", "/api/notifications/test", {"channel": "slack", "webhook_url": SLACK_URL}),
@@ -222,9 +256,9 @@ def test_foreign_origin_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_wrong_content_type_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         req = urllib.request.Request(  # noqa: S310
             url + "/api/notifications",
             data=b'{"enabled": true}',
@@ -243,9 +277,9 @@ def test_wrong_content_type_is_rejected(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         parsed = urlsplit(url)
         conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port or 80)
         conn.putrequest("PUT", "/api/notifications")
@@ -264,9 +298,9 @@ def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_get_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
-        status, payload = _request(url, "/api/notifications", cookie=_session_cookie(url, token))
+        status, payload = _request(url, "/api/notifications", cookie=_login_cookie(url))
         view = json.loads(payload)
         assert status == 200
         assert view["enabled"] is False
@@ -278,9 +312,9 @@ def test_get_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_save_then_get_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, notifier, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, notifier, _s = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, payload = _request(
             url,
             "/api/notifications",
@@ -323,10 +357,10 @@ def test_save_then_get_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 def test_secrets_never_appear_in_any_response_or_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     bodies: list[bytes] = []
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         with caplog.at_level(logging.DEBUG):
             for method, path, body in (
                 (
@@ -391,10 +425,10 @@ def test_secrets_never_appear_in_any_response_or_log(
 def test_validation_errors_map_to_400_with_a_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], code: str
 ) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
         status, payload = _request(
-            url, "/api/notifications", method="PUT", body=body, cookie=_session_cookie(url, token)
+            url, "/api/notifications", method="PUT", body=body, cookie=_login_cookie(url)
         )
         assert status == 400
         assert json.loads(payload)["error"] == code
@@ -404,9 +438,9 @@ def test_validation_errors_map_to_400_with_a_code(
 
 
 def test_non_object_body_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         req = urllib.request.Request(  # noqa: S310
             url + "/api/notifications",
             data=b"[1, 2, 3]",
@@ -427,7 +461,7 @@ def test_non_object_body_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 def test_unreadable_config_file_is_409_and_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
         (tmp_path / "notifications.json").write_text("{nope", encoding="utf-8")
         status, payload = _request(
@@ -435,7 +469,7 @@ def test_unreadable_config_file_is_409_and_untouched(
             "/api/notifications",
             method="PUT",
             body={"enabled": True},
-            cookie=_session_cookie(url, token),
+            cookie=_login_cookie(url),
         )
         assert status == 409
         assert json.loads(payload)["error"] == "config_unreadable"
@@ -448,9 +482,9 @@ def test_unreadable_config_file_is_409_and_untouched(
 
 
 def test_test_send_uses_the_saved_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         _request(
             url,
             "/api/notifications",
@@ -475,13 +509,13 @@ def test_test_send_uses_the_saved_channel(tmp_path: Path, monkeypatch: pytest.Mo
 def test_test_send_can_use_typed_values_without_saving(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
         status, _payload = _request(
             url,
             "/api/notifications/test",
             method="POST",
-            cookie=_session_cookie(url, token),
+            cookie=_login_cookie(url),
             body={"channel": "telegram", "bot_token": BOT_TOKEN, "chat_id": CHAT_ID},
         )
         assert status == 200
@@ -494,7 +528,7 @@ def test_test_send_can_use_typed_values_without_saving(
 def test_a_failed_delivery_is_http_200_with_ok_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
         sender.result = SendResult(
             ok=False, message="Slack rejected the message (HTTP 404).", status=404
@@ -503,7 +537,7 @@ def test_a_failed_delivery_is_http_200_with_ok_false(
             url,
             "/api/notifications/test",
             method="POST",
-            cookie=_session_cookie(url, token),
+            cookie=_login_cookie(url),
             body={"channel": "slack", "webhook_url": SLACK_URL},
         )
         assert status == 200
@@ -531,13 +565,13 @@ def test_a_failed_delivery_is_http_200_with_ok_false(
 def test_test_send_rejects_bad_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], code: str
 ) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
         status, payload = _request(
             url,
             "/api/notifications/test",
             method="POST",
-            cookie=_session_cookie(url, token),
+            cookie=_login_cookie(url),
             body=body,
         )
         assert status == 400
@@ -548,9 +582,9 @@ def test_test_send_rejects_bad_requests(
 
 
 def test_test_send_is_rate_limited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _n, sender = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, sender = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         body = {"channel": "slack", "webhook_url": SLACK_URL}
         statuses = [
             _request(url, "/api/notifications/test", method="POST", cookie=cookie, body=body)[0]
@@ -565,9 +599,9 @@ def test_test_send_is_rate_limited(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_changes_share_the_settings_change_rate_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _n, _s = _serve(tmp_path, monkeypatch)
+    httpd, url, _n, _s = _serve(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # Requests rejected as invalid still count against the window (it is
         # charged before the body is read), and they never touch the disk.
         statuses = [

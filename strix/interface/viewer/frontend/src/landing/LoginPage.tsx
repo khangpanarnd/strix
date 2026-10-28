@@ -12,18 +12,15 @@ import "./login.css";
  */
 
 interface LoginPageProps {
-  /** Signed in: continue to the app. */
-  onSignedIn: (username: string) => void;
+  /** Signed in: continue to the app, or to the change-password step. */
+  onSignedIn: (username: string, mustChangePassword: boolean) => void;
   /** Return to the landing page. */
   onBack: () => void;
   /** Shown above the form, e.g. "Your session expired." */
   notice?: string | null;
 }
 
-type Problem =
-  | { kind: "invalid" | "error"; message: string }
-  | { kind: "unauthorized-browser" }
-  | null;
+type Problem = { kind: "invalid" | "error"; message: string } | null;
 
 export function LoginPage({ onSignedIn, onBack, notice }: LoginPageProps) {
   const ids = {
@@ -75,7 +72,7 @@ export function LoginPage({ onSignedIn, onBack, notice }: LoginPageProps) {
 
     if (outcome.kind === "ok") {
       setPassword("");
-      onSignedIn(outcome.username);
+      onSignedIn(outcome.username, outcome.mustChangePassword);
       return;
     }
     // Never keep a rejected password around.
@@ -86,8 +83,6 @@ export function LoginPage({ onSignedIn, onBack, notice }: LoginPageProps) {
       setFocusPassword((n) => n + 1);
     } else if (outcome.kind === "locked") {
       setLockedFor(outcome.retryAfterSeconds);
-    } else if (outcome.kind === "unauthorized-browser") {
-      setProblem({ kind: "unauthorized-browser" });
     } else {
       setProblem({ kind: "error", message: outcome.message });
     }
@@ -137,23 +132,12 @@ export function LoginPage({ onSignedIn, onBack, notice }: LoginPageProps) {
             </p>
           )}
 
-          {problem?.kind === "unauthorized-browser" ? (
-            <div className="login-problem" role="alert" id={ids.problem} data-testid="login-unauthorized">
-              <strong>This browser has not been authorized.</strong>
-              <p>
-                Sign-in only works in the browser opened by the viewer. Go back to the terminal where
-                you started <code>strix view</code> and open the full link it printed (it ends in{" "}
-                <code>?token=…</code>), then try again.
-              </p>
-            </div>
-          ) : (
-            (problem || locked) && (
-              <p className="login-problem" role="alert" id={ids.problem} data-testid="login-error">
-                {locked
-                  ? `Too many failed attempts. Try again in ${lockedFor} second${lockedFor === 1 ? "" : "s"}.`
-                  : problem?.message}
-              </p>
-            )
+          {(problem || locked) && (
+            <p className="login-problem" role="alert" id={ids.problem} data-testid="login-error">
+              {locked
+                ? `Too many failed attempts. Try again in ${lockedFor} second${lockedFor === 1 ? "" : "s"}.`
+                : problem?.message}
+            </p>
           )}
 
           <form onSubmit={(e) => void submit(e)} noValidate data-testid="login-form">
