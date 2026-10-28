@@ -16,15 +16,21 @@ import urllib.request
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+import pytest
+
+from strix.interface.viewer import credentials_store
 from strix.interface.viewer.launch_errors import LaunchError
 from strix.interface.viewer.launch_request import LaunchLimits
+from strix.interface.viewer.login import LoginConfig, LoginManager, hash_password
 from strix.interface.viewer.server import serve
 
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
+
+_TEST_USER = "alice"
+_TEST_PW = "pw-correct-horse"
 
 
 class FakeLauncher:
@@ -74,9 +80,30 @@ def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
 
-def _session_cookie(url: str, token: str) -> str:
-    bootstrap = f"{url}/?token={token}"
-    with urllib.request.urlopen(bootstrap) as resp:  # noqa: S310  # nosec B310
+@pytest.fixture(autouse=True)
+def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        credentials_store, "CREDENTIALS_PATH", tmp_path / ".strix" / "viewer-credentials.json"
+    )
+
+
+def _login_manager() -> LoginManager:
+    return LoginManager(LoginConfig(_TEST_USER, hash_password(_TEST_PW, iterations=1000)))
+
+
+def _login_cookie(url: str, origin: str | None = None) -> str:
+    body = json.dumps({"username": _TEST_USER, "password": _TEST_PW}).encode()
+    headers = {"Content-Type": "application/json"}
+    if origin is not None:
+        headers["Origin"] = origin
+    req = urllib.request.Request(  # noqa: S310
+        url + "/api/login",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
+        assert resp.status == 200
         raw = str(resp.headers.get("Set-Cookie", ""))
     return raw.split(";", 1)[0]
 
@@ -107,19 +134,20 @@ def _request(
 
 def _serve_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, run_dir: Path | None = None
-) -> tuple[Any, str, str, FakeLauncher]:
+) -> tuple[Any, str, FakeLauncher]:
     _bundle(tmp_path, monkeypatch)
     launcher = FakeLauncher()
     runs_dir = tmp_path / "strix_runs"
     runs_dir.mkdir(exist_ok=True)
-    httpd, url, token = serve(
+    httpd, url, _empty = serve(
         run_dir,
         host="127.0.0.1",
         open_browser=False,
         runs_dir=runs_dir,
         launcher=launcher,  # type: ignore[arg-type]
+        login=_login_manager(),
     )
-    return httpd, url, token, launcher
+    return httpd, url, launcher
 
 
 _VALID_BODY = {"target": "https://example.com", "authorized": True}
@@ -131,7 +159,7 @@ _VALID_BODY = {"target": "https://example.com", "authorized": True}
 def test_every_new_endpoint_requires_cookie(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, _token, _launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _launcher = _serve_launch(tmp_path, monkeypatch)
     try:
         # No cookie -> 403 for all five new endpoints.
         checks: list[tuple[str, str, dict[str, object] | None]] = [
@@ -153,9 +181,9 @@ def test_every_new_endpoint_requires_cookie(
 
 
 def test_foreign_origin_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url,
             "/api/scans",
@@ -172,9 +200,9 @@ def test_foreign_origin_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_own_origin_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url,
             "/api/scans",
@@ -191,9 +219,9 @@ def test_own_origin_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_wrong_content_type_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         data = json.dumps(_VALID_BODY).encode()
         req = urllib.request.Request(  # noqa: S310
             url + "/api/scans",
@@ -214,9 +242,9 @@ def test_wrong_content_type_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # A chunked body carries no Content-Length -> 411.
         parsed = urlsplit(url)
         conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port or 80)
@@ -238,9 +266,9 @@ def test_missing_content_length_is_411(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 def test_oversized_body_is_413(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         big = {"target": "https://example.com", "authorized": True, "instruction": "x" * 20_000}
         status, _, body = _request(url, "/api/scans", method="POST", body=big, cookie=cookie)
         assert status == 413
@@ -254,9 +282,9 @@ def test_oversized_body_is_413(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_success_returns_202_with_run_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, launcher = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url, "/api/scans", method="POST", body=_VALID_BODY, cookie=cookie
         )
@@ -270,9 +298,9 @@ def test_success_returns_202_with_run_name(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_unknown_field_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         body = {"target": "https://example.com", "authorized": True, "bogus": 1}
         status, _, payload = _request(url, "/api/scans", method="POST", body=body, cookie=cookie)
         assert status == 400
@@ -283,10 +311,10 @@ def test_unknown_field_is_400(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_scan_active_409(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, launcher = _serve_launch(tmp_path, monkeypatch)
     launcher.next_error = LaunchError("scan_active", "busy", status=409, extra={"run": "web-live"})
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url, "/api/scans", method="POST", body=_VALID_BODY, cookie=cookie
         )
@@ -300,12 +328,12 @@ def test_scan_active_409(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_rate_limited_429_has_retry_after(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, launcher = _serve_launch(tmp_path, monkeypatch)
     launcher.next_error = LaunchError(
         "rate_limited", "slow down", status=429, extra={"retry_after": 60}
     )
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, headers, body = _request(
             url, "/api/scans", method="POST", body=_VALID_BODY, cookie=cookie
         )
@@ -321,10 +349,10 @@ def test_rate_limited_429_has_retry_after(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_stop_404_for_cli_run_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, launcher = _serve_launch(tmp_path, monkeypatch)
     launcher.stop_error = LaunchError("not_found", "no such live scan", status=404)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url, "/api/scans/stop", method="POST", body={"run": "cli-run"}, cookie=cookie
         )
@@ -336,9 +364,9 @@ def test_stop_404_for_cli_run_name(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 def test_stop_success_202(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, launcher = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, launcher = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url, "/api/scans/stop", method="POST", body={"run": "web-x"}, cookie=cookie
         )
@@ -354,9 +382,9 @@ def test_stop_success_202(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_status_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(url, "/api/scans/status?run=web-x", cookie=cookie)
         assert status == 200
         payload = json.loads(body)
@@ -373,9 +401,9 @@ def test_artifacts_allow_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     run_dir = _make_run(tmp_path, "web-done")
     (run_dir / "report.html").write_text("<html></html>", encoding="utf-8")
     (run_dir / "vulnerabilities.json").write_text("[]", encoding="utf-8")
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(url, "/api/run/artifacts?run=web-done", cookie=cookie)
         assert status == 200
         available = json.loads(body)["available"]
@@ -390,9 +418,9 @@ def test_artifact_download_streams_attachment(
 ) -> None:
     run_dir = _make_run(tmp_path, "web-done")
     (run_dir / "report.html").write_text("<html>hi</html>", encoding="utf-8")
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, headers, body = _request(
             url, "/api/run/artifact?run=web-done&name=report.html", cookie=cookie
         )
@@ -406,9 +434,9 @@ def test_artifact_download_streams_attachment(
 
 def test_artifact_unknown_key_is_404(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = _make_run(tmp_path, "web-done")
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(
             url, "/api/run/artifact?run=web-done&name=secret.key", cookie=cookie
         )
@@ -421,9 +449,9 @@ def test_artifact_unknown_key_is_404(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_artifact_traversal_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = _make_run(tmp_path, "web-done")
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch, run_dir=run_dir)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # A traversal run name, an absolute path, and a traversal artifact name
         # are all refused; client text never joins a path.
         for query in (
@@ -442,7 +470,7 @@ def test_artifact_traversal_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_capabilities_in_launch_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    httpd, url, _token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
         # Capabilities are unauthenticated as today.
         status, _, body = _request(url, "/api/capabilities")
@@ -464,7 +492,7 @@ def test_capabilities_not_in_launch_mode(tmp_path: Path, monkeypatch: pytest.Mon
     run_dir = _make_run(tmp_path, "fixed")
     _bundle(tmp_path, monkeypatch)
     # No launcher -> launch mode off.
-    httpd, url, _token = serve(run_dir, host="127.0.0.1", open_browser=False)
+    httpd, url, _empty = serve(run_dir, host="127.0.0.1", open_browser=False)
     try:
         status, _, body = _request(url, "/api/capabilities")
         assert status == 200
@@ -482,9 +510,11 @@ def test_launch_endpoints_403_when_not_launch_mode(
 ) -> None:
     run_dir = _make_run(tmp_path, "fixed")
     _bundle(tmp_path, monkeypatch)
-    httpd, url, token = serve(run_dir, host="127.0.0.1", open_browser=False)
+    httpd, url, _empty = serve(
+        run_dir, host="127.0.0.1", open_browser=False, login=_login_manager()
+    )
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # With the cookie present, the gate reaches the launch-mode check and
         # returns launch_unavailable (BR-5).
         status, _, body = _request(
@@ -507,9 +537,9 @@ def test_launch_endpoints_403_when_not_launch_mode(
 def test_run_data_404_no_run_in_empty_launch_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    httpd, url, token, _ = _serve_launch(tmp_path, monkeypatch)
+    httpd, url, _ = _serve_launch(tmp_path, monkeypatch)
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(url, "/api/run", cookie=cookie)
         assert status == 404
         assert json.loads(body)["error"] == "no_run"
@@ -523,9 +553,11 @@ def test_existing_endpoints_still_work_with_fixed_run(
 ) -> None:
     run_dir = _make_run(tmp_path, "fixed")
     _bundle(tmp_path, monkeypatch)
-    httpd, url, token = serve(run_dir, host="127.0.0.1", open_browser=False)
+    httpd, url, _empty = serve(
+        run_dir, host="127.0.0.1", open_browser=False, login=_login_manager()
+    )
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         status, _, body = _request(url, "/api/run", cookie=cookie)
         assert status == 200
         assert json.loads(body)["run_name"] == "fixed"
@@ -542,17 +574,18 @@ def test_loopback_origin_alias_not_accepted_when_bound_to_all_interfaces(
     launcher = FakeLauncher()
     runs_dir = tmp_path / "strix_runs"
     runs_dir.mkdir(exist_ok=True)
-    httpd, _url, token = serve(
+    httpd, _url, _empty = serve(
         None,
         host="0.0.0.0",  # nosec B104 - the point of the test
         open_browser=False,
         runs_dir=runs_dir,
         launcher=launcher,  # type: ignore[arg-type]
+        login=_login_manager(),
     )
     try:
         port = httpd.server_address[1]
         loopback = f"http://127.0.0.1:{port}"
-        cookie = _session_cookie(loopback, token)
+        cookie = _login_cookie(loopback, origin=f"http://0.0.0.0:{port}")
         status, _, body = _request(
             loopback,
             "/api/scans",

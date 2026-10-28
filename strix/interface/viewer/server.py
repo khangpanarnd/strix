@@ -18,7 +18,6 @@ import json
 import logging
 import mimetypes
 import os
-import secrets
 import threading
 import time
 import webbrowser
@@ -27,7 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from strix.core.paths import run_record_path
 from strix.interface.viewer import auth
@@ -134,15 +133,21 @@ def resolve_run_dir(
     return candidate
 
 
-# Prefix of the cookie carrying the per-process session capability. The bound
-# port is appended (``strix_viewer_session_<port>``) because browsers scope
-# cookies by host only, never by port: concurrent viewers on 127.0.0.1 would
-# otherwise share one cookie slot and clobber each other's session.
-SESSION_COOKIE_PREFIX = "strix_viewer_session"
-
-# Cookie carrying the login session (second factor). Port-suffixed in ``serve()``
-# for the same reason as the session cookie above.
+# Cookie carrying the login session. The bound port is appended
+# (``strix_viewer_login_<port>``) because browsers scope cookies by host only,
+# never by port: concurrent viewers on 127.0.0.1 would otherwise share one
+# cookie slot and clobber each other's session.
 LOGIN_COOKIE_PREFIX = "strix_viewer_login"
+
+# Human-readable messages for the password-change policy error codes returned by
+# ``credentials_store.validate_new_password`` (kept here so the HTTP layer owns
+# the wording and the store stays free of presentation).
+_PASSWORD_POLICY_MESSAGES = {
+    "invalid_password": "Enter a new password.",
+    "password_too_short": "Use at least 8 characters.",
+    "password_too_long": "That password is too long.",
+    "password_unchanged": "Choose a password other than the default.",
+}
 
 # Types served with an explicit type because the platform's mimetypes table may
 # not know them (Windows reads the registry).
@@ -209,18 +214,6 @@ class _ViewerState:
         # launcher), which can deliver a message to a running agent. Absent for
         # standalone ``strix view`` / finished runs, so steering is unavailable.
         self.steer_handler = steer_handler
-        # Unguessable per-process capability. It is minted here, printed/opened
-        # for the operator who started the server (see ``authorized_url``), and
-        # exchanged for a session cookie only when presented on the initial page
-        # load. It is the request-level authorization the review asked for:
-        # reachability of the port (e.g. when bound with ``--host``) is not
-        # enough to read run data, steer a live scan, trigger a report, or
-        # browse history -- the token is never handed to a caller who merely
-        # reaches ``/``.
-        self.session_token = secrets.token_urlsafe(32)
-        # Finalized in ``serve()`` once the port is known (the server binds
-        # after this state is constructed); see SESSION_COOKIE_PREFIX.
-        self.cookie_name = SESSION_COOKIE_PREFIX
         # Sliding-window rate limiter for settings CHANGES (PUT + reset), shared
         # across worker threads (BR-4: 30 per rolling minute). The connection
         # test keeps its own 6/min window inside ``ConnectionTester``, so it is
@@ -266,7 +259,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 if path.startswith("/api/"):
                     self._handle_api(path, parse_qs(parts.query))
                 else:
-                    self._handle_static(path, parse_qs(parts.query))
+                    self._handle_static(path)
             except ConnectionError:
                 # The browser closed the connection mid-response (e.g. it
                 # navigated away between polls). Not an error.
@@ -296,6 +289,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "/api/notifications/test": self._handle_notifications_test,
                 "/api/login": self._handle_login,
                 "/api/logout": self._handle_logout,
+                "/api/password": self._handle_password_change,
             }
             try:
                 handler = routes.get(path)
@@ -1092,20 +1086,25 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         def _handle_login_status(self) -> None:
             """GET /api/login/status — what the sign-in page needs to decide what to show.
 
-            Public by design: it returns three booleans and, only once the caller
-            is signed in, their own username. ``authorized_browser`` is false when
-            this browser never opened the viewer's secret link, so the page can
-            say so instead of showing a form that cannot work.
+            Public by design: it returns a few booleans and, only once the caller
+            is signed in, their own username. ``must_change_password`` is true
+            when the signed-in account still owes the forced change of the shipped
+            default, so the SPA shows the change-password screen instead of the app.
             """
-            first = self._has_first_factor()
-            authenticated = first and self._is_logged_in()
-            username = state.login.username if state.login is not None and authenticated else None
+            logged_in = self._is_logged_in()
+            must_change = self._must_change_password()
+            authenticated = logged_in and not must_change
+            username = (
+                state.login.username
+                if state.login is not None and logged_in
+                else None
+            )
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "login_required": state.login is not None,
                     "authenticated": authenticated,
-                    "authorized_browser": first,
+                    "must_change_password": must_change,
                     "username": username,
                 },
                 extra_headers={"Cache-Control": "no-store"},
@@ -1114,15 +1113,13 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         def _handle_login(self) -> None:
             """POST /api/login — check the username and password, open a login session.
 
-            Gate order: session cookie → login enabled → Origin/Host → Content-Type
-            → Content-Length; the body is not read until all pass. The session
-            cookie is required so the password cannot be guessed by anyone who has
-            not got the secret link. Wrong username and wrong password give the
-            same answer. Failures are rate-limited (429 + Retry-After).
+            Username/password is the only factor, so this is the entry point: no
+            prior capability is required. Gate order: login enabled → Origin/Host
+            → Content-Type → Content-Length; the body is not read until all pass.
+            Wrong username and wrong password give the same answer. Failures are
+            rate-limited (429 + Retry-After). On success the response reports
+            whether the account must still change its password.
             """
-            if not self._has_first_factor():
-                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-                return
             login = state.login
             if login is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "login_disabled"})
@@ -1144,7 +1141,11 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if result.ok and result.token is not None:
                 self._send_json(
                     HTTPStatus.OK,
-                    {"ok": True, "username": login.username},
+                    {
+                        "ok": True,
+                        "username": login.username,
+                        "must_change_password": login.must_change_password,
+                    },
                     extra_headers=self._login_cookie_header(result.token, int(login.session_ttl)),
                 )
             elif result.retry_after is not None:
@@ -1179,11 +1180,11 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         def _handle_logout(self) -> None:
             """POST /api/logout — end the login session and clear its cookie.
 
-            Needs the session cookie and a same-origin request (so another site
+            Needs a live login session and a same-origin request (so another site
             cannot sign the user out). Always succeeds if those hold, whether or
             not a login session existed.
             """
-            if not self._has_first_factor():
+            if not self._is_logged_in():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
             if not self._origin_ok():
@@ -1194,6 +1195,81 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self._send_json(
                 HTTPStatus.OK, {"ok": True}, extra_headers=self._login_cookie_header("", 0)
             )
+
+        def _handle_password_change(self) -> None:
+            """POST /api/password — replace the password for the signed-in account.
+
+            Requires a live login session (so only a signed-in caller can change
+            the password) and a same-origin request. The body is
+            ``{"current_password": ..., "new_password": ...}``. The current
+            password is verified; the new one must meet the policy and differ
+            from the shipped default. On success the session stays valid and the
+            forced-change flag (if any) is cleared. A wrong current password is
+            rate-limited like a failed sign-in.
+            """
+            from strix.interface.viewer import credentials_store
+
+            login = state.login
+            if login is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "login_disabled"})
+                return
+            token = self._cookies().get(state.login_cookie_name)
+            if not login.is_valid(token):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            gate = self._login_gate_error()
+            if gate is not None:
+                self._send_json(gate[0], {"error": gate[1]})
+                return
+            try:
+                body = self._read_settings_body()
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+                return
+
+            new_password = body.get("new_password")
+            policy_error = credentials_store.validate_new_password(new_password)
+            if policy_error is not None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": policy_error, "message": _PASSWORD_POLICY_MESSAGES[policy_error]},
+                    extra_headers={"Cache-Control": "no-store"},
+                )
+                return
+            assert isinstance(new_password, str)
+
+            result = login.change_password(token, body.get("current_password"), new_password)
+            if result.ok:
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "username": login.username},
+                    extra_headers={"Cache-Control": "no-store"},
+                )
+            elif result.retry_after is not None:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {
+                        "error": "rate_limited",
+                        "message": "Too many attempts. Try again shortly.",
+                        "retry_after": result.retry_after,
+                    },
+                    extra_headers={
+                        "Retry-After": str(result.retry_after),
+                        "Cache-Control": "no-store",
+                    },
+                )
+            else:
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {
+                        "error": "invalid_current_password",
+                        "message": "Your current password is incorrect.",
+                    },
+                    extra_headers={"Cache-Control": "no-store"},
+                )
 
         def _handle_run_log(self, run_dir: Path, query: dict[str, list[str]]) -> None:
             """GET /api/log?run=&after= — new lines of the run's ``strix.log``.
@@ -1384,42 +1460,36 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     jar[name] = value
             return jar
 
-        def _has_first_factor(self) -> bool:
-            """True when the request carries this process's session capability.
-
-            The cookie is set only when the SPA is served with the bootstrap token,
-            so only the browser this process handed the page to can pass. A direct
-            caller on an exposed port has no cookie and is rejected.
-            """
-            supplied = self._cookies().get(state.cookie_name, "")
-            return bool(supplied) and secrets.compare_digest(supplied, state.session_token)
-
         def _is_logged_in(self) -> bool:
             """True when login is off, or the request carries a live login session."""
             if state.login is None:
                 return True
             return state.login.is_valid(self._cookies().get(state.login_cookie_name))
 
+        def _must_change_password(self) -> bool:
+            """True when the signed-in account still owes a password change.
+
+            While this holds, data endpoints stay locked (423) and only the
+            change-password endpoint works.
+            """
+            return (
+                state.login is not None
+                and self._is_logged_in()
+                and state.login.must_change_password
+            )
+
         def _has_session(self) -> bool:
             """True when the caller may read or change viewer data.
 
-            Needs the session capability (first factor) and, when login is on, a
-            valid login session as well (second factor). Every data endpoint goes
-            through here, so turning login on protects all of them at once.
+            Username/password is the only factor: the request must carry a live
+            login session, and the account must not still owe a forced password
+            change. Every data endpoint goes through here, so sign-in protects
+            them all at once. With login off (``STRIX_VIEWER_LOGIN=off``) the page
+            is open to anyone who can reach it.
             """
-            return self._has_first_factor() and self._is_logged_in()
+            return self._is_logged_in() and not self._must_change_password()
 
-        def _token_presented(self, query: dict[str, list[str]]) -> bool:
-            """True when the request carries the correct bootstrap token.
-
-            The token reaches the operator's browser through the URL printed /
-            opened by the process that started the server, a channel an
-            arbitrary network caller on an exposed port cannot observe.
-            """
-            supplied = (query.get("token") or [""])[0]
-            return bool(supplied) and secrets.compare_digest(supplied, state.session_token)
-
-        def _handle_static(self, path: str, query: dict[str, list[str]]) -> None:
+        def _handle_static(self, path: str) -> None:
             target = self._resolve_asset(path)
             if target is None:
                 # SPA fallback: unknown non-asset routes render index.html so
@@ -1454,16 +1524,6 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(max(0, last - first + 1)))
             if not is_index:
                 self.send_header("Accept-Ranges", "bytes")
-            if is_index and self._token_presented(query):
-                # Exchange the bootstrap token for the per-process session
-                # capability. Issued only when the correct token is presented,
-                # so a caller who merely reaches ``/`` never obtains it.
-                # HttpOnly (JS never needs it; fetch sends it automatically) and
-                # SameSite=Strict (never sent from a cross-site context).
-                self.send_header(
-                    "Set-Cookie",
-                    f"{state.cookie_name}={state.session_token}; Path=/; HttpOnly; SameSite=Strict",
-                )
             self.end_headers()
             self._write_file_range(target, first, last)
 
@@ -1512,17 +1572,6 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
     return ViewerHandler
 
 
-def authorized_url(base_url: str, token: str) -> str:
-    """URL that bootstraps the viewer session for the operator.
-
-    Presenting ``token`` on the initial page load is what mints the session
-    cookie, so this URL is printed / opened only for the operator who started
-    the server. Sharing it (rather than the bare ``base_url``) is what lets a
-    trusted remote user authorize when the viewer is exposed with ``--host``.
-    """
-    return f"{base_url}/?{urlencode({'token': token})}"
-
-
 def serve(
     run_dir: Path | None,
     *,
@@ -1538,10 +1587,11 @@ def serve(
     notifier: NotificationService | None = None,
     login: LoginManager | None = None,
 ) -> tuple[ThreadingHTTPServer, str, str]:
-    """Start the viewer server on a background thread; return (server, url, token).
+    """Start the viewer server on a background thread; return (server, url, "").
 
-    ``url`` is the bare base; pass it through ``authorized_url(url, token)`` to
-    build the operator link that authorizes the browser.
+    ``url`` is the address to open. Sign-in (username/password) is the only
+    access factor, so there is no URL token; the third tuple element is an empty
+    string, kept only so existing call sites that unpack three values still work.
 
     Binds an ephemeral port by default. If a fixed ``port`` is requested but in
     use, falls back to an ephemeral port. Reused by both the ``strix view``
@@ -1607,7 +1657,6 @@ def serve(
 
     httpd.daemon_threads = True
     bound_port = int(httpd.server_address[1])
-    state.cookie_name = f"{SESSION_COOKIE_PREFIX}_{bound_port}"
     state.login_cookie_name = f"{LOGIN_COOKIE_PREFIX}_{bound_port}"
     url = f"http://{host}:{bound_port}"
     # Record the bound origin so the Origin/Host check (BR-2) has the truth.
@@ -1618,16 +1667,18 @@ def serve(
     thread.start()
 
     if open_browser:
-        _open_browser(authorized_url(url, state.session_token))
+        _open_browser(url)
 
-    return httpd, url, state.session_token
+    # The third element is retained for call-site compatibility; there is no
+    # longer a URL token, so it is always empty.
+    return httpd, url, ""
 
 
 def _open_browser(url: str) -> None:
     try:
         webbrowser.open(url)
-    except Exception:  # noqa: BLE001 - launching the browser is best-effort
+    except Exception:
         logger.debug("could not open browser for %s", url, exc_info=True)
 
 
-__all__ = ["authorized_url", "bundle_dir", "bundle_is_built", "serve"]
+__all__ = ["bundle_dir", "bundle_is_built", "serve"]

@@ -1,8 +1,9 @@
 """Tests for viewer sign-in: hashing, configuration, rate limiting and sessions.
 
 Tests use throwaway passwords and a low iteration count so they stay fast. The
-shipped default account's real password is deliberately NOT in this file or
-anywhere else in the repo; only its hash is, and it is checked for shape.
+shipped default account's password is the well-known ``admin`` seed, changed on
+first sign-in; only its name and the seed constant are asserted here, never a
+real credential.
 """
 
 from __future__ import annotations
@@ -16,15 +17,17 @@ import pytest
 
 from strix.interface.viewer import login
 from strix.interface.viewer.login import (
-    DEFAULT_PASSWORD_HASH,
+    DEFAULT_SEED_PASSWORD,
     DEFAULT_USERNAME,
     FAILURE_WINDOW_SECONDS,
     LOCKOUT_SECONDS,
     MAX_FAILURES,
     MAX_FIELD_CHARS,
     MAX_SESSIONS,
+    USE_STORE,
     LoginConfig,
     LoginManager,
+    env_login_config,
     hash_password,
     parse_hash,
     verify_password,
@@ -33,6 +36,7 @@ from strix.interface.viewer.login import (
 
 FAST = 1_000  # iterations; the minimum allowed, for speed
 PASSWORD = "correct-horse-battery-staple"  # noqa: S105 - test-only value, not a real credential
+NEW_PASSWORD = "a-brand-new-password-9"  # noqa: S105 - test-only value, not a real credential
 
 
 class Clock:
@@ -122,60 +126,56 @@ def test_parse_hash_rejects_non_strings() -> None:
 # --- configuration ----------------------------------------------------------------
 
 
-def test_the_shipped_default_account_is_well_formed_and_stores_no_plaintext() -> None:
-    assert DEFAULT_USERNAME == "prdcv"
-    parsed = parse_hash(DEFAULT_PASSWORD_HASH)
-    assert parsed is not None
-    iterations, salt, digest = parsed
-    assert iterations >= 600_000
-    assert len(salt) >= 16
-    assert len(digest) == 32
-    assert DEFAULT_PASSWORD_HASH.startswith("pbkdf2_sha256$")
+def test_the_shipped_default_account_constants_are_the_well_known_seed() -> None:
+    # The seed is intentionally well known so a fresh install can be opened; the
+    # forced change at first sign-in is what keeps it safe. No hash is shipped
+    # as a constant any more — the store hashes the seed on first run.
+    assert DEFAULT_USERNAME == "admin"
+    assert DEFAULT_SEED_PASSWORD == "admin"  # noqa: S105 - the shipped default, asserted here
 
 
-def test_default_config_uses_the_built_in_account() -> None:
-    config = LoginConfig.from_env({})
-    assert config is not None
-    assert config.username == DEFAULT_USERNAME
-    assert config.password_hash == DEFAULT_PASSWORD_HASH
+def test_no_env_account_falls_back_to_the_store() -> None:
+    # Neither env var set: the caller is told to use the persisted store.
+    assert env_login_config({}) is USE_STORE
 
 
 @pytest.mark.parametrize("value", ["off", "OFF", "0", "false", "No", " off "])
 def test_login_can_be_switched_off(value: str) -> None:
-    assert LoginConfig.from_env({"STRIX_VIEWER_LOGIN": value}) is None
+    assert env_login_config({"STRIX_VIEWER_LOGIN": value}) is None
 
 
 @pytest.mark.parametrize("value", ["on", "1", "", "yes", "maybe"])
 def test_other_values_leave_login_on(value: str) -> None:
-    assert LoginConfig.from_env({"STRIX_VIEWER_LOGIN": value}) is not None
+    # "On" with no account set still means "use the store", not a config error.
+    assert env_login_config({"STRIX_VIEWER_LOGIN": value}) is USE_STORE
 
 
 def test_env_can_override_the_account() -> None:
     encoded = hash_password(PASSWORD, iterations=FAST)
-    config = LoginConfig.from_env(
+    config = env_login_config(
         {"STRIX_VIEWER_USERNAME": "bob", "STRIX_VIEWER_PASSWORD_HASH": encoded}
     )
-    assert config is not None
+    assert isinstance(config, LoginConfig)
     assert (config.username, config.password_hash) == ("bob", encoded)
-
-
-def test_env_hash_alone_keeps_the_default_username() -> None:
-    encoded = hash_password(PASSWORD, iterations=FAST)
-    config = LoginConfig.from_env({"STRIX_VIEWER_PASSWORD_HASH": encoded})
-    assert config is not None
-    assert config.username == DEFAULT_USERNAME
-    assert config.password_hash == encoded
+    # An env-configured account is trusted as-is; it is never forced to change.
+    assert config.must_change is False
 
 
 def test_a_bad_env_hash_is_an_error_not_a_silent_fallback() -> None:
     with pytest.raises(ValueError, match="not a valid hash"):
-        LoginConfig.from_env({"STRIX_VIEWER_PASSWORD_HASH": "hunter2"})
+        env_login_config({"STRIX_VIEWER_USERNAME": "bob", "STRIX_VIEWER_PASSWORD_HASH": "hunter2"})
 
 
 def test_a_username_override_without_a_hash_is_an_error() -> None:
-    # Otherwise the default password would silently protect the operator's chosen name.
+    # Otherwise the chosen name would be left without a password to match.
     with pytest.raises(ValueError, match="without STRIX_VIEWER_PASSWORD_HASH"):
-        LoginConfig.from_env({"STRIX_VIEWER_USERNAME": "bob"})
+        env_login_config({"STRIX_VIEWER_USERNAME": "bob"})
+
+
+def test_a_hash_without_a_username_is_an_error() -> None:
+    encoded = hash_password(PASSWORD, iterations=FAST)
+    with pytest.raises(ValueError, match="without STRIX_VIEWER_USERNAME"):
+        env_login_config({"STRIX_VIEWER_PASSWORD_HASH": encoded})
 
 
 def test_config_repr_hides_the_hash() -> None:
@@ -369,6 +369,101 @@ def test_malformed_input_counts_as_a_failure() -> None:
     for _ in range(MAX_FAILURES):
         manager.attempt(None, None)
     assert manager.attempt("alice", PASSWORD).retry_after is not None
+
+
+# --- forced change and change-password -------------------------------------------------
+
+
+def _changeable(
+    clock: Clock | None = None,
+    *,
+    must_change: bool = True,
+) -> tuple[LoginManager, list[str], Clock]:
+    """A manager whose account owes a change, with a callback capturing new passwords."""
+    clock = clock or Clock()
+    captured: list[str] = []
+    config = LoginConfig(
+        username="alice",
+        password_hash=hash_password(PASSWORD, iterations=FAST),
+        must_change=must_change,
+    )
+    manager = LoginManager(config, clock=clock, on_password_changed=captured.append)
+    return manager, captured, clock
+
+
+def test_a_fresh_account_reports_must_change() -> None:
+    manager, _, _ = _changeable()
+    assert manager.must_change_password is True
+    # A normally-configured account does not owe a change.
+    plain, _ = _manager()
+    assert plain.must_change_password is False
+
+
+def test_changing_the_password_clears_the_flag_and_fires_the_callback() -> None:
+    manager, captured, _ = _changeable()
+    token = manager.attempt("alice", PASSWORD).token
+    result = manager.change_password(token, PASSWORD, NEW_PASSWORD)
+    assert result.ok is True
+    assert result.token == token  # the caller's session stays valid
+    assert manager.is_valid(token) is True
+    assert manager.must_change_password is False
+    assert captured == [NEW_PASSWORD]
+    # The new password is the one that now signs in.
+    assert manager.attempt("alice", NEW_PASSWORD).ok is True
+    assert manager.attempt("alice", PASSWORD).ok is False
+
+
+def test_changing_the_password_without_a_callback_still_works() -> None:
+    config = LoginConfig(
+        username="alice",
+        password_hash=hash_password(PASSWORD, iterations=FAST),
+        must_change=True,
+    )
+    manager = LoginManager(config)
+    token = manager.attempt("alice", PASSWORD).token
+    assert manager.change_password(token, PASSWORD, NEW_PASSWORD).ok is True
+    assert manager.must_change_password is False
+
+
+def test_a_wrong_current_password_is_rejected_and_rate_limited() -> None:
+    manager, captured, _ = _changeable()
+    token = manager.attempt("alice", PASSWORD).token
+    for _ in range(MAX_FAILURES - 1):
+        assert manager.change_password(token, "wrong-current", NEW_PASSWORD).ok is False
+    # The flag is untouched and the callback never fired.
+    assert manager.must_change_password is True
+    assert captured == []
+    # The failures share the sign-in limiter: one more trips the lock-out.
+    locked = manager.change_password(token, "wrong-current", NEW_PASSWORD)
+    assert locked.ok is False
+    assert locked.retry_after is not None
+
+
+def test_an_invalid_session_token_cannot_change_the_password() -> None:
+    manager, captured, _ = _changeable()
+    assert manager.change_password(None, PASSWORD, NEW_PASSWORD).ok is False
+    assert manager.change_password("never-existed", PASSWORD, NEW_PASSWORD).ok is False
+    assert manager.must_change_password is True
+    assert captured == []
+
+
+def test_an_expired_session_token_cannot_change_the_password() -> None:
+    manager, captured, clock = _changeable(Clock())
+    # Rebuild with a short TTL so the session can expire under the fake clock.
+    captured.clear()
+    config = LoginConfig(
+        username="alice",
+        password_hash=hash_password(PASSWORD, iterations=FAST),
+        must_change=True,
+    )
+    manager = LoginManager(
+        config, clock=clock, session_ttl=100.0, on_password_changed=captured.append
+    )
+    token = manager.attempt("alice", PASSWORD).token
+    clock.advance(101)
+    assert manager.change_password(token, PASSWORD, NEW_PASSWORD).ok is False
+    assert manager.must_change_password is True
+    assert captured == []
 
 
 # --- timing and logging ---

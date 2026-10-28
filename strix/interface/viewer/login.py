@@ -1,11 +1,14 @@
 """Username/password sign-in for the viewer, enforced on the server.
 
-The viewer already has one factor: a per-process token in the URL it prints and
-opens, exchanged for a session cookie. This adds a second. When login is on, a
-request is authorised only if it carries BOTH the session cookie and a valid
-login cookie, and a login cookie is only issued by ``POST /api/login`` to a
-caller that already holds the session cookie. So a password cannot be guessed
-from the network: an attacker would first need the secret URL.
+Username/password is the ONLY factor: a request is authorised when it carries a
+valid login cookie, issued by ``POST /api/login`` to a caller that sent the right
+credentials. There is no longer a URL token; the page is reachable directly and
+the sign-in form is the gate.
+
+The account is persisted (see ``credentials_store``). On a fresh install it is
+the well-known default ``admin`` / ``admin`` with a "must change" flag, so the
+viewer can be opened once and then forces a real password before any data is
+shown. Environment variables still override the stored account.
 
 Design points:
 
@@ -21,13 +24,13 @@ Design points:
 
 Configuration (environment, read when the viewer starts):
 
-* ``STRIX_VIEWER_LOGIN=off``           turn login off entirely.
+* ``STRIX_VIEWER_LOGIN=off``           turn login off entirely (no sign-in at all).
 * ``STRIX_VIEWER_USERNAME``            the username.
 * ``STRIX_VIEWER_PASSWORD_HASH``       the hash, from ``python -m strix.interface.viewer.login``.
 
-Without overrides the viewer uses the default account below. Anyone who can read
-this source can run offline guesses against its hash, so for anything beyond a
-single-user machine, set your own hash.
+With both set, that account is used and no password change is ever forced. With
+neither set, the persisted account is used: on first run that is ``admin`` /
+``admin`` with a forced change at first sign-in.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 
@@ -64,12 +67,13 @@ _HASH_BYTES = 32
 #: Longest username/password accepted, so a request cannot make the server hash megabytes.
 MAX_FIELD_CHARS = 256
 
-#: The built-in account. Overridable through the environment. Only the HASH is here.
-DEFAULT_USERNAME = "prdcv"
-DEFAULT_PASSWORD_HASH = (
-    # A salted PBKDF2 hash, not a password.
-    "pbkdf2_sha256$600000$vmbzJA+JkCnYpGcmlNN4Ow==$QLgHIhwuNIYogpF/o4WnjOG522vkez2dtOj/NXOM6GE="  # noqa: S105
-)
+#: The shipped default account. On first run the viewer seeds the persisted
+#: credential store with this username and a hash of DEFAULT_SEED_PASSWORD, and
+#: forces a password change at first sign-in. The default is intentionally
+#: well known so a fresh install can be opened; the forced change is what keeps
+#: it safe. Overridable through the environment (then no change is forced).
+DEFAULT_USERNAME = "admin"
+DEFAULT_SEED_PASSWORD = "admin"  # noqa: S105 - the shipped default, changed on first login
 
 #: Rolling window for failed attempts, how many it takes to lock, and how long it lasts.
 FAILURE_WINDOW_SECONDS = 300.0
@@ -142,35 +146,58 @@ class LoginConfig:
 
     username: str
     password_hash: str
+    #: True while the shipped default must still be replaced (persisted account
+    #: only; an env-configured account is never forced to change).
+    must_change: bool = False
 
     def __repr__(self) -> str:  # keep the hash out of any stray log of the object
-        return f"LoginConfig(username={self.username!r}, password_hash=<hidden>)"
+        return (
+            f"LoginConfig(username={self.username!r}, "
+            f"password_hash=<hidden>, must_change={self.must_change})"
+        )
 
-    @classmethod
-    def from_env(cls, environ: Mapping[str, str]) -> LoginConfig | None:
-        """The configured account, or None when login is switched off.
 
-        An invalid ``STRIX_VIEWER_PASSWORD_HASH`` raises ``ValueError`` rather than
-        silently falling back to the default account: a typo must not quietly
-        leave the viewer protected by a different password than the operator set.
-        """
-        if environ.get("STRIX_VIEWER_LOGIN", "").strip().lower() in {"off", "0", "false", "no"}:
-            return None
-        username = environ.get("STRIX_VIEWER_USERNAME", "").strip() or DEFAULT_USERNAME
-        password_hash = environ.get("STRIX_VIEWER_PASSWORD_HASH", "").strip()
-        if password_hash and parse_hash(password_hash) is None:
-            raise ValueError(
-                "STRIX_VIEWER_PASSWORD_HASH is not a valid hash; generate one with "
-                "'python -m strix.interface.viewer.login'"
-            )
-        if not password_hash:
-            if environ.get("STRIX_VIEWER_USERNAME", "").strip():
-                raise ValueError(
-                    "STRIX_VIEWER_USERNAME is set without STRIX_VIEWER_PASSWORD_HASH; "
-                    "set both, or neither to use the built-in account"
-                )
-            password_hash = DEFAULT_PASSWORD_HASH
-        return cls(username=username, password_hash=password_hash)
+#: Sentinel returned by :meth:`EnvLogin.resolve` meaning "no env account was set;
+#: fall back to the persisted credential store".
+USE_STORE = object()
+
+
+def env_login_config(environ: Mapping[str, str]) -> LoginConfig | object | None:
+    """Resolve the login account from the environment.
+
+    Returns:
+      * ``None`` when ``STRIX_VIEWER_LOGIN=off`` — sign-in is disabled entirely.
+      * a :class:`LoginConfig` when BOTH username and password hash are set.
+      * :data:`USE_STORE` when neither is set — the caller should load the
+        persisted credential store (default ``admin`` / ``admin`` on first run).
+
+    An invalid hash, or a username without a hash, raises ``ValueError`` rather
+    than silently falling back: a typo must not quietly leave the viewer
+    protected by a different account than the operator intended.
+    """
+    if environ.get("STRIX_VIEWER_LOGIN", "").strip().lower() in {"off", "0", "false", "no"}:
+        return None
+    username = environ.get("STRIX_VIEWER_USERNAME", "").strip()
+    password_hash = environ.get("STRIX_VIEWER_PASSWORD_HASH", "").strip()
+    if not username and not password_hash:
+        return USE_STORE
+    if password_hash and parse_hash(password_hash) is None:
+        raise ValueError(
+            "STRIX_VIEWER_PASSWORD_HASH is not a valid hash; generate one with "
+            "'python -m strix.interface.viewer.login'"
+        )
+    if not password_hash:
+        raise ValueError(
+            "STRIX_VIEWER_USERNAME is set without STRIX_VIEWER_PASSWORD_HASH; "
+            "set both, or neither to use the stored account"
+        )
+    if not username:
+        raise ValueError(
+            "STRIX_VIEWER_PASSWORD_HASH is set without STRIX_VIEWER_USERNAME; "
+            "set both, or neither to use the stored account"
+        )
+    # An env-configured account is trusted as-is; no forced change.
+    return LoginConfig(username=username, password_hash=password_hash, must_change=False)
 
 
 # --- sessions and rate limiting ------------------------------------------------------
@@ -195,8 +222,14 @@ class LoginManager:
         *,
         clock: Callable[[], float] | None = None,
         session_ttl: float = SESSION_TTL_SECONDS,
+        on_password_changed: Callable[[str], None] | None = None,
     ) -> None:
         self._config = config
+        self._must_change = config.must_change
+        # Called with the NEW plaintext password after a successful change, so a
+        # caller can persist it (the credential store hashes + writes). Optional:
+        # an env-configured account passes nothing and simply cannot be changed.
+        self._on_password_changed = on_password_changed
         self._clock = clock or time.monotonic
         self._ttl = session_ttl
         self._lock = threading.Lock()
@@ -307,6 +340,47 @@ class LoginManager:
     def session_ttl(self) -> float:
         return self._ttl
 
+    @property
+    def must_change_password(self) -> bool:
+        """True while the shipped default must still be replaced."""
+        with self._lock:
+            return self._must_change
+
+    def change_password(self, token: str | None, current: object, new: str) -> LoginResult:
+        """Replace the password for the session identified by ``token``.
+
+        Requires a live login session (``token``) and the correct ``current``
+        password. ``new`` is assumed already validated by the caller. On success
+        the in-memory hash is updated, the ``must_change`` flag is cleared, the
+        persistence callback (if any) is invoked with the new plaintext, and the
+        caller's session stays valid. A wrong current password is rate-limited
+        exactly like a failed sign-in.
+        """
+        if not self.is_valid(token):
+            return LoginResult(ok=False)
+        with self._attempt_lock:
+            now = self._clock()
+            with self._lock:
+                wait = self._lockout_remaining(now)
+            if wait > 0:
+                return LoginResult(ok=False, retry_after=max(1, int(wait + 0.999)))
+            # Always hash so a wrong-type/wrong password costs the same.
+            if isinstance(current, str) and 0 < len(current) <= MAX_FIELD_CHARS:
+                good = verify_password(current, self._config.password_hash)
+            else:
+                verify_password("x", self._dummy_hash)
+                good = False
+            with self._lock:
+                now = self._clock()
+                if not good:
+                    return self._record_failure(now)
+                self._failures.clear()
+                self._config = replace(self._config, password_hash=hash_password(new))
+                self._must_change = False
+        if self._on_password_changed is not None:
+            self._on_password_changed(new)
+        return LoginResult(ok=True, token=token)
+
 
 def _main() -> int:  # pragma: no cover - interactive helper
     """``python -m strix.interface.viewer.login``: print a hash for STRIX_VIEWER_PASSWORD_HASH."""
@@ -331,7 +405,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "DEFAULT_ITERATIONS",
-    "DEFAULT_PASSWORD_HASH",
+    "DEFAULT_SEED_PASSWORD",
     "DEFAULT_USERNAME",
     "FAILURE_WINDOW_SECONDS",
     "LOCKOUT_SECONDS",
@@ -339,9 +413,11 @@ __all__ = [
     "MAX_FIELD_CHARS",
     "MAX_SESSIONS",
     "SESSION_TTL_SECONDS",
+    "USE_STORE",
     "LoginConfig",
     "LoginManager",
     "LoginResult",
+    "env_login_config",
     "hash_password",
     "parse_hash",
     "verify_password",

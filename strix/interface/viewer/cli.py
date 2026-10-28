@@ -23,15 +23,21 @@ from strix.core.paths import (
     run_record_path,
     runs_base_dir,
 )
+from strix.interface.viewer import credentials_store
 from strix.interface.viewer.launch_request import LaunchLimits
 from strix.interface.viewer.llm_connection_test import ConnectionTester
 from strix.interface.viewer.llm_profiles import ProfileStore
 from strix.interface.viewer.llm_settings import SettingsStore
-from strix.interface.viewer.login import LoginConfig, LoginManager
+from strix.interface.viewer.login import (
+    USE_STORE,
+    LoginConfig,
+    LoginManager,
+    env_login_config,
+)
 from strix.interface.viewer.notification_store import NotificationStore
 from strix.interface.viewer.notifications import NotificationService
 from strix.interface.viewer.scan_launcher import ScanLauncher
-from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
+from strix.interface.viewer.server import bundle_is_built, serve
 from strix.interface.viewer.transcript import read_run_summary
 
 
@@ -70,18 +76,43 @@ def run_view(argv: list[str]) -> None:
 
 
 def _build_login(console: Console) -> LoginManager | None:
-    """The sign-in manager from the environment, or None when login is switched off.
+    """The sign-in manager, or None when login is switched off.
 
-    A malformed ``STRIX_VIEWER_PASSWORD_HASH`` (or a username without a hash) stops
-    the viewer with a clear message rather than quietly falling back to a different
-    password than the operator set. The message never contains a credential.
+    Resolution: ``STRIX_VIEWER_LOGIN=off`` disables sign-in; an env-configured
+    username+hash is used as-is; otherwise the persisted credential store is
+    used, seeded with the default ``admin`` / ``admin`` (change forced) on first
+    run. A malformed env hash, or only one of the two env vars, stops the viewer
+    with a clear message that never contains a credential. When the store backs
+    the account, a successful password change is written back to disk.
     """
     try:
-        config = LoginConfig.from_env(os.environ)
+        resolved = env_login_config(os.environ)
     except ValueError as exc:
         console.print(f"[bold red]Cannot start the viewer:[/] {escape(str(exc))}")
         raise SystemExit(1) from exc
-    return LoginManager(config) if config is not None else None
+
+    if resolved is None:
+        return None
+
+    if resolved is USE_STORE:
+        account = credentials_store.load_or_seed()
+        config = LoginConfig(
+            username=account.username,
+            password_hash=account.password_hash,
+            must_change=account.must_change,
+        )
+
+        def _persist(new_password: str) -> None:
+            # Re-read so a hand-edit between startup and the change is respected,
+            # then store the new hash and clear the forced-change flag.
+            current = credentials_store.read() or account
+            credentials_store.set_password(current, new_password)
+
+        return LoginManager(config, on_password_changed=_persist)
+
+    # An explicit env account: used as-is, never asked to change, not persisted.
+    assert isinstance(resolved, LoginConfig)
+    return LoginManager(resolved)
 
 
 def _print_login_note(console: Console, login: LoginManager | None) -> None:
@@ -89,12 +120,17 @@ def _print_login_note(console: Console, login: LoginManager | None) -> None:
     if login is None:
         console.print(
             "[bold yellow]Sign-in is off[/] "
-            "[dim](STRIX_VIEWER_LOGIN=off): the link alone grants access.[/]"
+            "[dim](STRIX_VIEWER_LOGIN=off): anyone who can reach the page gets in.[/]"
         )
         return
+    console.print(f"[dim]Sign-in is on. Username:[/] {escape(login.username)}")
+    if login.must_change_password:
+        console.print(
+            "[bold yellow]First sign-in:[/] use the default password "
+            "[bold]admin[/] [dim]— you will be asked to set a new one before the app opens.[/]"
+        )
     console.print(
-        f"[dim]Sign-in is on. Username:[/] {escape(login.username)}"
-        "  [dim]Set STRIX_VIEWER_USERNAME and STRIX_VIEWER_PASSWORD_HASH to use your own;[/]"
+        "[dim]Set STRIX_VIEWER_USERNAME and STRIX_VIEWER_PASSWORD_HASH to use your own account[/]"
     )
     console.print(
         "[dim]create a hash with[/] python -m strix.interface.viewer.login"
@@ -161,7 +197,7 @@ def _serve_run(
     # config file is shared with launch-mode viewers.
     notifier = NotificationService(NotificationStore())
     notifier.start()
-    httpd, url, token = serve(
+    httpd, url, _token = serve(
         run_dir,
         host=args.host,
         port=args.port,
@@ -172,7 +208,7 @@ def _serve_run(
         notifier=notifier,
         login=login,
     )
-    open_url = authorized_url(url, token)
+    open_url = url
 
     summary = read_run_summary(run_dir)
     live = not summary.get("finished", False)
@@ -184,8 +220,13 @@ def _serve_run(
     console.print()
     console.print(f"Serving [bold white]{run_dir.name}[/] ({_state_label(summary)}) at:")
     console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
-    console.print("[dim]This link authorizes the browser; anyone you share it with can steer[/]")
-    console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
+    if login is None:
+        console.print(
+            "[dim]Sign-in is off: anyone who can reach this address can steer a live[/]"
+        )
+        console.print("[dim]scan and browse history. Press Ctrl-C to stop the viewer.[/]")
+    else:
+        console.print("[dim]Sign in to steer a live scan and browse history. Ctrl-C to stop.[/]")
     _print_login_note(console, login)
     console.print()
 
@@ -216,7 +257,7 @@ def _serve_launch_mode(
     notifier = NotificationService(NotificationStore(), launcher=launcher, runs_dir=runs_dir)
     notifier.start()
 
-    httpd, url, token = serve(
+    httpd, url, _token = serve(
         None,
         host=args.host,
         port=args.port,
@@ -229,7 +270,7 @@ def _serve_launch_mode(
         notifier=notifier,
         login=login,
     )
-    open_url = authorized_url(url, token)
+    open_url = url
 
     from strix.telemetry import posthog
 
@@ -238,15 +279,21 @@ def _serve_launch_mode(
     console.print()
     console.print("Serving [bold white]Strix[/] ([#eab308]launch mode[/]) at:")
     console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
-    console.print("[dim]Open the link to start a scan from the browser. This link authorizes[/]")
-    console.print("[dim]the browser; anyone you share it with can start scans. Ctrl-C to stop.[/]")
+    console.print(
+        "[dim]Open the link and sign in to start a scan from the browser. Ctrl-C to stop.[/]"
+    )
     _print_login_note(console, login)
     if args.host not in _LOOPBACK_HOSTS:
         # NFR-6: a non-loopback bind is reachable over the network.
         console.print(
             "[bold yellow]Warning:[/] this viewer is reachable over the network. "
-            "Anyone with the link can start scans that spend your LLM budget."
+            "Anyone who signs in can start scans that spend your LLM budget."
         )
+        if login is None:
+            console.print(
+                "[bold red]Sign-in is off while exposed to the network — "
+                "anyone who can reach this port has full control.[/]"
+            )
     console.print()
 
     _run_forever(

@@ -10,8 +10,12 @@ import urllib.request
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+import pytest
+
 from strix.core.paths import latest_run_dir, runs_base_dir
+from strix.interface.viewer import credentials_store
 from strix.interface.viewer.cli import _state_label, run_view
+from strix.interface.viewer.login import LoginConfig, LoginManager, hash_password
 from strix.interface.viewer.server import serve
 from strix.interface.viewer.transcript import (
     build_run_state,
@@ -25,7 +29,14 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    import pytest
+
+@pytest.fixture(autouse=True)
+def _tmp_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the real ``~/.strix`` untouched. The gated tests pass explicit login
+    managers, so this is belt-and-suspenders against any stray store read."""
+    monkeypatch.setattr(
+        credentials_store, "CREDENTIALS_PATH", tmp_path / ".strix" / "viewer-credentials.json"
+    )
 
 
 def _make_run(base: Path, name: str, *, status: str, end_time: str | None) -> Path:
@@ -226,15 +237,14 @@ def test_server_serves_api_and_static(tmp_path: Path, monkeypatch: pytest.Monkey
     (assets / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False)
     try:
-        cookie = _session_cookie(url, token)
-        status, ctype, body = _get(f"{url}/api/run", cookie=cookie)
+        status, ctype, body = _get(f"{url}/api/run")
         assert status == 200
         assert "application/json" in ctype
         assert json.loads(body)["finished"] is True
 
-        status, _, body = _get(f"{url}/api/transcript", cookie=cookie)
+        status, _, body = _get(f"{url}/api/transcript")
         assert {a["id"] for a in json.loads(body)["agents"]} == {"root", "child"}
 
         # Real asset is served.
@@ -352,9 +362,9 @@ def test_feedback_records_telemetry_on_success(
         "strix.telemetry.posthog.viewer_feedback_submitted", lambda: sent.append(True)
     )
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         # A successful, session-holding submission relays and records telemetry.
         status, _ = _post(
             url, "/api/feedback", {"email": "a@b.com", "message": "hi"}, cookie=cookie
@@ -388,17 +398,33 @@ def _post(
         return exc.code, exc.read()
 
 
-def _session_cookie(url: str, token: str) -> str:
-    """Bootstrap a session via the tokened URL and return its ``name=value`` cookie."""
-    bootstrap = f"{url}/?token={token}"
-    with urllib.request.urlopen(bootstrap) as resp:  # noqa: S310 - localhost test server  # nosec B310
+def _login_manager() -> LoginManager:
+    """A ready-to-use username/password manager for the gated tests."""
+    return LoginManager(LoginConfig("alice", hash_password("pw-correct-horse", iterations=1000)))
+
+
+def _login_cookie(url: str) -> str:
+    """Sign in over HTTP and return the ``name=value`` login cookie.
+
+    Username/password is the only factor now; this replaces the old tokened
+    bootstrap. It posts straight to ``/api/login`` and reads the ``Set-Cookie``.
+    """
+    body = json.dumps({"username": "alice", "password": "pw-correct-horse"}).encode()
+    req = urllib.request.Request(  # noqa: S310 - localhost test server
+        url + "/api/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
+        assert resp.status == 200
         raw = str(resp.headers.get("Set-Cookie", ""))
     return raw.split(";", 1)[0]
 
 
-def _cookie_name(url: str) -> str:
-    """The per-server session cookie name, derived from the bound port."""
-    return f"strix_viewer_session_{urlsplit(url).port}"
+def _login_cookie_name(url: str) -> str:
+    """The per-server login cookie name, derived from the bound port."""
+    return f"strix_viewer_login_{urlsplit(url).port}"
 
 
 def _get_status(url: str, *, cookie: str | None = None) -> int:
@@ -418,7 +444,7 @@ def _bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
 
-def test_capability_issued_only_for_tokened_bootstrap(
+def test_no_cookie_is_issued_without_signing_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir = _make_run(tmp_path, "cookie", status="running", end_time=None)
@@ -428,31 +454,33 @@ def test_capability_issued_only_for_tokened_bootstrap(
     (assets / "assets" / "app.js").write_text("1", encoding="utf-8")
     monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: assets)
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
-        # A bare index load -- all a reachable client can do -- hands out nothing.
-        with urllib.request.urlopen(url + "/") as resp:  # noqa: S310  # nosec B310
-            assert resp.headers.get("Set-Cookie") is None
+        # The only way to get a cookie now is POST /api/login. Loading the page --
+        # with or without a (now-meaningless) token -- and fetching an asset hand
+        # out nothing.
+        for target in (url + "/", f"{url}/?token=anything", url + "/assets/app.js"):
+            with urllib.request.urlopen(target) as resp:  # noqa: S310  # nosec B310
+                assert resp.headers.get("Set-Cookie") is None, target
 
-        # A wrong token is likewise refused the capability.
-        with urllib.request.urlopen(f"{url}/?token=wrong") as resp:  # noqa: S310  # nosec B310
-            assert resp.headers.get("Set-Cookie") is None
-
-        # Only the correct bootstrap token mints the session cookie.
-        with urllib.request.urlopen(f"{url}/?token={token}") as resp:  # noqa: S310  # nosec B310
+        # A successful sign-in mints the hardened login cookie.
+        body = json.dumps({"username": "alice", "password": "pw-correct-horse"}).encode()
+        req = urllib.request.Request(  # noqa: S310 - localhost test server
+            url + "/api/login",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
             cookie = str(resp.headers.get("Set-Cookie", ""))
-        assert f"{_cookie_name(url)}=" in cookie
+        assert f"{_login_cookie_name(url)}=" in cookie
         assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
-
-        # Static assets never carry it.
-        with urllib.request.urlopen(url + "/assets/app.js") as resp:  # noqa: S310  # nosec B310
-            assert resp.headers.get("Set-Cookie") is None
     finally:
         httpd.shutdown()
         httpd.server_close()
 
 
-def test_unauthorized_client_cannot_acquire_capability(
+def test_unauthenticated_client_cannot_steer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir = _make_run(tmp_path, "exposed", status="running", end_time=None)
@@ -464,19 +492,20 @@ def test_unauthorized_client_cannot_acquire_capability(
         delivered.append((agent_id, message))
         return True
 
-    httpd, url, _ = serve(run_dir, open_browser=False, steer_handler=handler)
+    httpd, url, _ = serve(
+        run_dir, open_browser=False, steer_handler=handler, login=_login_manager()
+    )
     try:
-        # A direct network client can reach the page but is handed no capability,
-        # so replaying an empty/guessed cookie cannot steer a live scan.
-        with urllib.request.urlopen(url + "/") as resp:  # noqa: S310  # nosec B310
-            assert resp.headers.get("Set-Cookie") is None
-        status, _ = _post(
-            url,
-            "/api/agents/steer",
-            {"agent_id": "root", "message": "pwn"},
-            cookie=f"{_cookie_name(url)}=",
-        )
-        assert status == 403
+        # A direct network client reaches the page but, without signing in, holds
+        # no login cookie -- a forged/garbage one cannot steer a live scan.
+        for cookie in (None, f"{_login_cookie_name(url)}=", f"{_login_cookie_name(url)}=garbage"):
+            status, _ = _post(
+                url,
+                "/api/agents/steer",
+                {"agent_id": "root", "message": "pwn"},
+                cookie=cookie,
+            )
+            assert status == 403
         assert delivered == []
     finally:
         httpd.shutdown()
@@ -487,12 +516,12 @@ def test_run_data_requires_session(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     run_dir = _make_run(tmp_path, "private", status="completed", end_time="2026-01-01T00:00:00Z")
     _bundle(tmp_path, monkeypatch)
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         for path in ("/api/run", "/api/vulnerabilities", "/api/report", "/api/transcript"):
             assert _get_status(url + path) == 403, path
-            assert _get_status(url + path, cookie=f"{_cookie_name(url)}=wrong") == 403, path
+            assert _get_status(url + path, cookie=f"{_login_cookie_name(url)}=wrong") == 403, path
             assert _get_status(url + path, cookie=cookie) == 200, path
     finally:
         httpd.shutdown()
@@ -508,9 +537,9 @@ def test_auth_status_reflects_expiry(tmp_path: Path, monkeypatch: pytest.MonkeyP
     verified = {"value": True}
     monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: verified["value"])
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         _, _, body = _get(f"{url}/api/auth/status", cookie=cookie)
         assert json.loads(body) == {"verified": True, "email": "a@b.com"}
 
@@ -534,7 +563,7 @@ def test_auth_mutations_require_session(tmp_path: Path, monkeypatch: pytest.Monk
     forgotten = {"value": False}
     monkeypatch.setattr("strix.interface.viewer.auth.forget", lambda: forgotten.update(value=True))
 
-    httpd, url, _ = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
         for path in ("/api/auth/forget", "/api/auth/otp/start", "/api/auth/otp/verify"):
             status, _ = _post(url, path, {"email": "a@b.com", "code": "123456"})
@@ -555,7 +584,9 @@ def test_steer_requires_session_cookie(tmp_path: Path, monkeypatch: pytest.Monke
         delivered.append((agent_id, message))
         return True
 
-    httpd, url, token = serve(run_dir, open_browser=False, steer_handler=handler)
+    httpd, url, _ = serve(
+        run_dir, open_browser=False, steer_handler=handler, login=_login_manager()
+    )
     try:
         body = {"agent_id": "root", "message": "focus on auth"}
         # No cookie: rejected before reaching the live coordinator.
@@ -563,8 +594,8 @@ def test_steer_requires_session_cookie(tmp_path: Path, monkeypatch: pytest.Monke
         assert status == 403
         assert delivered == []
 
-        # With the session cookie the message is delivered.
-        status, raw = _post(url, "/api/agents/steer", body, cookie=_session_cookie(url, token))
+        # With the login cookie the message is delivered.
+        status, raw = _post(url, "/api/agents/steer", body, cookie=_login_cookie(url))
         assert status == 200
         assert json.loads(raw)["ok"] is True
         assert delivered == [("root", "focus on auth")]
@@ -584,7 +615,7 @@ def test_report_send_requires_session_cookie(
         "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
     )
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
         # No cookie: forbidden before the machine token is ever consulted.
         status, _ = _post(url, "/api/report/send", {})
@@ -593,7 +624,7 @@ def test_report_send_requires_session_cookie(
         # With the cookie the request clears the session gate; it then reaches
         # the run resolver, so an unknown run is a 404 rather than a 403.
         status, _ = _post(
-            url, "/api/report/send", {"run": "does-not-exist"}, cookie=_session_cookie(url, token)
+            url, "/api/report/send", {"run": "does-not-exist"}, cookie=_login_cookie(url)
         )
         assert status == 404
     finally:
@@ -610,9 +641,9 @@ def test_report_send_rejects_live_run(tmp_path: Path, monkeypatch: pytest.Monkey
         "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
     )
 
-    httpd, url, token = serve(run_dir, open_browser=False)
+    httpd, url, _ = serve(run_dir, open_browser=False, login=_login_manager())
     try:
-        status, _ = _post(url, "/api/report/send", {}, cookie=_session_cookie(url, token))
+        status, _ = _post(url, "/api/report/send", {}, cookie=_login_cookie(url))
         assert status == 409
     finally:
         httpd.shutdown()
@@ -630,14 +661,14 @@ def test_historical_run_data_requires_session_only(
     # longer consulted for browsing history: only the session capability is.
     monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: False)
 
-    httpd, url, token = serve(launched, open_browser=False)
+    httpd, url, _ = serve(launched, open_browser=False, login=_login_manager())
     try:
-        # The launched run needs the session capability, but not email verification.
+        # The launched run needs the login session, but not email verification.
         assert _get_status(f"{url}/api/run") == 403
-        cookie = _session_cookie(url, token)
+        cookie = _login_cookie(url)
         assert _get_status(f"{url}/api/run", cookie=cookie) == 200
 
-        # A different run still needs the session capability first: a cookie-less
+        # A different run still needs the login session first: a cookie-less
         # caller is forbidden.
         assert _get_status(f"{url}/api/run?run=other") == 403
 
@@ -665,7 +696,7 @@ def test_runs_list_requires_session_only(
         with urllib.request.urlopen(req) as resp:  # noqa: S310 - localhost test server  # nosec B310
             return dict(json.loads(resp.read()))
 
-    httpd, url, token = serve(launched, open_browser=False)
+    httpd, url, _ = serve(launched, open_browser=False, login=_login_manager())
     try:
         # A cookie-less caller only sees the teaser count, never the run entries.
         payload = _runs(None)
@@ -673,8 +704,8 @@ def test_runs_list_requires_session_only(
         assert payload["count"] == 2
         assert payload["runs"] == []
 
-        # With the session cookie the entries unlock -- no email verification.
-        payload = _runs(_session_cookie(url, token))
+        # With the login cookie the entries unlock -- no email verification.
+        payload = _runs(_login_cookie(url))
         assert payload["locked"] is False
         assert {r["name"] for r in payload["runs"]} == {"launched", "other"}  # type: ignore[attr-defined]
     finally:
@@ -685,43 +716,34 @@ def test_runs_list_requires_session_only(
 def test_concurrent_servers_use_distinct_cookies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cookies are host-scoped, not port-scoped: two viewers on 127.0.0.1 must
-    not share a cookie slot, and one server's cookie must not pass the other's
-    session gate."""
+    """Login cookies are port-suffixed, so two viewers on 127.0.0.1 do not share
+    a cookie slot, and one server's login cookie must not pass the other's gate."""
     run_a = _make_run(tmp_path / "a", "run-a", status="running", end_time=None)
     run_b = _make_run(tmp_path / "b", "run-b", status="running", end_time=None)
     _bundle(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "strix.interface.viewer.auth.read_auth", lambda: {"email": "a@b.com", "token": "t"}
-    )
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: True)
 
-    httpd_a, url_a, token_a = serve(run_a, open_browser=False)
-    httpd_b, url_b, token_b = serve(run_b, open_browser=False)
+    httpd_a, url_a, _ = serve(run_a, open_browser=False, login=_login_manager())
+    httpd_b, url_b, _ = serve(run_b, open_browser=False, login=_login_manager())
     try:
-        cookie_a = _session_cookie(url_a, token_a)
-        cookie_b = _session_cookie(url_b, token_b)
+        cookie_a = _login_cookie(url_a)
+        cookie_b = _login_cookie(url_b)
 
         # The two servers mint differently named cookies, so a browser stores both.
-        assert cookie_a.split("=", 1)[0] == _cookie_name(url_a)
-        assert cookie_b.split("=", 1)[0] == _cookie_name(url_b)
+        assert cookie_a.split("=", 1)[0] == _login_cookie_name(url_a)
+        assert cookie_b.split("=", 1)[0] == _login_cookie_name(url_b)
         assert cookie_a.split("=", 1)[0] != cookie_b.split("=", 1)[0]
 
-        def _status(url: str, cookie: str) -> dict[str, object]:
-            _, _, body = _get(f"{url}/api/auth/status", cookie=cookie)
-            return dict(json.loads(body))
-
-        # Each server honors its own cookie...
-        assert _status(url_a, cookie_a)["verified"] is True
-        assert _status(url_b, cookie_b)["verified"] is True
+        # Each server honors its own login cookie...
+        assert _get_status(f"{url_a}/api/run", cookie=cookie_a) == 200
+        assert _get_status(f"{url_b}/api/run", cookie=cookie_b) == 200
         # ...but treats the other server's cookie as session-less.
-        assert _status(url_a, cookie_b)["verified"] is False
-        assert _status(url_b, cookie_a)["verified"] is False
+        assert _get_status(f"{url_a}/api/run", cookie=cookie_b) == 403
+        assert _get_status(f"{url_b}/api/run", cookie=cookie_a) == 403
         # Even both cookies together (what a real browser would send) only
         # match the token minted by the receiving server.
         both = f"{cookie_a}; {cookie_b}"
-        assert _status(url_a, both)["verified"] is True
-        assert _status(url_b, both)["verified"] is True
+        assert _get_status(f"{url_a}/api/run", cookie=both) == 200
+        assert _get_status(f"{url_b}/api/run", cookie=both) == 200
     finally:
         httpd_a.shutdown()
         httpd_a.server_close()

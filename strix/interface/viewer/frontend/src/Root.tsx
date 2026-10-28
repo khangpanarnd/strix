@@ -2,19 +2,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import App, { type View } from "@/App";
 import { LandingPage } from "@/landing/LandingPage";
 import { LoginPage } from "@/landing/LoginPage";
+import { ChangePasswordPage } from "@/landing/ChangePasswordPage";
 import { fetchLoginStatus, signOut } from "@/data/loginSource";
 
 /**
  * Decides what the browser sees:
  *
- *   landing  ──"Scan your project"──▶  login  ──signed in──▶  app (New scan)
+ *   landing ─"Scan"─▶ login ─signed in─▶ [change password] ─▶ app (New scan)
  *      ▲                                                          │
  *      └──────────────────────── Sign out ◀───────────────────────┘
  *
  * The server is the authority. This component only reads `/api/login/status` to
  * choose a stage; it never decides who is allowed in, so tampering with it in
  * the browser cannot unlock anything: every data request is checked again by
- * the server.
+ * the server. The change-password step is forced on first sign-in with the
+ * shipped default account and cannot be skipped — the server keeps data locked
+ * until the password is replaced.
  *
  * - A browser that is already signed in (e.g. after a page refresh) goes straight
  *   to the app rather than back to the landing page.
@@ -23,7 +26,10 @@ import { fetchLoginStatus, signOut } from "@/data/loginSource";
  * - An unreadable status (network blip) is "unknown", never "signed out".
  */
 
-type Stage = "checking" | "landing" | "login" | "app";
+type Stage = "checking" | "landing" | "login" | "change-password" | "app";
+
+/** The shipped default password, offered as a prefill on the forced-change step. */
+const DEFAULT_PASSWORD = "admin";
 
 /** How often the app re-checks that the session is still valid. */
 const SESSION_CHECK_MS = 30_000;
@@ -42,7 +48,11 @@ export default function Root() {
     const controller = new AbortController();
     void fetchLoginStatus(controller.signal).then((status) => {
       if (controller.signal.aborted) return;
-      if (status?.authenticated) {
+      if (status?.mustChangePassword) {
+        setUsername(status.username);
+        setLoginRequired(true);
+        setStage("change-password");
+      } else if (status?.authenticated) {
         setUsername(status.username);
         setLoginRequired(status.loginRequired);
         setStage("app");
@@ -65,7 +75,11 @@ export default function Root() {
   // "Scan your project": go to sign-in, or straight to the scanner if already allowed in.
   const handleScan = useCallback(async () => {
     const status = await fetchLoginStatus();
-    if (status?.authenticated) {
+    if (status?.mustChangePassword) {
+      setUsername(status.username);
+      setLoginRequired(true);
+      setStage("change-password");
+    } else if (status?.authenticated) {
       setLoginRequired(status.loginRequired);
       enterApp(status.username, "launch");
     } else if (status && !status.loginRequired) {
@@ -79,12 +93,23 @@ export default function Root() {
   }, [enterApp]);
 
   const handleSignedIn = useCallback(
-    (name: string) => {
+    (name: string, mustChangePassword: boolean) => {
       setLoginRequired(true);
-      enterApp(name, "launch");
+      setUsername(name);
+      if (mustChangePassword) {
+        setNotice(null);
+        setStage("change-password");
+      } else {
+        enterApp(name, "launch");
+      }
     },
     [enterApp]
   );
+
+  const handleChanged = useCallback(() => {
+    setNotice(null);
+    enterApp(username, "launch");
+  }, [enterApp, username]);
 
   const handleSignOut = useCallback(async () => {
     await signOut();
@@ -138,6 +163,16 @@ export default function Root() {
           setNotice(null);
           setStage("landing");
         }}
+      />
+    );
+  }
+  if (stage === "change-password") {
+    return (
+      <ChangePasswordPage
+        username={username}
+        suggestedCurrent={DEFAULT_PASSWORD}
+        onChanged={handleChanged}
+        onCancel={() => void handleSignOut()}
       />
     );
   }
