@@ -711,17 +711,55 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             return value if value >= 0 else None
 
         def _origin_ok(self) -> bool:
-            """Enforce the Origin/Host rule (BR-2).
+            """Enforce the Origin/Host rule (BR-2), a CSRF guard.
 
-            When ``Origin`` is present it must equal the viewer's own origin (with
-            loopback aliases accepted only when the viewer is bound to loopback).
-            When absent, ``Host`` must equal the bound ``host:port``.
+            When ``Origin`` is present its scheme+host+port must match the host
+            the browser actually reached us on. For a fixed bind that is the
+            bound ``host:port`` (with loopback aliases). For a wildcard bind
+            (``0.0.0.0`` / ``::``) the viewer is reachable on many addresses, so
+            we accept any address as long as the request's ``Origin`` and
+            ``Host`` agree on it and the port matches the bound port -- a
+            cross-site page's Origin still would not match the Host, so the CSRF
+            guard holds. When ``Origin`` is absent, ``Host`` must be acceptable.
             """
             origin = self.headers.get("Origin")
             if origin is not None:
-                return origin in self._acceptable_origins()
+                if origin in self._acceptable_origins():
+                    return True
+                return self._wildcard_origin_matches_host(origin)
             host = (self.headers.get("Host") or "").strip()
-            return host in self._acceptable_hosts()
+            if host in self._acceptable_hosts():
+                return True
+            return self._is_wildcard_bind() and self._host_port_matches(host)
+
+        def _is_wildcard_bind(self) -> bool:
+            return state.bound_host in ("0.0.0.0", "::", "")
+
+        def _bound_port(self) -> str:
+            _, _, port = self._bound_hostport().partition(":")
+            return port
+
+        def _host_port_matches(self, hostport: str) -> bool:
+            """True when ``hostport`` names a non-empty host on the bound port."""
+            host, _, port = hostport.strip().partition(":")
+            return bool(host) and port == self._bound_port()
+
+        def _wildcard_origin_matches_host(self, origin: str) -> bool:
+            """For a wildcard bind, accept when Origin == the request's own Host.
+
+            The browser sends both; if a real cross-site page forged the request
+            its ``Origin`` would be its own site, which cannot equal the ``Host``
+            of this server, so this stays a valid CSRF check.
+            """
+            if not self._is_wildcard_bind():
+                return False
+            origin_hostport = origin.split("://", 1)[-1] if "://" in origin else ""
+            host = (self.headers.get("Host") or "").strip()
+            return (
+                bool(origin_hostport)
+                and origin_hostport == host
+                and self._host_port_matches(origin_hostport)
+            )
 
         def _bound_hostport(self) -> str:
             """The viewer's bound ``host:port`` parsed from its origin."""
