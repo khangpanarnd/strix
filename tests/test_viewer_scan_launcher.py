@@ -201,6 +201,18 @@ def test_argv_omits_instruction_when_absent(tmp_path: Path) -> None:
     assert not any(a.startswith("--instruction=") for a in spawned[0].argv)
 
 
+def test_argv_omits_budget_when_unlimited(tmp_path: Path) -> None:
+    # A None budget ("no limit") must not emit a --max-budget flag; the child
+    # then runs uncapped like a CLI run with the flag omitted.
+    launcher, spawned = _make_launcher(tmp_path / "strix_runs")
+    (tmp_path / "strix_runs").mkdir()
+    launcher.launch(_request(max_budget_usd=None))
+    assert not any(a.startswith("--max-budget") for a in spawned[0].argv)
+    # The other flags are still present and intact.
+    assert "--scan-mode=quick" in spawned[0].argv
+    assert any(a.startswith("--run-name=") for a in spawned[0].argv)
+
+
 def test_run_name_is_web_prefixed_hex(tmp_path: Path) -> None:
     launcher, _ = _make_launcher(tmp_path / "strix_runs")
     (tmp_path / "strix_runs").mkdir()
@@ -340,6 +352,66 @@ def test_exit_code_mapping(tmp_path: Path, exit_code: int, expected: ScanState) 
     assert status["state"] == expected.value
     assert status["exit_code"] == exit_code
     assert status["stoppable"] is False
+
+
+# --- snapshot (read-only view for observers) --------------------------------
+
+
+def test_snapshot_reports_live_child_without_instruction(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    run_name = launcher.launch(_request(instruction="SECRET-INSTRUCTION-TEXT"))
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.run_name == run_name
+    assert snap.target == "https://example.com"
+    assert snap.mode == "quick"
+    assert snap.state == ScanState.STARTING.value
+    assert snap.exit_code is None
+    assert "SECRET-INSTRUCTION-TEXT" not in repr(snap)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected"),
+    [(0, ScanState.FINISHED), (2, ScanState.FINISHED), (1, ScanState.FAILED)],
+)
+def test_snapshot_folds_an_exited_child_into_its_terminal_state(
+    tmp_path: Path, exit_code: int, expected: ScanState
+) -> None:
+    # No status() call: snapshot() itself must reap, since the notification
+    # service never polls /api/scans/status.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, spawned = _make_launcher(runs)
+    launcher.launch(_request())
+    spawned[0].finish(exit_code)
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.state == expected.value
+    assert snap.exit_code == exit_code
+
+
+def test_snapshot_reports_a_requested_stop_as_stopped(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, spawned = _make_launcher(runs)
+    run_name = launcher.launch(_request())
+    launcher.stop(run_name)
+    spawned[0].finish(-2)
+
+    (snap,) = launcher.snapshot()
+
+    assert snap.state == ScanState.STOPPED.value
+
+
+def test_snapshot_is_empty_before_any_launch(tmp_path: Path) -> None:
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    assert launcher.snapshot() == []
 
 
 def test_status_unknown_for_non_launched_run(tmp_path: Path) -> None:
@@ -511,6 +583,20 @@ def test_audit_line_excludes_instruction(tmp_path: Path, caplog: pytest.LogCaptu
     assert "93.184.216.34" in audit
 
 
+def test_audit_line_reports_unlimited_budget_as_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A None budget must render as budget=none in the audit line rather than
+    # raising on %g formatting.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, _ = _make_launcher(runs)
+    with caplog.at_level("INFO", logger="strix.interface.viewer.scan_launcher"):
+        launcher.launch(_request(max_budget_usd=None))
+    audit = "\n".join(record.message for record in caplog.records)
+    assert "budget=none" in audit
+
+
 class _NeverReapsPopen(FakePopen):
     """A child that survives kill(): wait() times out like a stuck process."""
 
@@ -542,3 +628,229 @@ def test_stop_forced_kill_skips_reconcile_when_child_not_reaped(tmp_path: Path) 
     assert stuck.killed is True
     record = json.loads((runs / run_name / "run.json").read_text(encoding="utf-8"))
     assert record["status"] == "running"
+
+
+# --- Step 3.1: child_env_builder + pre_launch_check hooks (FR-16..FR-18, NFR-5) ---
+
+
+def _make_launcher_with_hooks(
+    runs_dir: Path,
+    *,
+    child_env_builder: Any = None,
+    pre_launch_check: Any = None,
+    processes: list[FakePopen] | None = None,
+    clock: FakeClock | None = None,
+) -> tuple[ScanLauncher, list[FakePopen]]:
+    """Like ``_make_launcher`` but also wires the two settings-store hooks."""
+    spawned: list[FakePopen] = []
+    pending = list(processes or [])
+
+    def popen(argv: list[str], **kwargs: Any) -> FakePopen:
+        proc = pending.pop(0) if pending else FakePopen(argv, **kwargs)
+        proc.argv = argv
+        proc.kwargs = kwargs
+        spawned.append(proc)
+        return proc
+
+    launcher = ScanLauncher(
+        runs_dir,
+        LIMITS,
+        popen=popen,
+        clock=clock or FakeClock(),
+        resolver=_ok_resolver,
+        classifier=_web_classifier,
+        environ={"PATH": "/usr/bin", "STRIX_LLM": "shell-model", "LLM_API_KEY": "shell-key"},
+        child_env_builder=child_env_builder,
+        pre_launch_check=pre_launch_check,
+    )
+    return launcher, spawned
+
+
+def test_child_env_builder_called_per_spawn_sees_change_between_launches(tmp_path: Path) -> None:
+    # FR-17/NFR-5: the builder is evaluated at EACH spawn, so a settings change
+    # made between two launches is picked up by the next one with no restart.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    state = {"MODEL": "first"}
+    calls: list[dict[str, str]] = []
+
+    def builder(_base: Any) -> dict[str, str]:
+        # Snapshot the mutable state at call time; this is what proves the
+        # builder runs per spawn, not once at start-up.
+        env = {"PATH": "/usr/bin", "STRIX_LLM": state["MODEL"]}
+        calls.append(env)
+        return env
+
+    launcher, spawned = _make_launcher_with_hooks(runs, child_env_builder=builder)
+
+    first = launcher.launch(_request())
+    spawned[0].finish(0)
+    launcher.status(first)  # fold into FINISHED so the slot frees
+
+    state["MODEL"] = "second"  # a save happened between the two launches
+    launcher.launch(_request())
+
+    assert len(calls) == 2
+    assert spawned[0].kwargs["env"]["STRIX_LLM"] == "first"
+    assert spawned[1].kwargs["env"]["STRIX_LLM"] == "second"
+
+
+def test_child_env_builder_stripped_vars_absent_from_child_env(tmp_path: Path) -> None:
+    # FR-16: a managed builder removes the LLM variables; the fake child's env
+    # (what we passed to Popen) must not contain them. The builder receives the
+    # live os.environ, so we seed and strip a probe variable on it.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+
+    def builder(base: Any) -> dict[str, str]:
+        strip = {"STRIX_LLM", "LLM_API_KEY", "STRIX_STRIP_PROBE"}
+        return {k: v for k, v in base.items() if k.upper() not in strip}
+
+    launcher, spawned = _make_launcher_with_hooks(runs, child_env_builder=builder)
+    os.environ["STRIX_STRIP_PROBE"] = "leak-me"
+    os.environ["STRIX_KEPT_PROBE"] = "keep-me"
+    try:
+        launcher.launch(_request())
+    finally:
+        os.environ.pop("STRIX_STRIP_PROBE", None)
+        os.environ.pop("STRIX_KEPT_PROBE", None)
+
+    env = spawned[0].kwargs["env"]
+    assert "STRIX_LLM" not in env
+    assert "LLM_API_KEY" not in env
+    assert "STRIX_STRIP_PROBE" not in env
+    assert env["STRIX_KEPT_PROBE"] == "keep-me"
+
+
+def test_child_env_builder_reads_os_environ_at_call_time(tmp_path: Path) -> None:
+    # The builder receives os.environ (read at the spawn), not the launcher's
+    # start-up snapshot, so it can strip whatever the process currently holds.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    seen: list[str] = []
+
+    def builder(base: Any) -> dict[str, str]:
+        seen.append(base.get("STRIX_HOOK_PROBE", "<unset>"))
+        return {"PATH": base.get("PATH", "")}
+
+    launcher, _ = _make_launcher_with_hooks(runs, child_env_builder=builder)
+    os.environ["STRIX_HOOK_PROBE"] = "live-value"
+    try:
+        launcher.launch(_request())
+    finally:
+        os.environ.pop("STRIX_HOOK_PROBE", None)
+
+    assert seen == ["live-value"]
+
+
+def test_no_builder_passes_through_start_up_environ(tmp_path: Path) -> None:
+    # FR-18: with no builder the child gets the launcher's start-up environ
+    # exactly as before this feature.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    launcher, spawned = _make_launcher_with_hooks(runs, child_env_builder=None)
+    launcher.launch(_request())
+
+    env = spawned[0].kwargs["env"]
+    assert env["STRIX_LLM"] == "shell-model"
+    assert env["LLM_API_KEY"] == "shell-key"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_pre_launch_check_refusal_means_no_spawn_and_no_active_child(tmp_path: Path) -> None:
+    # DD-9/BR-36: a refused pre-launch check raises its LaunchError unchanged and
+    # nothing is spawned, so no child is registered or left active.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+
+    def refuse() -> None:
+        raise LaunchError("llm_base_blocked", "the saved base resolves to metadata", status=400)
+
+    launcher, spawned = _make_launcher_with_hooks(runs, pre_launch_check=refuse)
+
+    with pytest.raises(LaunchError) as exc:
+        launcher.launch(_request())
+    assert exc.value.code == "llm_base_blocked"
+    assert exc.value.status == 400
+    assert spawned == []
+    assert launcher.active_run() is None
+
+
+def test_pre_launch_check_refusal_does_not_consume_a_rate_slot(tmp_path: Path) -> None:
+    # The check runs before the rate limit is recorded, so repeated refusals do
+    # not exhaust the window: a later allowed launch still succeeds.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    blocked = {"on": True}
+
+    def maybe_refuse() -> None:
+        if blocked["on"]:
+            raise LaunchError("llm_base_blocked", "blocked", status=400)
+
+    launcher, spawned = _make_launcher_with_hooks(runs, pre_launch_check=maybe_refuse)
+
+    # Ten refusals: if any had consumed a rate slot, the 6th+ would turn into
+    # rate_limited instead of llm_base_blocked.
+    for _ in range(10):
+        with pytest.raises(LaunchError) as exc:
+            launcher.launch(_request())
+        assert exc.value.code == "llm_base_blocked"
+
+    blocked["on"] = False
+    run_name = launcher.launch(_request())
+    assert run_name.startswith("web-")
+    assert len(spawned) == 1
+
+
+def test_pre_launch_check_runs_before_the_spawn(tmp_path: Path) -> None:
+    # A passing check does not block a normal launch, and it is invoked exactly
+    # once per launch.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    calls = {"n": 0}
+
+    def ok() -> None:
+        calls["n"] += 1
+
+    launcher, spawned = _make_launcher_with_hooks(runs, pre_launch_check=ok)
+    launcher.launch(_request())
+    assert calls["n"] == 1
+    assert len(spawned) == 1
+
+
+def test_builder_exception_fails_launch_with_spawn_failed(tmp_path: Path) -> None:
+    # Documented decision: a builder failure FAILS the launch (spawn_failed, 500)
+    # rather than falling back to the unstripped viewer environment, which would
+    # leak the very secrets the strip set removes (FR-16).
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+
+    def broken_builder(_base: Any) -> dict[str, str]:
+        raise RuntimeError("store read blew up")
+
+    launcher, spawned = _make_launcher_with_hooks(runs, child_env_builder=broken_builder)
+
+    with pytest.raises(LaunchError) as exc:
+        launcher.launch(_request())
+    assert exc.value.code == "spawn_failed"
+    assert exc.value.status == 500
+    assert spawned == []
+    assert launcher.active_run() is None
+
+
+def test_builder_launch_error_propagates_unchanged(tmp_path: Path) -> None:
+    # A LaunchError the store raises (e.g. config_unreadable) keeps its own code
+    # and status; it is not re-wrapped as spawn_failed.
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+
+    def builder(_base: Any) -> dict[str, str]:
+        raise LaunchError("config_unreadable", "existing file is not valid JSON", status=409)
+
+    launcher, spawned = _make_launcher_with_hooks(runs, child_env_builder=builder)
+
+    with pytest.raises(LaunchError) as exc:
+        launcher.launch(_request())
+    assert exc.value.code == "config_unreadable"
+    assert exc.value.status == 409
+    assert spawned == []

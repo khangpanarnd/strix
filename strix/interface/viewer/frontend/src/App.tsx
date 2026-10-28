@@ -3,12 +3,7 @@ import {
   ArrowLeft,
   AlertCircle,
   Bot,
-  Mail,
   ChevronDown,
-  Radar,
-  Rocket,
-  ArrowUpRight,
-  Building2,
   History,
 } from "lucide-react";
 import type { Vulnerability, VulnerabilitySeverity } from "@/types/issues";
@@ -21,53 +16,68 @@ import AgentGraph from "@/components/live/AgentGraph";
 import { buildGraphAgents } from "@/components/live/AgentTranscript";
 import AgentDetailModal from "@/components/live/AgentDetailModal";
 import { ScanPromptComposer } from "@/components/live/ScanPromptComposer";
+import { ServerLogPanel } from "@/components/live/ServerLogPanel";
 import { severityCounts, type ParsedRunSummary } from "@/lib/local-run-parser";
 import {
   fetchAll,
-  fetchAuthStatus,
   fetchCapabilities,
   fetchRunSummary,
   fetchRuns,
   fetchTranscript,
   fetchVulnerabilities,
-  forgetAuth,
   parseMcpConnectionStatus,
-  type AuthStatus,
   type LoadedRun,
   type RunsPayload,
   type ScanLimits,
 } from "@/data/serverSource";
-import { SIGNUP_URL, DEMO_URL, ctaUrl, trackCta } from "@/lib/cta";
 import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
 import PastRunsView from "@/components/PastRunsView";
-import EmailReportView from "@/components/EmailReportView";
 import { RunDetails } from "@/components/RunDetails";
+import { ScanTimeline } from "@/components/ScanTimeline";
+import { SystemIntro } from "@/components/SystemIntro";
 import { TrustToast } from "@/components/TrustToast";
-import FeedbackView from "@/components/FeedbackView";
-import { ProInlineCta } from "@/components/ProCta";
+
 import { LaunchView } from "@/components/launch/LaunchView";
 import { StopScanButton } from "@/components/launch/StopScanButton";
 import { ReportDownloads } from "@/components/launch/ReportDownloads";
+import SettingsView from "@/components/settings/SettingsView";
+import NotificationsPage from "@/components/notifications/NotificationsView";
 
-export type View = "overview" | "issues" | "agents" | "history" | "email" | "feedback" | "launch";
+export type View =
+  | "overview"
+  | "lastscan"
+  | "issues"
+  | "agents"
+  | "history"
+  | "launch"
+  | "settings"
+  | "notifications";
 
 const TRUST_BANNER =
-  "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by Strix.";
+  "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by P-hacker Strix Agents.";
 
 const SEVERITY_ORDER: VulnerabilitySeverity[] = ["critical", "high", "medium", "low"];
 const POLL_MS = 500;
 
-export default function App() {
+export interface AppProps {
+  /**
+   * The view to open on first render (the landing page's "Scan your project" opens
+   * the New scan form). Without it the app opens on Overview and picks a default
+   * from the run, as before.
+   */
+  entryView?: View;
+  /** The signed-in account, when the viewer requires sign-in; enables "Sign out". */
+  account?: { username: string; onSignOut: () => void };
+}
+
+export default function App({ entryView, account }: AppProps = {}) {
   const [activeRun, setActiveRun] = useState<string | null>(null);
   const [run, setRun] = useState<LoadedRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("overview");
-  const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [view, setView] = useState<View>(entryView ?? "overview");
   const [runs, setRuns] = useState<RunsPayload | null>(null);
-  const [emailPurpose, setEmailPurpose] = useState<"report" | "verify">("report");
-  const [emailSkipDisclosure, setEmailSkipDisclosure] = useState(false);
   // Whether this viewer can steer a live scan (true only inside the in-TUI
   // launcher that shares the running scan's coordinator + event loop).
   const [canSteer, setCanSteer] = useState(false);
@@ -78,17 +88,15 @@ export default function App() {
   const [scanLaunchAvailable, setScanLaunchAvailable] = useState(false);
   const [scanLimits, setScanLimits] = useState<ScanLimits | null>(null);
   const [initialRun, setInitialRun] = useState(true);
+  // Whether the LLM Settings page is offered (loopback or not). Read once from
+  // capabilities; the Sidebar shows the entry only when available.
+  const [llmSettingsAvailable, setLlmSettingsAvailable] = useState(false);
+  // Whether the Notifications page is offered; also read once from capabilities.
+  const [notificationsAvailable, setNotificationsAvailable] = useState(false);
   // Resolved once capabilities land, so the no-run guard only fires after we
   // actually know whether a run exists.
   const [capsLoaded, setCapsLoaded] = useState(false);
 
-  const refreshAuth = useCallback(async () => {
-    try {
-      setAuth(await fetchAuthStatus());
-    } catch {
-      /* auth status is best-effort; the launched run stays viewable */
-    }
-  }, []);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -99,7 +107,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void refreshAuth();
     void refreshRuns();
     // Capabilities never change over a session, so fetch once on mount.
     fetchCapabilities()
@@ -108,6 +115,8 @@ export default function App() {
         setScanLaunchAvailable(caps.scan_launch_available);
         setScanLimits(caps.scan_limits);
         setInitialRun(caps.initial_run);
+        setLlmSettingsAvailable(caps.llm_settings.available);
+        setNotificationsAvailable(caps.notifications.available);
         // Empty workspace in launch mode: open the launch view straight away
         // rather than spinning on a run that does not exist yet.
         if (caps.scan_launch_available && !caps.initial_run) {
@@ -118,7 +127,7 @@ export default function App() {
         /* absence of steering is the safe default */
       })
       .finally(() => setCapsLoaded(true));
-  }, [refreshAuth, refreshRuns]);
+  }, [refreshRuns]);
 
   // Live polling, scoped to the active run. Re-runs when the active run changes
   // so switching to a past run (?run=<name>) reloads its data; a finished run
@@ -200,7 +209,10 @@ export default function App() {
   );
   const selected = run?.vulnerabilities.find((v) => v.id === selectedId) ?? null;
   const agentCount = run?.transcript.agents.length ?? 0;
-  const verified = auth?.verified === true;
+  // The Agents page also carries the server log, which matters most before the
+  // first agent exists (image pull, sandbox start, a slow first model reply), so
+  // it is offered for any live scan, not only once agents have appeared.
+  const agentsAvailable = agentCount > 0 || (run !== null && !run.finished);
 
   // The run's persisted MCP roster (from run.json via /api/run), plus the set of
   // connections with a tool call currently in flight. "In use" is derived here
@@ -224,28 +236,35 @@ export default function App() {
   }, [run]);
 
   // Per-run guard for the default view: land on Agents while a scan is live,
-  // Overview once it finishes. Applied at most once per run and never once the
-  // user has navigated manually (userSetView flips the guard).
-  const initialViewAppliedRef = useRef(false);
+  // Last scan (the results) once it finishes. Overview is the run-independent
+  // product introduction and is never a run default. Applied at most once per
+  // run and never once the user has navigated manually (userSetView flips the
+  // guard).
+  // An explicit entry view (the landing page's "Scan your project") counts as the
+  // user having chosen a view, so the run's default must not override it.
+  const entryViewRef = useRef(entryView);
+  const initialViewAppliedRef = useRef(entryView !== undefined);
 
   // Reset the guard whenever the active run changes so the newly selected run
-  // gets its own default.
+  // gets its own default. Before any run is selected (activeRun is null), an
+  // entry view keeps the guard set. Derived from the ref rather than "skip the
+  // first call", so React StrictMode's double-invoked effects give the same result.
   useEffect(() => {
-    initialViewAppliedRef.current = false;
+    initialViewAppliedRef.current = activeRun === null && entryViewRef.current !== undefined;
   }, [activeRun]);
 
   useEffect(() => {
     if (initialViewAppliedRef.current || !run) return;
     if (run.finished) {
       initialViewAppliedRef.current = true;
-      setView("overview");
-    } else if (agentCount > 0) {
-      // Live and agents have appeared: default to the agent graph. If it is
-      // live but no agents exist yet, wait (do not apply, do not set the flag).
+      setView("lastscan");
+    } else {
+      // Live: default to Agents, which shows the agent graph and the server log
+      // (so there is something to watch even before the first agent appears).
       initialViewAppliedRef.current = true;
       setView("agents");
     }
-  }, [run, agentCount]);
+  }, [run]);
 
   // User-initiated navigation: mark the default guard applied so the per-run
   // default effect never yanks the user off the view they chose.
@@ -269,44 +288,55 @@ export default function App() {
     userSetView("launch");
   }, [userSetView]);
 
-  // A launch succeeded and the new run is watchable: select it and land on the
-  // overview, which immediately picks up the live-run defaults (Agents once
-  // agents appear). selectRun resets activeRun, which restarts the poll loop.
+  // A launch succeeded and the new run is watchable: select it and land on
+  // Last scan, which shows the new run's live details. selectRun resets
+  // activeRun, which restarts the poll loop.
   const onLaunched = useCallback(
     (runName: string) => {
       selectRun(runName);
-      userSetView("overview");
+      userSetView("lastscan");
     },
     [selectRun, userSetView]
   );
 
-  const goEmail = useCallback((skipDisclosure: boolean, surface: string) => {
-    trackCta("email_report", surface);
-    setEmailPurpose("report");
-    setEmailSkipDisclosure(skipDisclosure);
-    userSetView("email");
-  }, [userSetView]);
-
-  // Sidebar entry keeps the disclosure (first place those users see it);
-  const openEmail = useCallback(() => goEmail(false, "sidebar"), [goEmail]);
-  // the Overview CTA already states the tradeoff, so it starts the flow directly.
-  const openEmailFromOverview = useCallback(() => goEmail(true, "overview"), [goEmail]);
 
   const openHistory = useCallback(() => {
     void refreshRuns();
     userSetView("history");
   }, [refreshRuns, userSetView]);
 
-  const onPastRunsVerified = useCallback(async () => {
-    await refreshAuth();
-    await refreshRuns();
-  }, [refreshAuth, refreshRuns]);
+  // Open the LLM Settings page (Sidebar entry, or the launch error card's
+  // "Open Settings" link). Like the launch view, it needs no run.
+  const openSettings = useCallback(() => {
+    userSetView("settings");
+  }, [userSetView]);
 
-  const onForget = useCallback(async () => {
-    await forgetAuth();
-    await refreshAuth();
-    await refreshRuns();
-  }, [refreshAuth, refreshRuns]);
+  // Open the Notifications page (Sidebar entry). Needs no run.
+  const openNotifications = useCallback(() => {
+    userSetView("notifications");
+  }, [userSetView]);
+
+
+  // Tab strip for small screens, where the sidebar is hidden. Shared by the
+  // Overview (which needs no run) and the run-backed views.
+  const mobileTabs = (
+    <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
+      <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
+        Overview
+      </TabButton>
+      <TabButton active={view === "lastscan"} onClick={() => userSetView("lastscan")}>
+        Last scan
+      </TabButton>
+      <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
+        Issues{(run?.vulnerabilities.length ?? 0) > 0 ? ` (${run?.vulnerabilities.length})` : ""}
+      </TabButton>
+      {agentsAvailable && (
+        <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
+          Agents{agentCount > 0 ? ` (${agentCount})` : ""}
+        </TabButton>
+      )}
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-black text-white flex">
@@ -322,43 +352,42 @@ export default function App() {
         }}
         scanLaunchAvailable={scanLaunchAvailable}
         onOpenLaunch={openLaunch}
+        llmSettingsAvailable={llmSettingsAvailable}
+        onOpenSettings={openSettings}
+        notificationsAvailable={notificationsAvailable}
+        onOpenNotifications={openNotifications}
         issuesCount={run?.vulnerabilities.length ?? 0}
         agentCount={agentCount}
+        agentsAvailable={agentsAvailable}
         mcpConnections={mcpConnections}
         mcpInUse={mcpInUse}
         runCount={runs?.count ?? 0}
-        finished={run?.finished ?? false}
-        verified={verified}
-        email={auth?.email ?? null}
-        onOpenEmail={openEmail}
         onOpenHistory={openHistory}
-        onForget={() => void onForget()}
+        account={account}
       />
 
       <div className="flex-1 min-w-0">
         {/* Top bar */}
         <div className="border-b border-[#222]">
           <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-4 flex items-center gap-1.5">
-            <a
-              href={ctaUrl("https://app.strix.ai", "logo")}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={() => trackCta("logo", "topbar")}
-              className="flex items-center gap-1.5 opacity-90 transition-opacity hover:opacity-100 lg:hidden"
-              title="Open Strix Cloud"
-            >
-              <img src="./logo.png" alt="Strix" className="w-10 h-8 object-cover" />
-              <div className="text-base text-white font-medium tracking-tight">Strix</div>
-            </a>
-            {run && <LiveIndicator finished={run.finished} />}
+            <div className="flex items-center gap-1.5 opacity-90 lg:hidden">
+              <img src="./logo.png" alt="P-hacker Strix Agents" className="w-10 h-8 object-cover" />
+              <div className="text-base text-white font-medium tracking-tight">P-hacker Strix Agents</div>
+            </div>
+            {/* The Overview is the run-independent intro, so the finished-run
+                status text and report downloads are hidden there. A live scan's
+                indicator and Stop button stay visible on every view. */}
+            {run && !(view === "overview" && run.finished) && (
+              <LiveIndicator finished={run.finished} />
+            )}
             {activeRun && run && !run.finished && (
               <StopScanButton runName={activeRun} finished={run.finished} />
             )}
-            {activeRun && run && run.finished && (
+            {activeRun && run && run.finished && view !== "overview" && (
               <ReportDownloads runName={activeRun} finished={run.finished} />
             )}
             <div className="ml-auto flex items-center gap-3">
-              {verified && runs && !runs.locked && runs.runs.length > 0 && (
+              {runs && !runs.locked && runs.runs.length > 0 && (
                 <RunSwitcher
                   runs={runs}
                   activeRun={activeRun}
@@ -366,22 +395,12 @@ export default function App() {
                   onSelect={selectRun}
                 />
               )}
-              <a
-                href={ctaUrl(SIGNUP_URL, "run_in_cloud")}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => trackCta("run_in_cloud", "topbar")}
-                className="inline-flex items-center gap-1 rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-black transition-opacity hover:opacity-90"
-              >
-                Run in the cloud
-                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
-              </a>
             </div>
           </div>
         </div>
 
         <div className="max-w-[88rem] mx-auto px-3 sm:px-6 py-8 sm:py-12 space-y-6">
-          {error && !run && view !== "history" && view !== "email" && view !== "launch" && (
+          {error && !run && view !== "overview" && view !== "history" && view !== "launch" && view !== "settings" && view !== "notifications" && (
             <div className="rounded-lg px-4 py-3 flex gap-3 items-start border border-red-500/30 bg-red-500/5">
               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-400" aria-hidden="true" />
               <p className="text-sm text-red-300">{error}</p>
@@ -395,36 +414,36 @@ export default function App() {
             className="animate-page-in space-y-6"
           >
           {view === "launch" ? (
-            scanLimits ? (
+            !capsLoaded ? (
+              <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
+                <div className="w-6 h-6 mx-auto mb-3 rounded-full border-2 border-[#333] border-t-white animate-spin" />
+                <p className="text-sm text-[#888]">Loading…</p>
+              </div>
+            ) : scanLimits ? (
               <LaunchView
                 limits={scanLimits}
                 onLaunched={onLaunched}
                 onOpenRun={selectRun}
+                onOpenSettings={llmSettingsAvailable ? openSettings : undefined}
               />
             ) : (
               <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
                 <p className="text-sm text-[#888]">
                   Launching scans is not available in this viewer.
                 </p>
+                <p className="mt-2 text-sm text-[#666]">
+                  Start the viewer with{" "}
+                  <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[#aaa]">
+                    strix view --launch
+                  </code>{" "}
+                  to scan a project from the browser.
+                </p>
               </div>
             )
-          ) : view === "email" ? (
-            <EmailReportView
-              activeRun={activeRun}
-              auth={auth}
-              purpose={emailPurpose}
-              skipDisclosure={emailSkipDisclosure}
-              onAuthChanged={() => {
-                void refreshAuth();
-                void refreshRuns();
-              }}
-              onExit={(dest) => setView(dest === "history" ? "history" : "overview")}
-            />
-          ) : view === "feedback" ? (
-            <FeedbackView
-              defaultEmail={auth?.email ?? null}
-              onExit={(dest) => setView(dest)}
-            />
+          ) : view === "settings" ? (
+            <SettingsView />
+          ) : view === "notifications" ? (
+            <NotificationsPage />
           ) : view === "history" ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2">
@@ -435,8 +454,28 @@ export default function App() {
                 runs={runs}
                 activeRun={activeRun}
                 onSelectRun={selectRun}
-                onVerified={() => void onPastRunsVerified()}
               />
+            </div>
+          ) : view === "overview" ? (
+            <div className="space-y-6">
+              {mobileTabs}
+              <SystemIntro />
+            </div>
+          ) : !run && !error && activeRun === null && !initialRun ? (
+            <div
+              data-testid="no-scans-yet"
+              className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center"
+            >
+              <p className="text-sm text-[#888]">No scans yet.</p>
+              {scanLaunchAvailable && (
+                <button
+                  type="button"
+                  onClick={openLaunch}
+                  className="mt-4 inline-flex items-center rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-neutral-200"
+                >
+                  Start a new scan
+                </button>
+              )}
             </div>
           ) : !run && !error ? (
             <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
@@ -445,35 +484,20 @@ export default function App() {
             </div>
           ) : run && counts ? (
             <>
-              <SummaryHeader summary={run.summary} />
+              <SummaryHeader summary={run.summary} finished={run.finished} />
 
-              {/* Tab strip: shown on small screens where the sidebar is hidden. */}
-              <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
-                <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
-                  Pentest Overview
-                </TabButton>
-                <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
-                  Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
-                </TabButton>
-                {agentCount > 0 && (
-                  <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
-                    Agents ({agentCount})
-                  </TabButton>
-                )}
-              </div>
+              {mobileTabs}
 
-              {view === "overview" ? (
-                <OverviewTab
+              {view === "lastscan" ? (
+                <LastScanTab
                   summary={run.summary}
                   counts={counts}
                   total={run.vulnerabilities.length}
                   reportMarkdown={run.reportMarkdown}
                   raw={run.raw}
-                  finished={run.finished}
-                  onOpenEmail={openEmailFromOverview}
                 />
-              ) : view === "agents" && agentCount > 0 ? (
-                <AgentsTab run={run} canSteer={canSteer} />
+              ) : view === "agents" && agentsAvailable ? (
+                <AgentsTab run={run} canSteer={canSteer} runName={activeRun} />
               ) : selected ? (
                 <div className="space-y-4">
                   <button
@@ -580,30 +604,27 @@ function LiveIndicator({ finished }: { finished: boolean }) {
   );
 }
 
-function formatDuration(seconds: number | null): string | null {
-  if (seconds == null) return null;
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-function SummaryHeader({ summary }: { summary: ParsedRunSummary }) {
-  const duration = formatDuration(summary.durationSeconds);
+function SummaryHeader({ summary, finished }: { summary: ParsedRunSummary; finished: boolean }) {
   return (
-    <div>
-      <h1 className="text-2xl font-semibold text-white">
-        {runTitle(summary.targets[0] ?? null, summary.runName ?? summary.runId ?? "Pentest results")}
-      </h1>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[#888]">
-        {summary.targets.length > 0 && (
-          <span className="font-mono text-[#aaa]">{summary.targets.join(", ")}</span>
-        )}
-        {summary.scanMode && <Meta label={summary.scanMode} />}
-        {duration && <Meta label={duration} />}
-        {summary.status && <Meta label={summary.status} />}
+    <div className="space-y-4">
+      <div>
+        <h1 className="text-2xl font-semibold text-white">
+          {runTitle(summary.targets[0] ?? null, summary.runName ?? summary.runId ?? "Pentest results")}
+        </h1>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[#888]">
+          {summary.targets.length > 0 && (
+            <span className="font-mono text-[#aaa]">{summary.targets.join(", ")}</span>
+          )}
+          {summary.scanMode && <Meta label={summary.scanMode} />}
+          {summary.status && <Meta label={summary.status} />}
+        </div>
       </div>
+      <ScanTimeline
+        startTime={summary.startTime}
+        endTime={summary.endTime}
+        status={summary.status}
+        finished={finished}
+      />
     </div>
   );
 }
@@ -635,21 +656,6 @@ function FindingsList({
         <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-8 text-center text-sm text-[#888]">
           {finished ? "No findings in this run." : "No findings yet. The pentest is still running…"}
         </div>
-        {finished && (
-          <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-            <p className="text-sm font-medium text-white">Stay ahead of new exposures</p>
-            <p className="mt-0.5 mb-3 text-xs text-[#666]">
-              Attack surface monitoring catches new exposures for your org over time.
-            </p>
-            <ProInlineCta
-              label="Attack surface monitoring"
-              desc="Continuous coverage for your whole org."
-              slug="asm"
-              surface="empty_state"
-              icon={Radar}
-            />
-          </div>
-        )}
       </div>
     );
   }
@@ -701,50 +707,18 @@ function dedupeHeadings(md: string): string {
   return out.join("\n");
 }
 
-/** Primary local CTA: email an encrypted PDF. Verify-email affordance, no lock. */
-function EmailReportCta({ onOpenEmail }: { onOpenEmail: () => void }) {
-  return (
-    <button
-      onClick={onOpenEmail}
-      className="group w-full cursor-pointer rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] p-4 text-left transition-colors hover:border-emerald-500/40"
-    >
-      <div className="flex items-center gap-3">
-        <div
-          className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg"
-          style={{ border: "1px solid rgba(16,185,129,0.3)", background: "rgba(16,185,129,0.08)" }}
-        >
-          <Mail className="h-4 w-4 text-emerald-400" aria-hidden="true" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold text-white">Email an encrypted PDF report of this run</p>
-          <p className="mt-0.5 text-xs text-[#888]">
-            Encrypted with a key only you can see, email verified with a one-time code before sending.
-          </p>
-        </div>
-        <span className="flex-shrink-0 rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-black transition-opacity group-hover:opacity-90">
-          Export report to PDF
-        </span>
-      </div>
-    </button>
-  );
-}
-
-function OverviewTab({
+function LastScanTab({
   summary,
   counts,
   total,
   reportMarkdown,
   raw,
-  finished,
-  onOpenEmail,
 }: {
   summary: ParsedRunSummary;
   counts: Record<VulnerabilitySeverity, number>;
   total: number;
   reportMarkdown: string | null;
   raw: Record<string, unknown>;
-  finished: boolean;
-  onOpenEmail: () => void;
 }) {
   const sections = (
     [
@@ -769,38 +743,6 @@ function OverviewTab({
         </div>
       )}
 
-      {/* Primary CTA: the one primary on Overview. Hidden until the run is
-          finished, since a live scan would only email a partial report. */}
-      {finished && (
-        <div className="animate-card-in">
-          <EmailReportCta onOpenEmail={onOpenEmail} />
-        </div>
-      )}
-
-      {finished && (
-        <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-          <p className="text-sm font-semibold text-white">Strix Cloud</p>
-          <p className="mt-0.5 text-xs text-[#666]">Run your next pentest in Strix Cloud.</p>
-          <div className="mt-3 flex flex-wrap gap-2.5">
-            <ProInlineCta
-              label="Run a pentest in Strix Cloud"
-              desc="Validated findings, autofix, and PR reviews."
-              slug="overview_cloud"
-              surface="overview"
-              icon={Rocket}
-              primary
-            />
-            <ProInlineCta
-              label="Try Strix Enterprise"
-              desc="SSO, compliance-ready reports, VPC or self-hosted deployment."
-              slug="book_demo"
-              surface="overview"
-              icon={Building2}
-              href={DEMO_URL}
-            />
-          </div>
-        </div>
-      )}
 
       {sections.length > 0 ? (
         <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5 space-y-8">
@@ -844,7 +786,15 @@ function TabButton({
   );
 }
 
-function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
+function AgentsTab({
+  run,
+  canSteer,
+  runName,
+}: {
+  run: LoadedRun;
+  canSteer: boolean;
+  runName: string | null;
+}) {
   const { agents, events } = run.transcript;
   const graphAgents = useMemo(() => buildGraphAgents(agents, events), [agents, events]);
   // Clicking a graph node opens the agent's transcript in a modal; no node selected means no modal.
@@ -853,6 +803,9 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
 
   // Live steering is only possible in-process (canSteer) while the scan runs.
   const steerable = canSteer && !run.finished;
+
+  // Log lines carry agent ids; show the agents' names instead.
+  const agentNames = useMemo(() => new Map(agents.map((a) => [a.id, a.name])), [agents]);
 
   return (
     <div className="space-y-5">
@@ -865,7 +818,9 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
           </span>
         </div>
         <p className="mt-1 mb-4 text-xs text-[#666]">
-          Click an agent to open its full transcript.
+          {agents.length === 0
+            ? "Agents appear here once the scan starts them. The server log below shows what is happening in the meantime."
+            : "Click an agent to open its full transcript."}
         </p>
         <div className="h-[480px] rounded-lg border border-[#1a1a1a] overflow-hidden">
           <AgentGraph
@@ -882,29 +837,8 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
       {/* Live steering: only in-process while the scan runs. Otherwise omitted. */}
       {steerable && <ScanPromptComposer agents={agents} />}
 
-      {/* Re-run always routes to Strix Cloud. */}
-      <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
-        <p className="text-sm font-semibold text-white">Run this pentest with more depth</p>
-        <p className="mt-0.5 text-xs text-[#666]">Run this pentest again in Strix Cloud.</p>
-        <div className="mt-3 flex flex-wrap gap-2.5">
-          <ProInlineCta
-            label="Re-run in Strix Pro with more depth"
-            desc="More depth, validated findings, and autofix."
-            slug="live_scan"
-            surface="agents"
-            icon={Rocket}
-            primary
-          />
-          <ProInlineCta
-            label="Try Strix Enterprise"
-            desc="SSO, compliance-ready reports, VPC or self-hosted deployment."
-            slug="book_demo"
-            surface="agents"
-            icon={Building2}
-            href={DEMO_URL}
-          />
-        </div>
-      </div>
+      {/* What is running on the server side: the scan's own log, streamed. */}
+      <ServerLogPanel runName={runName} finished={run.finished} agentNames={agentNames} />
 
       <AgentDetailModal
         open={selectedAgent !== null}

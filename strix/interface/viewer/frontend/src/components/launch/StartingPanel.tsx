@@ -23,6 +23,8 @@ export interface StartingPanelProps {
   onCancel: () => void;
   onOpenRun: () => void;
   onEditAndRetry: () => void;
+  /** When set, the failed card offers an "Open Settings" link (BR-37). */
+  onOpenSettings?: () => void;
 }
 
 export function StartingPanel({
@@ -34,6 +36,7 @@ export function StartingPanel({
   onCancel,
   onOpenRun,
   onEditAndRetry,
+  onOpenSettings,
 }: StartingPanelProps) {
   const [elapsed, setElapsed] = useState(0);
   const startRef = useRef(Date.now());
@@ -109,6 +112,16 @@ export function StartingPanel({
           >
             Edit and retry
           </button>
+          {onOpenSettings && (
+            <button
+              type="button"
+              data-testid="starting-panel-open-settings-button"
+              onClick={onOpenSettings}
+              className="ml-3 inline-flex items-center justify-center rounded-lg border border-[#333] px-4 py-2 text-sm font-medium text-[#ddd] transition-colors hover:border-[#555] hover:text-white"
+            >
+              Open Settings
+            </button>
+          )}
         </div>
       </div>
     );

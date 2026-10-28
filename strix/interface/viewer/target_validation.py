@@ -53,15 +53,21 @@ Classifier = Callable[[str], str]
 _RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="viewer-dns")
 
 
-def _echo(raw: object) -> str:
+def echo_input(raw: object) -> str:
     """At most 80 characters of ``raw`` with control characters stripped.
 
     Used in error messages so a hostile input cannot reflect control sequences
-    or large bodies back through the response (BR-17).
+    or large bodies back through the response (BR-17). Exported under this name
+    so the LLM-settings validator shares the one sanitising helper instead of
+    re-deriving it (step 1.1 / BR-17).
     """
     text = raw if isinstance(raw, str) else str(raw)
     cleaned = "".join(ch for ch in text if ch.isprintable())
     return cleaned[:_MESSAGE_ECHO_LEN]
+
+
+# Backward-compatible alias: the original private name predates the export.
+_echo = echo_input
 
 
 def _invalid_target(raw: object, reason: str) -> LaunchError:

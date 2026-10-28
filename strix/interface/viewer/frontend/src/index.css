@@ -324,3 +324,27 @@ body {
   color: #ccc;
   font-weight: 600;
 }
+
+/* Native dropdowns: the closed select is transparent with white text, but the
+   opened list is drawn by the browser on a white background, which made the
+   options white on white. Give the control and its options an explicit dark
+   scheme so every <select> in the viewer stays readable. */
+select,
+input[list] {
+  color-scheme: dark;
+}
+
+select option,
+select optgroup {
+  background-color: #111111;
+  color: #ededed;
+}
+
+select option:checked {
+  background-color: #2a2a2a;
+  color: #ffffff;
+}
+
+select option:disabled {
+  color: #666666;
+}

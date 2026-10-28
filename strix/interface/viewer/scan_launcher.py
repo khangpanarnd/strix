@@ -99,6 +99,21 @@ class ScanState(StrEnum):
 _TERMINAL_STATES = frozenset({ScanState.FINISHED, ScanState.FAILED, ScanState.STOPPED})
 
 
+@dataclass(frozen=True)
+class ScanSnapshot:
+    """A point-in-time, read-only view of one launched child (for observers).
+
+    Carries no instruction text and no process handle, so the notification
+    service can hold it without being able to affect or leak the scan.
+    """
+
+    run_name: str
+    target: str
+    mode: str
+    state: str
+    exit_code: int | None
+
+
 class ProcessHandle(Protocol):
     """The subprocess surface the launcher uses; lets tests inject a fake Popen.
 
@@ -174,6 +189,8 @@ class ScanLauncher:
         classifier: Classifier | None = None,
         kill_tree: Callable[[PopenLike], None] | None = None,
         environ: Mapping[str, str] | None = None,
+        child_env_builder: Callable[[Mapping[str, str]], Mapping[str, str]] | None = None,
+        pre_launch_check: Callable[[], None] | None = None,
     ) -> None:
         self._runs_dir = runs_dir
         self._limits = limits
@@ -183,6 +200,12 @@ class ScanLauncher:
         self._classifier = classifier
         self._kill_tree = kill_tree or _default_kill_tree
         self._environ = dict(environ) if environ is not None else dict(os.environ)
+        # The settings store hands us these at wiring time (cli.py). ``child_env_builder``
+        # is evaluated at EACH spawn (FR-17) so a save between two launches is seen by
+        # the next one with no restart; ``pre_launch_check`` runs the managed base-URL
+        # DNS-rebinding guard (DD-9/BR-36) before any lock or rate-limit side effect.
+        self._child_env_builder = child_env_builder
+        self._pre_launch_check = pre_launch_check
 
         self._children: dict[str, ScanChild] = {}
         self._lock = threading.Lock()
@@ -205,7 +228,26 @@ class ScanLauncher:
         under the lock, and the child is registered *before* the lock is
         released, so a second request waiting on the lock sees it even though
         its ``run.json`` does not exist yet (FR-24).
+
+        Order chosen for ``pre_launch_check`` (the managed base-URL rebinding
+        guard, DD-9/BR-36): it runs *first*, before the rate limit is consumed
+        and before the launch lock is taken. A request that is refused for a
+        blocked base therefore does not burn a rate slot and never holds the
+        lock across its 3-second DNS bound. Any :class:`LaunchError` it raises
+        propagates unchanged. It is called exactly once per ``launch`` and not
+        at all for a request rejected earlier (the rate-limit 429), because that
+        rejection happens after this point.
+
+        Lock order: the launch lock (``self._lock``) is the OUTER lock; the
+        settings-store lock, taken inside ``child_env_builder`` during
+        ``_spawn``, is the INNER lock. The store never takes the launch lock
+        (BR-35), so the two can never deadlock.
         """
+        if self._pre_launch_check is not None:
+            # Runs before any side effect (rate limit, lock) so a blocked base
+            # neither consumes a slot nor holds the lock; LaunchError propagates.
+            self._pre_launch_check()
+
         self._record_attempt()
 
         validated = validate_target(
@@ -216,6 +258,10 @@ class ScanLauncher:
         )
 
         with self._lock:
+            # Lock order: this launch lock is OUTER. ``_spawn`` below calls the
+            # child-env builder, which takes the settings-store lock (INNER). The
+            # store never acquires this launch lock, so the nesting is deadlock-free
+            # (BR-35).
             active = self._active_run_locked()
             if active is not None:
                 raise LaunchError(
@@ -230,19 +276,52 @@ class ScanLauncher:
 
         # The audit line is written after the child exists but carries no
         # instruction text (BR-31). Outside the lock: it is pure logging.
+        budget_display = (
+            f"{request.max_budget_usd:g}" if request.max_budget_usd is not None else "none"
+        )
         logger.info(
-            "viewer launch run=%s target=%s addresses=%s mode=%s budget=%g allow_private=%s",
+            "viewer launch run=%s target=%s addresses=%s mode=%s budget=%s allow_private=%s",
             run_name,
             validated.normalized,
             ",".join(validated.addresses),
             request.scan_mode,
-            request.max_budget_usd,
+            budget_display,
             request.allow_private,
         )
         return run_name
 
     def _spawn(self, run_name: str, target: str, request: LaunchRequest) -> ScanChild:
-        """Build the argv and start the child; raise ``spawn_failed`` on OS refusal."""
+        """Build the argv and start the child; raise ``spawn_failed`` on OS refusal.
+
+        The child's environment is taken from ``child_env_builder`` when one was
+        supplied, evaluated here at *every* spawn (never from a start-up snapshot)
+        so a settings save between two launches is picked up by the next one with
+        no restart (FR-17). The builder is called with ``os.environ`` read now, and
+        it takes the settings-store lock (the INNER lock; this runs while the launch
+        lock is held — see ``launch`` for the order).
+
+        Builder-exception decision: a builder failure FAILS the launch with
+        ``spawn_failed`` rather than falling back to the raw viewer environment.
+        For a managed launch the builder is what strips the viewer's own LLM
+        secrets from the child (FR-16); silently using the unstripped environment
+        would leak exactly what the strip set is meant to remove, so refusing is
+        the safe choice.
+        """
+        if self._child_env_builder is not None:
+            try:
+                env: Mapping[str, str] = dict(self._child_env_builder(os.environ))
+            except LaunchError:
+                # A LaunchError from the store (e.g. config_unreadable) already
+                # carries a stable code/status; let it surface unchanged.
+                raise
+            except Exception as exc:
+                raise LaunchError(
+                    "spawn_failed",
+                    "the scan environment could not be prepared",
+                    status=500,
+                ) from exc
+        else:
+            env = self._environ
         argv = self._build_argv(run_name, target, request)
         try:
             process = self._popen(
@@ -252,7 +331,7 @@ class ScanLauncher:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 shell=False,
-                env=self._environ,
+                env=env,
                 text=True,
                 **_process_group_kwargs(),
             )
@@ -288,9 +367,12 @@ class ScanLauncher:
             "-n",
             f"--target={target}",
             f"--scan-mode={request.scan_mode}",
-            f"--max-budget={request.max_budget_usd:g}",
-            f"--run-name={run_name}",
         ]
+        # A None budget means "no limit": omit the flag so the child runs
+        # uncapped, exactly as the CLI does when --max-budget is not given.
+        if request.max_budget_usd is not None:
+            scan_args.append(f"--max-budget={request.max_budget_usd:g}")
+        scan_args.append(f"--run-name={run_name}")
         if request.instruction:
             scan_args.append(f"--instruction={request.instruction}")
 
@@ -370,6 +452,31 @@ class ScanLauncher:
             "stoppable": stoppable,
             "error_tail": error_tail,
         }
+
+    def snapshot(self) -> list[ScanSnapshot]:
+        """A read-only view of every child this viewer launched, with states brought up to date.
+
+        Used by the notification service to notice starts and exits without any
+        browser polling ``/api/scans/status``. Each child is reaped first (the
+        same idempotent fold the status endpoint performs), so a child that
+        exited since the last look is reported in its terminal state. The launch
+        lock is held only to copy the table, never while reaping.
+        """
+        with self._lock:
+            children = list(self._children.values())
+        snapshots: list[ScanSnapshot] = []
+        for child in children:
+            exit_code = self._reap(child)
+            snapshots.append(
+                ScanSnapshot(
+                    run_name=child.run_name,
+                    target=child.target,
+                    mode=child.mode,
+                    state=child.state.value,
+                    exit_code=exit_code,
+                )
+            )
+        return snapshots
 
     def _reap(self, child: ScanChild) -> int | None:
         """Fold a finished process into a terminal state; return its exit code or None.
@@ -635,4 +742,4 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-__all__ = ["ProcessHandle", "ScanChild", "ScanLauncher", "ScanState"]
+__all__ = ["ProcessHandle", "ScanChild", "ScanLauncher", "ScanSnapshot", "ScanState"]

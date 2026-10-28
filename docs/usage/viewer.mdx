@@ -39,6 +39,62 @@ The UI ships prebuilt with Strix, so there is no extra install and no JavaScript
 - **Steering** — send instructions to a live scan to redirect the agents during the run. Steering works only in the dashboard the running scan opens. A standalone `strix view` has no live scan to steer.
 - **History** — browse past runs on this machine and move between them. Verify your email address in the dashboard to unlock the other runs.
 - **Reports** — generate a shareable report and send it by email. Verify your email address first.
+- **Notifications** — get Slack, Microsoft Teams, or Telegram messages when a scan starts, progresses, finishes, stops, or fails. See [Notifications](#notifications).
+
+## Notifications
+
+The **Notifications** page sends a message to Slack, Microsoft Teams, or Telegram while a scan runs. It covers scans you start from the viewer's **New scan** page (`strix view --launch`). Scans started from the command line are not watched.
+
+Choose which events to send:
+
+| Event | When |
+| --- | --- |
+| Scan started | The scan begins. |
+| Progress updates | Every 5–240 minutes (default 15) while the scan is running. Off by default. |
+| Scan finished | The scan completes. |
+| Scan stopped | The scan is stopped before it completes, including when you stop the viewer. |
+| Scan failed | The scan exits with an error. |
+
+Then set up one or more destinations. Each has a **Send test message** button that works before you save.
+
+| Destination | What you need |
+| --- | --- |
+| Slack | An Incoming Webhook URL. |
+| Microsoft Teams | The URL of a channel workflow ("Post to a channel when a webhook request is received") or an Incoming Webhook. |
+| Telegram | A bot token from `@BotFather`, and the chat id (a number such as `-1001234567890`, or `@channelname`). |
+
+A message contains the target, scan mode, run name, elapsed time, finding counts by severity, and the cost when it is above zero. It never contains your instructions, API keys, finding details, or the viewer link.
+
+<Note>
+  Settings are stored in `~/.strix/notifications.json`, readable only by you. Webhook URLs and bot tokens are write-only: after you save, the page shows that one is set but never shows it again. Leave a field blank to keep the saved value, or tick **Remove** to delete it.
+</Note>
+
+Webhook URLs must be public `https` addresses. Strix refuses hosts that resolve to private or cloud-metadata addresses, does not follow redirects, and gives each request 10 seconds. A destination that fails never affects the scan. The reason is logged and shown by **Send test message**. Like the LLM settings, the page is read-only unless you open the viewer from `localhost`.
+
+## Landing Page And Sign-In
+
+Opening the viewer's link shows a landing page: a short introduction, an overview video, and a **Scan your project** button. The button leads to a sign-in page, and signing in opens the **New scan** form. A browser that is already signed in (for example after a refresh) goes straight to the dashboard.
+
+Sign-in is checked by the viewer, not by the page, and is a second lock on top of the private link:
+
+- The sign-in endpoint only answers a browser that opened the viewer's private link, so the password cannot be guessed from the network.
+- Every dashboard request needs both the private link's session and a valid sign-in. Signing out ends the session on the server.
+- Five wrong passwords lock the form for 60 seconds. A sign-in lasts 12 hours, and restarting the viewer signs everyone out.
+- The viewer stores only a salted PBKDF2-SHA256 hash. No password is kept in the code, the page or the logs.
+
+The built-in account has the username `prdcv`; its password is not in the repository. To use your own account, create a hash and set two environment variables before starting the viewer:
+
+```bash
+python -m strix.interface.viewer.login          # prompts for a password and prints a hash
+export STRIX_VIEWER_USERNAME="your-name"
+export STRIX_VIEWER_PASSWORD_HASH="pbkdf2_sha256$600000$..."
+```
+
+Set both or neither: a username without a hash, or a malformed hash, stops the viewer with an error instead of silently using a different password. To turn sign-in off, for example on a single-user machine, set `STRIX_VIEWER_LOGIN=off`; the private link then grants access on its own, as before.
+
+<Note>
+  Anyone who can read the source can run offline guesses against the built-in hash. For anything beyond one trusted machine, set your own account.
+</Note>
 
 ## Sharing The Link
 

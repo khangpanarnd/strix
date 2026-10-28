@@ -236,6 +236,7 @@ ignore = [
 "tests/test_viewer_auth.py" = ["S105", "S106", "ARG001"]
 # Fixture secret strings drive the redaction assertions.
 "tests/test_viewer_redaction.py" = ["S105"]
+"tests/test_llm_settings_store.py" = ["S105"]
 "tests/test_cloud_cli.py" = ["S105", "ARG001"]
 "tests/test_codex_auth.py" = ["S105", "S106", "SLF001"]
 # Hatchling loads the build hook by path, not as an importable package.
@@ -259,6 +260,12 @@ ignore = [
 "strix/interface/cloud/payment_proxy.py" = ["N802"]
 # Lazy telemetry import to avoid importing PostHog before the viewer starts.
 "strix/interface/viewer/cli.py" = ["PLC0415"]
+# The connection-test child imports Strix/LLM modules lazily and only AFTER the
+# payload is read and the environment prepared (DD-5); its categoriser is a chain
+# of guard clauses that each return a (category, status) pair.
+"strix/interface/viewer/llm_test_child.py" = ["PLC0415", "PLR0911"]
+# The tester's result parser is a guard-clause chain, one return per reject rule.
+"strix/interface/viewer/llm_connection_test.py" = ["PLR0911"]
 # Lazy imports inside functions to avoid circular dependency with
 # strix.telemetry / strix.report.dedupe / cvss.
 "strix/tools/notes/tools.py" = ["PLC0415", "TC002"]

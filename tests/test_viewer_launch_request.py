@@ -69,7 +69,19 @@ def test_budget_within_range() -> None:
     assert parse_launch_request(_body(max_budget_usd=12.5), LIMITS).max_budget_usd == 12.5
 
 
-@pytest.mark.parametrize("value", ["5", True, None])
+def test_budget_null_means_no_limit() -> None:
+    # An explicit JSON null is the "no limit" choice: the scan runs uncapped.
+    assert parse_launch_request(_body(max_budget_usd=None), LIMITS).max_budget_usd is None
+
+
+def test_budget_absent_uses_default() -> None:
+    # Absence is distinct from null: it falls back to the configured default.
+    assert (
+        parse_launch_request(_body(), LIMITS).max_budget_usd == LIMITS.default_budget_usd
+    )
+
+
+@pytest.mark.parametrize("value", ["5", True])
 def test_budget_must_be_number_not_bool_or_string(value: object) -> None:
     with pytest.raises(LaunchError) as exc:
         parse_launch_request(_body(max_budget_usd=value), LIMITS)

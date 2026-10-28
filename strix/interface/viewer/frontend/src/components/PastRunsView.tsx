@@ -1,15 +1,14 @@
-import { useState } from "react";
 import { History, ChevronRight, Terminal } from "lucide-react";
 import type { RunListEntry, RunsPayload, RunSeverityCounts } from "@/data/serverSource";
 import { runTitle } from "@/lib/target-utils";
-import { trackCta } from "@/lib/cta";
-import EmailVerifyInline from "@/components/EmailVerifyInline";
+import { formatUtc, formatUtcShort, parseTimestamp } from "@/lib/time";
+
 
 /**
- * "Past runs" panel. Unverified users see a tease with the run count and a
- * verify affordance (the launched run stays fully visible; the CLI
- * `strix view <name>` still works). Verified users get the full history and can
- * switch the active run, which threads ?run=<name> through the data fetches.
+ * "Past runs" panel. A browser without this viewer's session sees only the run
+ * count (the CLI `strix view <name>` still works); with the session it gets the
+ * full history and can switch the active run, which threads ?run=<name> through
+ * the data fetches.
  */
 
 const SEV = [
@@ -37,27 +36,17 @@ function SeverityChips({ counts }: { counts: RunSeverityCounts }) {
 }
 
 function formatDate(iso: string | null): string | null {
-  if (!iso) return null;
-  const normalized = iso.trim().replace(" UTC", "Z").replace(" ", "T");
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  const d = parseTimestamp(iso);
+  return d ? formatUtcShort(d) : null;
 }
 
 /**
  * Relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), falling back to
- * the absolute date for anything older than a week (mirrors the pro app).
+ * the absolute UTC date for anything older than a week (mirrors the pro app).
  */
 function formatTimeAgo(iso: string | null): string | null {
-  if (!iso) return null;
-  const normalized = iso.trim().replace(" UTC", "Z").replace(" ", "T");
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return null;
+  const d = parseTimestamp(iso);
+  if (!d) return null;
   const diffMs = Date.now() - d.getTime();
   const mins = Math.floor(diffMs / 60000);
   if (mins < 1) return "just now";
@@ -73,17 +62,14 @@ interface PastRunsViewProps {
   runs: RunsPayload | null;
   activeRun: string | null;
   onSelectRun: (name: string) => void;
-  onVerified: () => void;
 }
 
 export default function PastRunsView({
   runs,
   activeRun,
   onSelectRun,
-  onVerified,
 }: PastRunsViewProps) {
   const count = runs?.count ?? 0;
-  const [showVerify, setShowVerify] = useState(false);
 
   if (!runs || runs.locked) {
     return (
@@ -98,25 +84,10 @@ export default function PastRunsView({
         <p className="mx-auto mt-1.5 max-w-md text-sm text-[#888]">
           You have {count} past {count === 1 ? "run" : "runs"} on this machine.
         </p>
-        {showVerify ? (
-          <>
-            <p className="mx-auto mt-3 max-w-sm text-xs text-[#666]">
-              Verify your email with a one-time code to unlock the full history.
-            </p>
-            <EmailVerifyInline onVerified={onVerified} />
-          </>
-        ) : (
-          <button
-            onClick={() => {
-              trackCta("history_unlock", "past_runs");
-              setShowVerify(true);
-            }}
-            className="mt-4 cursor-pointer rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90"
-          >
-            View runs
-          </button>
-        )}
-        <p className="mt-4 flex items-center justify-center gap-1.5 text-xs text-[#555]">
+        <p className="mx-auto mt-3 max-w-sm text-xs text-[#666]">
+          Open this viewer from the link printed by <code className="font-mono text-[#888]">strix view</code> to
+          see the full history.
+        </p>        <p className="mt-4 flex items-center justify-center gap-1.5 text-xs text-[#555]">
           <Terminal className="h-3.5 w-3.5" aria-hidden="true" />
           Or open one from the CLI with{" "}
           <code className="font-mono text-[#888]">strix view &lt;name&gt;</code>
@@ -138,6 +109,8 @@ export default function PastRunsView({
       {runs.runs.map((run: RunListEntry) => {
         const active = run.name === activeRun;
         const date = formatTimeAgo(run.start_time) ?? formatTimeAgo(run.end_time);
+        const exactDate = parseTimestamp(run.start_time) ?? parseTimestamp(run.end_time);
+        const exactUtc = exactDate ? formatUtc(exactDate) : null;
         const title = runTitle(run.target, run.name);
         return (
           <button
@@ -161,7 +134,9 @@ export default function PastRunsView({
               <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#666]">
                 {run.scan_mode && <span className="capitalize">{run.scan_mode}</span>}
                 {run.scan_mode && (date || run.status) && <span className="text-[#333]">·</span>}
-                {date && <span>{date}</span>}
+                {date && (
+                  <span title={exactUtc ?? undefined}>{date}</span>
+                )}
                 {date && run.status && <span className="text-[#333]">·</span>}
                 {run.status && <span className="capitalize">{run.status}</span>}
               </div>
