@@ -135,7 +135,7 @@ def test_the_shipped_default_account_constants_are_the_well_known_seed() -> None
 
 
 def test_no_env_account_falls_back_to_the_store() -> None:
-    # Neither env var set: the caller is told to use the persisted store.
+    # Credentials are never taken from the environment: sign-in uses the store.
     assert env_login_config({}) is USE_STORE
 
 
@@ -146,36 +146,19 @@ def test_login_can_be_switched_off(value: str) -> None:
 
 @pytest.mark.parametrize("value", ["on", "1", "", "yes", "maybe"])
 def test_other_values_leave_login_on(value: str) -> None:
-    # "On" with no account set still means "use the store", not a config error.
     assert env_login_config({"STRIX_VIEWER_LOGIN": value}) is USE_STORE
 
 
-def test_env_can_override_the_account() -> None:
+def test_credential_env_vars_are_ignored() -> None:
+    # The old STRIX_VIEWER_USERNAME/PASSWORD_HASH account path is gone: whatever
+    # those say, sign-in resolves to the persisted store, never an env account.
     encoded = hash_password(PASSWORD, iterations=FAST)
-    config = env_login_config(
-        {"STRIX_VIEWER_USERNAME": "bob", "STRIX_VIEWER_PASSWORD_HASH": encoded}
+    assert (
+        env_login_config({"STRIX_VIEWER_USERNAME": "bob", "STRIX_VIEWER_PASSWORD_HASH": encoded})
+        is USE_STORE
     )
-    assert isinstance(config, LoginConfig)
-    assert (config.username, config.password_hash) == ("bob", encoded)
-    # An env-configured account is trusted as-is; it is never forced to change.
-    assert config.must_change is False
-
-
-def test_a_bad_env_hash_is_an_error_not_a_silent_fallback() -> None:
-    with pytest.raises(ValueError, match="not a valid hash"):
-        env_login_config({"STRIX_VIEWER_USERNAME": "bob", "STRIX_VIEWER_PASSWORD_HASH": "hunter2"})
-
-
-def test_a_username_override_without_a_hash_is_an_error() -> None:
-    # Otherwise the chosen name would be left without a password to match.
-    with pytest.raises(ValueError, match="without STRIX_VIEWER_PASSWORD_HASH"):
-        env_login_config({"STRIX_VIEWER_USERNAME": "bob"})
-
-
-def test_a_hash_without_a_username_is_an_error() -> None:
-    encoded = hash_password(PASSWORD, iterations=FAST)
-    with pytest.raises(ValueError, match="without STRIX_VIEWER_USERNAME"):
-        env_login_config({"STRIX_VIEWER_PASSWORD_HASH": encoded})
+    assert env_login_config({"STRIX_VIEWER_USERNAME": "bob"}) is USE_STORE
+    assert env_login_config({"STRIX_VIEWER_PASSWORD_HASH": "not-a-hash"}) is USE_STORE
 
 
 def test_config_repr_hides_the_hash() -> None:
