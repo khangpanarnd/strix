@@ -103,6 +103,11 @@ _FIXED_MESSAGES: dict[str, str] = {
     "auth_failed": "The provider rejected the API key.",
     "model_not_found": "The provider did not recognise the model.",
     "unreachable": "The API base URL could not be reached.",
+    "tls_failed": (
+        "The server's TLS certificate could not be verified. If it is signed by a private "
+        "certificate authority, install that CA in the operating system store or point "
+        "SSL_CERT_FILE at its bundle."
+    ),
     "timeout": "The connection test timed out.",
     "invalid_request": "The provider rejected the request.",
     "unknown": "The connection test could not be completed.",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import ssl
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -172,6 +173,92 @@ def test_connection_error_class_maps_to_unreachable() -> None:
         preflight=_preflight_raising(APIConnectionError("dns failed")),
     )
     assert result["category"] == "unreachable"
+
+
+def _chained(outer: BaseException, *, cause: BaseException | None = None) -> BaseException:
+    """``outer`` with an explicit ``__cause__`` (``raise ... from``), as SDKs wrap errors."""
+    outer.__cause__ = cause
+    return outer
+
+
+def _wrapped_tls_error() -> BaseException:
+    """``APIConnectionError`` -> ``ConnectError`` -> ``SSLCertVerificationError``."""
+
+    class APIConnectionError(Exception):
+        pass
+
+    class ConnectError(Exception):
+        pass
+
+    handshake = ssl.SSLCertVerificationError("certificate verify failed")
+    return _chained(
+        APIConnectionError("Connection error."),
+        cause=_chained(ConnectError("handshake"), cause=handshake),
+    )
+
+
+def test_tls_failure_behind_a_connection_error_maps_to_tls_failed() -> None:
+    """The regression: a certificate problem was reported as an unreachable base URL."""
+    _, result, _ = _run_child(
+        {"model": "m", "timeout": 30},
+        resolved_model="m",
+        preflight=_preflight_raising(_wrapped_tls_error()),
+    )
+    assert result["category"] == "tls_failed"
+    assert result["ok"] is False
+
+
+def test_tls_failure_found_through_implicit_context_maps_to_tls_failed() -> None:
+    """Some wrappers chain with ``__context__`` only (a ``raise`` inside ``except``)."""
+
+    class APIConnectionError(Exception):
+        pass
+
+    error = APIConnectionError("Connection error.")
+    error.__context__ = ssl.SSLError("handshake failure")
+    assert error.__cause__ is None
+
+    _, result, _ = _run_child(
+        {"model": "m", "timeout": 30}, resolved_model="m", preflight=_preflight_raising(error)
+    )
+    assert result["category"] == "tls_failed"
+
+
+def test_connection_error_without_a_tls_cause_stays_unreachable() -> None:
+    class APIConnectionError(Exception):
+        pass
+
+    error = _chained(APIConnectionError("Connection error."), cause=OSError("connection refused"))
+    _, result, _ = _run_child(
+        {"model": "m", "timeout": 30}, resolved_model="m", preflight=_preflight_raising(error)
+    )
+    assert result["category"] == "unreachable"
+
+
+def test_cyclic_exception_chain_terminates() -> None:
+    class APIConnectionError(Exception):
+        pass
+
+    first = APIConnectionError("a")
+    second = _chained(APIConnectionError("b"), cause=first)
+    first.__cause__ = second
+    _, result, _ = _run_child(
+        {"model": "m", "timeout": 30}, resolved_model="m", preflight=_preflight_raising(first)
+    )
+    assert result["category"] == "unreachable"
+
+
+def test_tls_failure_never_echoes_exception_text() -> None:
+    leaked = "sk-SECRET-should-not-leak"
+    error = ssl.SSLCertVerificationError(f"certificate verify failed for key {leaked}")
+    stdout = io.StringIO()
+    main(
+        io.StringIO(json.dumps({"model": "m", "timeout": 30}) + "\n"),
+        stdout,
+        preflight=_preflight_raising(error),
+        loader=_FakeLoader("m"),
+    )
+    assert leaked not in stdout.getvalue()
 
 
 def test_timeout_maps_to_timeout() -> None:

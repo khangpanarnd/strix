@@ -324,6 +324,9 @@ ignore = [
 # LiteLLM is imported lazily: the request log is wired at startup on every
 # route, including the native OpenAI ones that never load LiteLLM.
 "strix/llm/request_log.py" = ["PLC0415"]
+# openai, agents and litellm are imported on first use for the same reason; the
+# TLS installers run at startup on every route.
+"strix/llm/tls.py" = ["PLC0415"]
 # Heavy inference deps (httpx, openai) imported lazily so auth-status checks
 # don't pull them in.
 "strix/config/codex.py" = ["PLC0415"]

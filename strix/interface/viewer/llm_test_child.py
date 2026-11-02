@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 import sys
 import tempfile
 import time
@@ -59,6 +60,7 @@ _PAYLOAD_ENV_NAMES: dict[str, str] = {
 _CATEGORY_AUTH = "auth_failed"
 _CATEGORY_MODEL = "model_not_found"
 _CATEGORY_UNREACHABLE = "unreachable"
+_CATEGORY_TLS = "tls_failed"
 _CATEGORY_TIMEOUT = "timeout"
 _CATEGORY_INVALID = "invalid_request"
 _CATEGORY_UNKNOWN = "unknown"
@@ -105,6 +107,12 @@ def _categorise(exc: BaseException) -> tuple[str, int | None]:
     if isinstance(exc, TimeoutError):
         return _CATEGORY_TIMEOUT, None
 
+    # A TLS handshake failure surfaces as a generic connection error whose cause
+    # is the real ssl error; telling the two apart keeps a certificate problem
+    # from being reported as a bad URL.
+    if _is_tls_failure(exc):
+        return _CATEGORY_TLS, None
+
     status = _status_code_of(exc)
     if status is not None:
         if status in (401, 403):
@@ -127,6 +135,24 @@ def _categorise(exc: BaseException) -> tuple[str, int | None]:
     if any("badrequest" in n or "unprocessable" in n for n in class_names):
         return _CATEGORY_INVALID, status
     return _CATEGORY_UNKNOWN, status
+
+
+def _is_tls_failure(exc: BaseException) -> bool:
+    """True when ``exc`` or anything in its cause/context chain is an ``ssl`` error.
+
+    Decided from the exception *type* only, never its text (BR-32). The chain is
+    walked because SDKs wrap the handshake failure (``APIConnectionError`` ->
+    ``httpx.ConnectError`` -> ``ssl.SSLCertVerificationError``). A visited set
+    bounds the walk if a chain is cyclic.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _status_code_of(exc: BaseException) -> int | None:
