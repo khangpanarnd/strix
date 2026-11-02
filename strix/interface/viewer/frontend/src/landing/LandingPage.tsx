@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { CodeBlock } from "./CodeBlock";
-import { PixelChar } from "./PixelChar";
+import { Penguin } from "./Penguin";
 import { Showcase } from "./Showcase";
 import { makeGroundTextures } from "./pixel";
 import { useDeck } from "./useDeck";
@@ -160,36 +160,36 @@ export function LandingPage({ onScan }: LandingPageProps) {
             <div className="cloud" style={{ width: 80, top: "28%", animationDelay: "-40s", animationDuration: "80s" }} />
 
             <div className="actor" style={{ left: "6%" }}>
-              <PixelChar name="planner" anim="read" />
+              <Penguin />
             </div>
-            <div className="bubble talk first" style={{ left: "5%", bottom: 190, animationDelay: "0s" }}>
+            <div className="bubble talk first" style={{ left: "5%", bottom: 200, animationDelay: "0s" }}>
               Surface mapped <span className="ok">✓</span>
             </div>
 
             <div className="actor" style={{ left: "20%" }}>
-              <PixelChar name="coder" anim="work" />
+              <Penguin motion="hop" />
             </div>
-            <div className="rock" style={{ left: "calc(20% + 58px)" }} />
-            <div className="bubble talk" style={{ left: "19%", bottom: 190, animationDelay: "4s" }}>
+            <div className="rock" style={{ left: "calc(20% + 104px)" }} />
+            <div className="bubble talk" style={{ left: "19%", bottom: 200, animationDelay: "4s" }}>
               Trying injection
             </div>
 
-            <div className="walker hide-sm">
+            <div className="walker hide-sm hide-short">
               <div className="flip">
-                <PixelChar name="tester" anim="walk" style={{ width: 76 }} />
+                <Penguin motion="waddle" style={{ width: 92 }} />
               </div>
             </div>
-            <div className="bubble talk hide-sm" style={{ left: "42%", bottom: 190, animationDelay: "8s" }}>
+            <div className="bubble talk hide-sm hide-short" style={{ left: "42%", bottom: 200, animationDelay: "8s" }}>
               Exploit <span className="ok">VALIDATED</span>
             </div>
 
             <div className="actor hide-sm" style={{ right: "22%" }}>
-              <PixelChar name="reviewer" anim="read" />
+              <Penguin />
             </div>
             <div className="actor" style={{ right: "6%" }}>
-              <PixelChar name="guard" anim="guard" />
+              <Penguin />
             </div>
-            <div className="bubble talk" style={{ right: "4%", bottom: 190, animationDelay: "12s" }}>
+            <div className="bubble talk" style={{ right: "4%", bottom: 200, animationDelay: "12s" }}>
               Sandbox <span className="ok">ON</span>
             </div>
 
@@ -223,7 +223,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   ?
                 </span>
                 <div className="who" aria-hidden="true">
-                  <PixelChar name="writer" anim="think" />
+                  <Penguin />
                 </div>
               </div>
               <div className="card vs good rv" style={d(3)}>
@@ -237,9 +237,9 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   <li>An exit code that can gate a merge</li>
                 </ul>
                 <div className="who" aria-hidden="true">
-                  <PixelChar name="tester" anim="wave" />
-                  <PixelChar name="coder" />
-                  <PixelChar name="guard" anim="guard" />
+                  <Penguin motion="wiggle" />
+                  <Penguin />
+                  <Penguin />
                 </div>
               </div>
             </div>
@@ -259,7 +259,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
             <div className="fw-grid">
               <article className="card fw rv" style={d(2)}>
                 <div className="av bg-green">
-                  <PixelChar name="tester" />
+                  <Penguin />
                 </div>
                 <div>
                   <h3>Every finding is proven</h3>
@@ -268,7 +268,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               </article>
               <article className="card fw rv" style={d(3)}>
                 <div className="av bg-red">
-                  <PixelChar name="guard" />
+                  <Penguin />
                 </div>
                 <div>
                   <h3>Runs in a local sandbox</h3>
@@ -277,7 +277,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               </article>
               <article className="card fw rv" style={d(4)}>
                 <div className="av bg-violet">
-                  <PixelChar name="coach" />
+                  <Penguin />
                 </div>
                 <div>
                   <h3>The viewer explains itself</h3>
@@ -286,7 +286,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               </article>
               <article className="card fw rv" style={d(5)}>
                 <div className="av bg-blue">
-                  <PixelChar name="coder" />
+                  <Penguin />
                 </div>
                 <div>
                   <h3>Drops into your pipeline</h3>
@@ -298,7 +298,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               </article>
               <article className="card fw wide rv" style={d(6)}>
                 <div className="av bg-amber">
-                  <PixelChar name="writer" />
+                  <Penguin />
                 </div>
                 <div>
                   <h3>Reports you can hand off</h3>
@@ -347,7 +347,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               </div>
               <div className="flagpole" aria-hidden="true" />
               <div className="climber" aria-hidden="true">
-                <PixelChar name="coder" anim="walk" />
+                <Penguin motion="waddle" />
               </div>
             </div>
             <div className="stage-notes">
@@ -393,16 +393,16 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   <div className="stations">
                     {(
                       [
-                        ["orchestrator", "Root agent", "Attack map", "0.4s"],
-                        ["planner", "Recon", "Routes & inputs", "2.4s"],
-                        ["reviewer", "CVE hunter", "CVE leads", "4.4s"],
-                        ["coder", "Injection prober", "Candidate bugs", "6.4s"],
-                        ["tester", "Validate", "Working PoC", "8.4s"],
-                        ["writer", "Report", "SARIF & HTML", "10.4s"],
+                        ["Root agent", "Attack map", "0.4s"],
+                        ["Recon", "Routes & inputs", "2.4s"],
+                        ["CVE hunter", "CVE leads", "4.4s"],
+                        ["Injection prober", "Candidate bugs", "6.4s"],
+                        ["Validate", "Working PoC", "8.4s"],
+                        ["Report", "SARIF & HTML", "10.4s"],
                       ] as const
-                    ).map(([character, name, artifact, delay]) => (
+                    ).map(([name, artifact, delay]) => (
                       <div className="station" key={name} style={{ "--d": delay } as CSSProperties}>
-                        <PixelChar name={character} />
+                        <Penguin />
                         <b>{name}</b>
                         <span className="art">{artifact}</span>
                       </div>
@@ -534,7 +534,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   </li>
                 </ul>
                 <div className="who" aria-hidden="true">
-                  <PixelChar name="guard" anim="guard" />
+                  <Penguin />
                 </div>
               </div>
               <div className="card vs bad rv" style={d(3)}>
@@ -554,12 +554,12 @@ export function LandingPage({ onScan }: LandingPageProps) {
                   </li>
                 </ul>
                 <div className="who" aria-hidden="true">
-                  <PixelChar name="coach" anim="read" />
+                  <Penguin />
                 </div>
               </div>
             </div>
             <div className="card note rv" style={d(4)}>
-              <PixelChar name="captain" />
+              <Penguin />
               <p>
                 <b>Test only what you own.</b> Strix runs real exploits, so prefer a staging environment and a dedicated test
                 account over production data and real credentials.
@@ -572,13 +572,13 @@ export function LandingPage({ onScan }: LandingPageProps) {
         <section className={slideClass(9, "s-close")} id="s10" data-slide data-name="Next step">
           <div className="wrap">
             <div className="lineup rv" aria-hidden="true">
-              <PixelChar name="orchestrator" anim="wave" />
-              <PixelChar name="planner" />
-              <PixelChar name="reviewer" anim="wave" />
-              <PixelChar name="coder" />
-              <PixelChar name="tester" anim="wave" />
-              <PixelChar name="writer" />
-              <PixelChar name="guard" anim="wave" />
+              <Penguin motion="wiggle" />
+              <Penguin />
+              <Penguin motion="wiggle" />
+              <Penguin />
+              <Penguin motion="wiggle" />
+              <Penguin />
+              <Penguin motion="wiggle" />
             </div>
             <span className="eyebrow v rv" style={d(1)}>
               Next step

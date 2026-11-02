@@ -161,6 +161,9 @@ body:has(.lp) { background: var(--bg); }
 /* inline emphasis inside a checklist description must stay inline (the base styles every <b> there as a heading) */
 .lp .checks span b { display: inline; font-size: inherit; font-weight: 650; color: var(--fg); }
 
+/* On short windows the centred walker and its bubble would sit on the buttons; the side actors stay. */
+@media (max-height: 800px) { .lp .world .hide-short { display: none; } }
+
 /* a character host is an inline <span>; keep it a box */
 .lp .ch-host { display: block; }
 
