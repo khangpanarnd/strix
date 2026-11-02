@@ -72,9 +72,24 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
     """Every run directory under ``base_dir``, newest first by record mtime."""
     if not base_dir.is_dir():
         return []
-    run_dirs = [child for child in base_dir.iterdir() if run_record_path(child).is_file()]
-    run_dirs.sort(key=lambda child: run_record_path(child).stat().st_mtime, reverse=True)
-    return run_dirs
+    stamped: list[tuple[float, Path]] = []
+    try:
+        children = list(base_dir.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        record = run_record_path(child)
+        try:
+            if not record.is_file():
+                continue
+            modified = record.stat().st_mtime
+        except OSError:
+            # The run was deleted, or its record replaced, between the check and
+            # the stat. It is simply not listed; the next request sees the result.
+            continue
+        stamped.append((modified, child))
+    stamped.sort(key=lambda item: item[0], reverse=True)
+    return [child for _, child in stamped]
 
 
 def _latest_run_dir(base_dir: Path) -> Path | None:

@@ -6,6 +6,7 @@ import {
   ClipboardList,
   History,
   LogOut,
+  PanelLeftOpen,
   Plus,
   Settings,
 } from "lucide-react";
@@ -157,13 +158,27 @@ export default function Sidebar({
 
   return (
     <>
-      {/* Left-edge pull zone: click to bring the rail back when collapsed. */}
+      {/* Collapsed: a visible tab brings the rail back (an invisible strip was the only
+          way before, so dragging the rail too narrow looked like the menu had vanished).
+          The strip stays as a larger click target along the whole left edge. */}
       {collapsed && (
-        <div
-          className="fixed left-0 top-0 z-40 hidden h-full w-4 cursor-pointer transition-colors hover:bg-[rgba(255,255,255,0.08)] lg:block"
-          onClick={expandSidebar}
-          title="Expand sidebar"
-        />
+        <>
+          <div
+            className="fixed left-0 top-0 z-40 hidden h-full w-4 cursor-pointer transition-colors hover:bg-[rgba(255,255,255,0.08)] lg:block"
+            onClick={expandSidebar}
+            title="Expand sidebar"
+          />
+          <button
+            type="button"
+            onClick={expandSidebar}
+            aria-label="Show menu"
+            title="Show menu"
+            data-testid="sidebar-show"
+            className="fixed left-0 top-4 z-50 hidden h-10 w-6 cursor-pointer items-center justify-center rounded-r-md border border-l-0 border-[rgba(255,255,255,0.14)] bg-[#111] text-[#bbb] transition-colors hover:bg-[#1c1c1c] hover:text-white lg:flex"
+          >
+            <PanelLeftOpen className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </>
       )}
 
       <aside
