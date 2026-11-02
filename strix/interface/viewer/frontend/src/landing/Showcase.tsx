@@ -1,8 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 /**
- * "See what a scan looks like": three real screens of the viewer, in tabs, each
- * annotated with numbered callouts and a plain-English legend.
+ * "What a scan looks like": three real screens of the viewer, in tabs, each
+ * annotated with numbered callouts and a plain-English legend. Rendered as the
+ * body of a slide; the page wraps it in its <section>.
  *
  * The screenshots are used exactly as supplied (assets/Screenshot*.png, copied
  * unchanged into public/). The legend, not the badges, carries the explanation:
@@ -179,104 +180,100 @@ export function Showcase() {
   };
 
   return (
-    <section className="row showcase" id="preview" data-testid="landing-showcase">
-      <div className="wrap">
-        <div>
-          <h2>See what a scan looks like</h2>
-          <p className="note">Three screens you will use.</p>
-        </div>
-        <div className="body">
-          <div className="showcase-tabs" role="tablist" aria-label="Scan screens">
-            {SLIDES.map((slide, index) => (
-              <button
-                key={slide.id}
-                ref={(el) => {
-                  tabs.current[index] = el;
-                }}
-                type="button"
-                role="tab"
-                id={`${uid}-tab-${slide.id}`}
-                aria-selected={active === index}
-                aria-controls={`${uid}-panel-${slide.id}`}
-                tabIndex={active === index ? 0 : -1}
-                onClick={() => select(index)}
-                onKeyDown={(e) => onKeyDown(e, index)}
-              >
-                <span className="showcase-tab-n" aria-hidden="true">
-                  {index + 1}
-                </span>
-                {slide.tab}
-              </button>
-            ))}
+    <div className="wrap showcase" data-testid="landing-showcase">
+      <span className="eyebrow v rv">What a scan looks like</span>
+      <h2 className="title rv" style={{ "--i": 1 } as React.CSSProperties}>
+        Watch it work. Read the proof.
+      </h2>
+
+      <div className="showcase-tabs rv" style={{ "--i": 2 } as React.CSSProperties} role="tablist" aria-label="Scan screens">
+        {SLIDES.map((slide, index) => (
+          <button
+            key={slide.id}
+            ref={(el) => {
+              tabs.current[index] = el;
+            }}
+            type="button"
+            role="tab"
+            id={`${uid}-tab-${slide.id}`}
+            aria-selected={active === index}
+            aria-controls={`${uid}-panel-${slide.id}`}
+            tabIndex={active === index ? 0 : -1}
+            onClick={() => select(index)}
+            onKeyDown={(e) => onKeyDown(e, index)}
+          >
+            <span className="showcase-tab-n" aria-hidden="true">
+              {index + 1}
+            </span>
+            {slide.tab}
+          </button>
+        ))}
+      </div>
+
+      {SLIDES.map((slide, index) => (
+        <div
+          key={slide.id}
+          role="tabpanel"
+          id={`${uid}-panel-${slide.id}`}
+          aria-labelledby={`${uid}-tab-${slide.id}`}
+          hidden={active !== index}
+          className="showcase-panel split"
+        >
+          <div>
+            <h3>{slide.heading}</h3>
+            <p className="showcase-lede">{slide.lede}</p>
+            <ol className="callouts">
+              {slide.callouts.map((c) => (
+                <li key={c.title}>
+                  <strong>{c.title}</strong>
+                  <span>{c.text}</span>
+                </li>
+              ))}
+            </ol>
           </div>
 
-          {SLIDES.map((slide, index) => (
-            <div
-              key={slide.id}
-              role="tabpanel"
-              id={`${uid}-panel-${slide.id}`}
-              aria-labelledby={`${uid}-tab-${slide.id}`}
-              hidden={active !== index}
-              className="showcase-panel"
-            >
-              <h3>{slide.heading}</h3>
-              <p className="showcase-lede">{slide.lede}</p>
-
-              <figure className="showcase-figure">
-                <div className="frame">
-                  <div className="frame-bar" aria-hidden="true">
-                    <i />
-                    <i />
-                    <i />
-                    <span>Strix viewer</span>
-                  </div>
-                  <div className="frame-shot">
-                    <button
-                      type="button"
-                      className="shot-zoom"
-                      aria-label={`Enlarge screenshot: ${slide.tab}`}
-                      aria-haspopup="dialog"
-                      data-testid={`showcase-zoom-${slide.id}`}
-                      onClick={() => setZoom(slide)}
-                    >
-                      <img
-                        src={slide.src}
-                        width={slide.width}
-                        height={slide.height}
-                        alt={slide.alt}
-                        loading={index === 0 ? "eager" : "lazy"}
-                        decoding="async"
-                      />
-                    </button>
-                    {slide.callouts.map((c, i) => (
-                      <span
-                        key={c.title}
-                        className="badge"
-                        aria-hidden="true"
-                        style={{ left: `${c.x}%`, top: `${c.y}%` }}
-                      >
-                        {i + 1}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                <figcaption>
-                  {slide.caption} Click the screenshot to enlarge it.
-                </figcaption>
-              </figure>
-
-              <ol className="callouts">
-                {slide.callouts.map((c) => (
-                  <li key={c.title}>
-                    <strong>{c.title}</strong>
-                    <span>{c.text}</span>
-                  </li>
+          <figure className="showcase-figure">
+            <div className="frame">
+              <div className="frame-bar" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+                <span>Strix viewer</span>
+              </div>
+              <div className="frame-shot">
+                <button
+                  type="button"
+                  className="shot-zoom"
+                  aria-label={`Enlarge screenshot: ${slide.tab}`}
+                  aria-haspopup="dialog"
+                  data-testid={`showcase-zoom-${slide.id}`}
+                  onClick={() => setZoom(slide)}
+                >
+                  <img
+                    src={slide.src}
+                    width={slide.width}
+                    height={slide.height}
+                    alt={slide.alt}
+                    loading={index === 0 ? "eager" : "lazy"}
+                    decoding="async"
+                  />
+                </button>
+                {slide.callouts.map((c, i) => (
+                  <span
+                    key={c.title}
+                    className="badge"
+                    aria-hidden="true"
+                    style={{ left: `${c.x}%`, top: `${c.y}%` }}
+                  >
+                    {i + 1}
+                  </span>
                 ))}
-              </ol>
+              </div>
             </div>
-          ))}
+            <figcaption>{slide.caption} Click the screenshot to enlarge it.</figcaption>
+          </figure>
         </div>
-      </div>
+      ))}
 
       <dialog
         ref={dialog}
@@ -298,12 +295,10 @@ export function Showcase() {
           Close
         </button>
         <div className="zoom-scroll">
-          {zoom && (
-            <img src={zoom.src} width={zoom.width} height={zoom.height} alt={zoom.alt} />
-          )}
+          {zoom && <img src={zoom.src} width={zoom.width} height={zoom.height} alt={zoom.alt} />}
         </div>
       </dialog>
-    </section>
+    </div>
   );
 }
 
