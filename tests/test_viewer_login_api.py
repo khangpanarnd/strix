@@ -336,6 +336,48 @@ def test_a_foreign_origin_cannot_sign_in(served: Served) -> None:
     assert "Set-Cookie" not in headers
 
 
+def test_a_wildcard_bind_accepts_a_matching_lan_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A viewer on 0.0.0.0 reached by its LAN IP must accept the sign-in: the
+    # browser sends Origin == Host == that IP, which is same-origin even though
+    # it is not the literal bound host. (Regression: this used to 403.)
+    monkeypatch.setattr("strix.interface.viewer.server.bundle_dir", lambda: _make_assets(tmp_path))
+    runs = tmp_path / "strix_runs"
+    runs.mkdir()
+    _make_run(runs)
+    httpd, _url, _empty = serve(
+        None, host="0.0.0.0", open_browser=False, runs_dir=runs, login=_manager()
+    )
+    port = httpd.server_address[1]
+    lan = f"http://127.0.0.1:{port}"  # stand-in for the LAN IP; the check is Origin==Host
+    try:
+        # Reach it on 127.0.0.1 and claim that same host as Origin: accepted.
+        status, headers, _ = _req(
+            Served(lan, port),
+            "/api/login",
+            method="POST",
+            body={"username": USERNAME, "password": PASSWORD},
+            headers={"Origin": lan, "Host": f"127.0.0.1:{port}"},
+        )
+        assert status == 200
+        assert "Set-Cookie" in headers
+
+        # But a different host in the Origin than the Host is still rejected.
+        status, _, payload = _req(
+            Served(lan, port),
+            "/api/login",
+            method="POST",
+            body={"username": USERNAME, "password": PASSWORD},
+            headers={"Origin": f"http://10.0.0.9:{port}", "Host": f"127.0.0.1:{port}"},
+        )
+        assert status == 403
+        assert _json(payload)["error"] == "bad_origin"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_a_missing_content_length_is_411(served: Served) -> None:
     parsed = urlsplit(served.url)
     conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port or 80)

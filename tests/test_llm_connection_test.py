@@ -200,6 +200,7 @@ def test_success_line_maps_to_ok_result() -> None:
         ("auth_failed", 401),
         ("model_not_found", 404),
         ("unreachable", None),
+        ("tls_failed", None),
         ("invalid_request", 400),
     ],
 )

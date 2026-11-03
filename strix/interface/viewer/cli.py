@@ -8,6 +8,7 @@ any child the launcher started before the server stops (FR-28, NFR-6).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -65,6 +66,9 @@ def run_view(argv: list[str]) -> None:
         raise SystemExit(1)
 
     run_dir = _resolve_run_dir(args.run, console, launch=args.launch)
+    # A locked-out operator can reset the stored account before anything starts.
+    if args.reset_login is not None:
+        _apply_login_reset(console, args.reset_login)
     # Built before anything starts so a bad STRIX_VIEWER_* value fails fast and clearly.
     login = _build_login(console)
 
@@ -102,6 +106,39 @@ def _build_login(console: Console) -> LoginManager | None:  # noqa: ARG001 - kep
     return LoginManager(config, on_password_changed=_persist)
 
 
+def _apply_login_reset(console: Console, new_password: str) -> None:
+    """Reset the stored viewer account before serving, for a locked-out operator.
+
+    An empty ``new_password`` restores the default ``admin`` / ``admin`` (with a
+    forced change at first sign-in) by removing the store so it re-seeds. A given
+    password is validated and written straight to the store with no forced
+    change. Never prints the password.
+    """
+    if new_password == "":
+        with contextlib.suppress(OSError):
+            credentials_store.CREDENTIALS_PATH.unlink(missing_ok=True)
+        credentials_store.load_or_seed()
+        console.print(
+            "[bold green]Login reset.[/] Sign in with [bold]admin[/] / [bold]admin[/]; "
+            "you will be asked to set a new password."
+        )
+        return
+
+    error = credentials_store.validate_new_password(new_password)
+    if error is not None:
+        console.print(
+            "[bold red]Could not reset the password:[/] it must be at least "
+            f"{credentials_store.MIN_PASSWORD_CHARS} characters and not the default."
+        )
+        raise SystemExit(1)
+    account = credentials_store.load_or_seed()
+    credentials_store.set_password(account, new_password)
+    console.print(
+        f"[bold green]Password reset[/] for user [bold]{escape(account.username)}[/]. "
+        "Sign in with the new password."
+    )
+
+
 def _print_login_note(console: Console, login: LoginManager | None) -> None:
     """Tell the operator whether sign-in is on, without ever printing a secret."""
     if login is None:
@@ -110,15 +147,19 @@ def _print_login_note(console: Console, login: LoginManager | None) -> None:
             "[dim](STRIX_VIEWER_LOGIN=off): anyone who can reach the page gets in.[/]"
         )
         return
-    console.print(f"[dim]Sign-in is on. Username:[/] {escape(login.username)}")
+    console.print(f"[dim]Sign-in is on. Username:[/] [bold]{escape(login.username)}[/]")
     if login.must_change_password:
         console.print(
-            "[bold yellow]First sign-in:[/] use the default password "
-            "[bold]admin[/] [dim]— you will be asked to set a new one before the app opens.[/]"
+            "[bold yellow]First sign-in:[/] log in with [bold]admin[/] / [bold]admin[/] "
+            "[dim]— you will be asked to set a new password before the app opens.[/]"
         )
     console.print(
         "[dim]Change the password from the sign-in screen; it is stored on this machine.[/]"
-        "  [dim]Turn sign-in off with STRIX_VIEWER_LOGIN=off.[/]"
+    )
+    console.print(
+        "[dim]Locked out? Restart with[/] [cyan]strix view --reset-login[/] "
+        "[dim](back to admin/admin) or[/] [cyan]strix view --reset-login <password>[/]"
+        "[dim]. Turn sign-in off with STRIX_VIEWER_LOGIN=off.[/]"
     )
 
 
@@ -158,6 +199,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--launch",
         action="store_true",
         help="Start in launch mode (serve the form to start a new scan), even when runs exist.",
+    )
+    parser.add_argument(
+        "--reset-login",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PASSWORD",
+        help=(
+            "Reset the viewer account before starting: with a value, set the "
+            "password to it; with no value, restore the default admin/admin "
+            "(you will be asked to change it at first sign-in). Use this if you "
+            "are locked out."
+        ),
     )
     return parser.parse_args(argv)
 

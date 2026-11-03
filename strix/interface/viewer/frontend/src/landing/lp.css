@@ -1,0 +1,176 @@
+/*
+ * Landing page additions. lp.base.css is derived from the DE slide template and holds
+ * the shared design system (tokens, slides, cards, pixel characters, nav chrome). This
+ * file holds what the viewer needs on top of it. Every selector is scoped under .lp, and
+ * every keyframe is prefixed lp-, so nothing can reach the dashboard or the sign-in pages.
+ */
+
+/* ---------- document-level behaviour, only while the page is mounted ---------- */
+html:has(.lp) {
+  scroll-snap-type: y mandatory;
+  -webkit-text-size-adjust: 100%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  html:has(.lp) { scroll-behavior: smooth; }
+}
+body:has(.lp) { background: var(--bg); }
+
+/* The dashboard's global styles are dark; give the page its own base. */
+.lp {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  text-align: left;
+}
+.lp h1, .lp h2, .lp h3, .lp p, .lp ul, .lp ol, .lp figure, .lp dl, .lp dd { margin: 0; padding: 0; }
+.lp ul, .lp ol { list-style: none; }
+.lp button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+.lp button:disabled { cursor: default; opacity: .4; }
+.lp img, .lp svg, .lp video { display: block; max-width: 100%; }
+
+/* buttons here are <button>, not <a> */
+.lp .btn { font-family: var(--sans); }
+.lp .btn-sm { padding: 7px 14px; font-size: 14px; }
+.lp .brand { background: none; border: 0; cursor: pointer; color: var(--fg); }
+.lp .icon-btn { padding: 0; }
+.lp .dots button {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--border-strong);
+  transition: transform .2s, background .2s; padding: 0; display: block;
+}
+.lp .dots button:hover { transform: scale(1.3); }
+.lp .dots button[aria-current="true"] { background: var(--violet); transform: scale(1.35); }
+.lp .progress i { transition: width .4s ease; }
+.lp .kbd-hint { margin-top: 12px; color: var(--faint); font-size: 14px; }
+.lp .kbd-hint kbd, .lp .hint kbd {
+  font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--border); border-bottom-width: 2px;
+  border-radius: 5px; padding: 0 5px; color: var(--muted); background: var(--bg-soft);
+}
+.lp .start-hint { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 26px; }
+
+/* inline code, shared by every slide */
+.lp code {
+  font-family: var(--mono); font-size: .86em; background: var(--code-bg); border: 1px solid var(--border-soft);
+  padding: 1px 6px; border-radius: 6px; color: var(--fg); white-space: nowrap;
+}
+.lp .vs .dl code { font-size: .82em; white-space: normal; overflow-wrap: anywhere; }
+.lp .lead b { color: var(--fg); font-weight: 650; }
+
+/* ---------- screenshots (kept: tabs, numbered callouts, enlarge dialog) ---------- */
+.lp .showcase { width: 100%; max-width: 1180px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 1; }
+.lp .showcase-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.lp .showcase-tabs button {
+  display: inline-flex; align-items: center; gap: 9px; font: 600 14px/1 var(--sans);
+  color: var(--muted); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 999px; padding: 8px 15px 8px 9px;
+}
+.lp .showcase-tabs button:hover { color: var(--fg); border-color: var(--border-strong); }
+.lp .showcase-tabs button[aria-selected="true"] { color: var(--violet); background: var(--violet-bg); border-color: var(--violet-line); }
+.lp .showcase-tab-n {
+  display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+  font: 700 12px/1 var(--sans); background: var(--border); color: var(--fg);
+}
+.lp .showcase-tabs button[aria-selected="true"] .showcase-tab-n { background: var(--violet); color: #fff; }
+.lp .showcase-panel { margin-top: 20px; align-items: start; }
+.lp .showcase-panel[hidden] { display: none; }
+.lp .showcase h3 { font-size: 20px; font-weight: 680; line-height: 1.25; letter-spacing: -0.01em; }
+.lp .showcase-lede { color: var(--muted); margin: 6px 0 16px; font-size: 16px; max-width: 52ch; }
+.lp .showcase-figure { min-width: 0; }
+.lp .frame { background: #0A0C10; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-card); }
+.lp .frame-bar { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: #11151C; border-bottom: 1px solid #1C2330; }
+.lp .frame-bar i { width: 9px; height: 9px; border-radius: 50%; background: #2A3342; display: block; }
+.lp .frame-bar span { margin-left: 10px; font: 500 12px/1 var(--sans); color: #7C8AA0; }
+.lp .frame-shot { position: relative; line-height: 0; }
+.lp .frame-shot img { display: block; width: 100%; height: auto; }
+.lp .shot-zoom { display: block; width: 100%; cursor: zoom-in; line-height: 0; }
+.lp .shot-zoom:focus-visible { outline-offset: -3px; }
+.lp .badge {
+  position: absolute; transform: translate(-50%, -50%); display: grid; place-items: center;
+  width: 24px; height: 24px; border-radius: 50%; background: var(--violet); color: #fff;
+  font: 700 12px/1 var(--sans); box-shadow: 0 0 0 3px color-mix(in srgb, var(--violet) 30%, transparent), 0 2px 6px rgba(0,0,0,.45);
+  pointer-events: none;
+}
+.lp .showcase-figure figcaption { margin-top: 8px; color: var(--muted); font-size: 13.5px; line-height: 1.4; }
+.lp ol.callouts { counter-reset: c; margin: 0; display: grid; gap: 12px; }
+.lp ol.callouts li { counter-increment: c; position: relative; padding-left: 36px; }
+.lp ol.callouts li::before {
+  content: counter(c); position: absolute; left: 0; top: 1px; display: grid; place-items: center;
+  width: 24px; height: 24px; border-radius: 50%; background: var(--violet); color: #fff; font: 700 12px/1 var(--sans);
+}
+.lp ol.callouts strong { display: block; margin-bottom: 2px; font-size: 15.5px; }
+.lp ol.callouts span { display: block; color: var(--muted); font-size: 14px; line-height: 1.45; }
+
+.lp dialog.zoom {
+  padding: 0; border: 1px solid var(--border); border-radius: 10px; background: #05080C; color: #E6EBF2;
+  width: min(96vw, 1680px); max-width: none; max-height: 94vh; overflow: hidden; margin: auto;
+}
+.lp dialog.zoom[open] { display: flex; flex-direction: column; }
+.lp dialog.zoom::backdrop { background: rgba(5, 8, 12, 0.82); }
+.lp .zoom-scroll { overflow: auto; flex: 1 1 auto; line-height: 0; overscroll-behavior: contain; }
+.lp .zoom-scroll img { display: block; max-width: none; height: auto; }
+.lp .zoom-close {
+  flex: none; align-self: flex-end; margin: 10px 12px; font: 600 14px/1 var(--sans); color: #E6EBF2;
+  background: transparent; border: 1px solid #3A475C; border-radius: 6px; padding: 8px 14px;
+}
+.lp .zoom-close:hover { border-color: #E6EBF2; }
+
+/* ---------- video ---------- */
+.lp .video-card { padding: 0; overflow: hidden; }
+.lp .video-card video { width: 100%; aspect-ratio: 16 / 9; background: #05060a; }
+.lp .chapters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.lp .chapters button {
+  display: inline-flex; align-items: baseline; gap: 8px; font: 600 13.5px/1 var(--sans); color: var(--muted);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 8px 13px;
+}
+.lp .chapters button:hover { color: var(--fg); border-color: var(--border-strong); }
+.lp .chapters button[aria-current="true"] { color: var(--violet); background: var(--violet-bg); border-color: var(--violet-line); }
+.lp .chapters time { font: 500 11.5px/1 var(--mono); color: var(--faint); }
+
+/* ---------- command blocks ---------- */
+
+/* ---------- data & safety slide ---------- */
+.lp .safety .dl { padding-right: 84px; gap: 9px; }
+.lp .safety .vs { min-height: 0; padding-bottom: 20px; }
+.lp .safety .dl li { font-size: 14.5px; }
+.lp .safety .vs .who .ch-host { width: 64px; }
+.lp .note { display: grid; grid-template-columns: 56px 1fr; gap: 16px; align-items: center; padding: 14px 18px; margin-top: 16px; border-color: var(--amber-line); background: var(--amber-bg); }
+.lp .note .ch-host { width: 52px; }
+.lp .note p { font-size: 14.5px; line-height: 1.5; color: var(--fg); }
+
+/* ---------- close slide ---------- */
+.lp .sign a { text-decoration: underline; text-underline-offset: 3px; }
+.lp .sign a:hover { color: var(--fg); }
+.lp .sign { max-width: 60ch; margin-left: auto; margin-right: auto; line-height: 1.6; }
+
+/* inline emphasis inside a checklist description must stay inline (the base styles every <b> there as a heading) */
+
+/* On short windows the centred walker and its bubble would sit on the buttons; the side actors stay. */
+@media (max-height: 800px) { .lp .world .hide-short { display: none; } }
+
+/* a character host is an inline <span>; keep it a box */
+.lp .ch-host { display: block; }
+
+/* short desktop windows (e.g. 1280x720): reclaim vertical space so no slide slides under the bars */
+@media (min-width: 861px) and (min-height: 701px) and (max-height: 800px) {
+  .lp h2.title { font-size: clamp(26px, 3.2vw, 36px); }
+  .lp .lead { margin-top: 10px; font-size: 16px; }
+  .lp .mt { margin-top: 20px; }
+  .lp .fw-grid { margin-top: 22px; }
+  .lp .relay-card { margin-top: 20px; }
+  .lp .principles { margin-top: 12px; }
+}
+
+@media (max-width: 1000px) {
+  .lp .showcase { padding: 0 32px; }
+}
+@media (max-width: 760px) {
+  .lp .showcase { padding: 0 20px; }
+  .lp .safety .dl { padding-right: 0; }
+  .lp .safety .vs { padding-bottom: 84px; }
+  .lp .note { grid-template-columns: 1fr; }
+  .lp .tb-right .btn { display: none; }
+}

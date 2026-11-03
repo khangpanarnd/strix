@@ -705,8 +705,13 @@ def configure_sdk_model_defaults(settings: Settings) -> None:
     """Apply Strix config to SDK-native defaults."""
     llm = settings.llm
     set_tracing_disabled(True)
+    from strix.llm import tls
     from strix.report.state import record_llm_request
 
+    # Before request_log.install(): that creates the SDK's shared httpx client,
+    # and the TLS trust has to be in place when the client is built.
+    tls.install_sdk_client()
+    tls.install_litellm()
     request_log.install()
     if settings.telemetry.run_record_timings:
         request_log.register_sink(record_llm_request)

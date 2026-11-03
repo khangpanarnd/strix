@@ -26,6 +26,7 @@ import {
   fetchTranscript,
   fetchVulnerabilities,
   parseMcpConnectionStatus,
+  type Capabilities,
   type LoadedRun,
   type RunsPayload,
   type ScanLimits,
@@ -71,6 +72,9 @@ export interface AppProps {
   account?: { username: string; onSignOut: () => void };
 }
 
+/** Delays before each background retry of a failed /api/capabilities read. */
+const CAPABILITIES_RETRY_MS = [1000, 2000, 4000] as const;
+
 export default function App({ entryView, account }: AppProps = {}) {
   const [activeRun, setActiveRun] = useState<string | null>(null);
   const [run, setRun] = useState<LoadedRun | null>(null);
@@ -108,25 +112,49 @@ export default function App({ entryView, account }: AppProps = {}) {
 
   useEffect(() => {
     void refreshRuns();
-    // Capabilities never change over a session, so fetch once on mount.
-    fetchCapabilities()
-      .then((caps) => {
-        setCanSteer(caps.can_steer);
-        setScanLaunchAvailable(caps.scan_launch_available);
-        setScanLimits(caps.scan_limits);
-        setInitialRun(caps.initial_run);
-        setLlmSettingsAvailable(caps.llm_settings.available);
-        setNotificationsAvailable(caps.notifications.available);
-        // Empty workspace in launch mode: open the launch view straight away
-        // rather than spinning on a run that does not exist yet.
-        if (caps.scan_launch_available && !caps.initial_run) {
-          setView("launch");
-        }
-      })
-      .catch(() => {
-        /* absence of steering is the safe default */
-      })
-      .finally(() => setCapsLoaded(true));
+    // Capabilities never change over a session, so they are read once on mount. One
+    // transient failure used to leave every flag at its default for the whole session,
+    // which silently dropped "New scan" (and Settings, Notifications) from the menu
+    // until the page was reloaded. A failed read is therefore retried a few times in
+    // the background; the page does not wait for the retries, it renders with the safe
+    // defaults and picks the capabilities up when they arrive.
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const apply = (caps: Capabilities, firstAttempt: boolean) => {
+      setCanSteer(caps.can_steer);
+      setScanLaunchAvailable(caps.scan_launch_available);
+      setScanLimits(caps.scan_limits);
+      setInitialRun(caps.initial_run);
+      setLlmSettingsAvailable(caps.llm_settings.available);
+      setNotificationsAvailable(caps.notifications.available);
+      // Empty workspace in launch mode: open the launch view straight away rather than
+      // spinning on a run that does not exist yet. Only on the first read: a late
+      // retry must not pull the user off a page they have already moved to.
+      if (firstAttempt && caps.scan_launch_available && !caps.initial_run) {
+        setView("launch");
+      }
+    };
+
+    const attempt = (n: number) => {
+      fetchCapabilities()
+        .then((caps) => {
+          if (!cancelled) apply(caps, n === 0);
+        })
+        .catch(() => {
+          if (cancelled || n >= CAPABILITIES_RETRY_MS.length) return;
+          timer = setTimeout(() => attempt(n + 1), CAPABILITIES_RETRY_MS[n]);
+        })
+        .finally(() => {
+          if (!cancelled && n === 0) setCapsLoaded(true);
+        });
+    };
+    attempt(0);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [refreshRuns]);
 
   // Live polling, scoped to the active run. Re-runs when the active run changes
@@ -317,26 +345,61 @@ export default function App({ entryView, account }: AppProps = {}) {
   }, [userSetView]);
 
 
-  // Tab strip for small screens, where the sidebar is hidden. Shared by the
-  // Overview (which needs no run) and the run-backed views.
+  // Tab strip for small screens, where the sidebar is hidden (below 1024px). It lists
+  // the same pages as the sidebar, each under the same condition, and scrolls sideways
+  // when they do not fit.
   const mobileTabs = (
-    <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
+    <div
+      className="flex gap-5 overflow-x-auto whitespace-nowrap border-b border-[#2a2a2a] scrollbar-thin lg:hidden"
+      data-testid="mobile-tabs"
+    >
       <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
         Overview
       </TabButton>
+      {scanLaunchAvailable && (
+        <TabButton active={view === "launch"} onClick={openLaunch} testId="mobile-tab-new-scan">
+          New scan
+        </TabButton>
+      )}
       <TabButton active={view === "lastscan"} onClick={() => userSetView("lastscan")}>
         Last scan
       </TabButton>
       <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
         Issues{(run?.vulnerabilities.length ?? 0) > 0 ? ` (${run?.vulnerabilities.length})` : ""}
       </TabButton>
+      <TabButton active={view === "history"} onClick={openHistory}>
+        Past runs{(runs?.count ?? 0) > 0 ? ` (${runs?.count})` : ""}
+      </TabButton>
       {agentsAvailable && (
         <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
           Agents{agentCount > 0 ? ` (${agentCount})` : ""}
         </TabButton>
       )}
+      {llmSettingsAvailable && (
+        <TabButton active={view === "settings"} onClick={openSettings}>
+          Settings
+        </TabButton>
+      )}
+      {notificationsAvailable && (
+        <TabButton active={view === "notifications"} onClick={openNotifications}>
+          Notifications
+        </TabButton>
+      )}
     </div>
   );
+
+  // The Overview and a loaded run draw the strip themselves (the run view puts it under
+  // its summary). Every other page - New scan, Settings, Notifications, Past runs, and
+  // the empty / loading / error states - would otherwise have no navigation at all on a
+  // narrow window, because the sidebar is not shown there.
+  const stripDrawnByPage =
+    view === "overview" ||
+    (view !== "launch" &&
+      view !== "settings" &&
+      view !== "notifications" &&
+      view !== "history" &&
+      run !== null &&
+      counts !== null);
 
   return (
     <div className="min-h-screen bg-black text-white flex">
@@ -413,6 +476,7 @@ export default function App({ entryView, account }: AppProps = {}) {
             key={`${activeRun ?? "launched"}:${view}:${selectedId ?? ""}`}
             className="animate-page-in space-y-6"
           >
+          {!stripDrawnByPage && mobileTabs}
           {view === "launch" ? (
             !capsLoaded ? (
               <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-10 text-center">
@@ -768,15 +832,18 @@ function TabButton({
   active,
   onClick,
   children,
+  testId,
 }: {
   active: boolean;
   onClick: () => void;
   children: React.ReactNode;
+  testId?: string;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`cursor-pointer relative pb-2.5 text-sm font-semibold transition-colors ${
+      data-testid={testId}
+      className={`cursor-pointer relative flex-shrink-0 whitespace-nowrap pb-2.5 text-sm font-semibold transition-colors ${
         active ? "text-white" : "text-[#666] hover:text-white"
       }`}
     >

@@ -83,9 +83,17 @@ export LLM_EXTRA_BODY='{"service_tier":"flex","safety_identifier":"9f86d081884c7
 Fields aren't validated, so use only fields your provider accepts, and don't
 set fields Strix already sends, such as `model`, `messages` or `stream`.
 
-For endpoints behind a private CA, point Strix at your certificate bundle with
-the standard `SSL_CERT_FILE=/path/to/ca-bundle.pem` — never disable TLS
-verification against a real endpoint.
+For endpoints behind a private CA, Strix trusts your operating system's
+certificate store as well as its bundled one, so a CA your IT team already
+installed works without any setting. To trust a CA that is not installed
+system-wide, point Strix at its bundle with the standard
+`SSL_CERT_FILE=/path/to/ca-bundle.pem`. Chain, expiry and host name are always
+verified; never disable TLS verification against a real endpoint.
+
+Strix does not enforce Python 3.13's stricter X.509 profile for these
+connections. Many corporate root CAs omit the Key Usage extension that profile
+requires, and would otherwise fail with `CA cert does not include key usage
+extension` even when trusted.
 
 ## Tool calling must return structured `tool_calls`
 

@@ -72,9 +72,24 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
     """Every run directory under ``base_dir``, newest first by record mtime."""
     if not base_dir.is_dir():
         return []
-    run_dirs = [child for child in base_dir.iterdir() if run_record_path(child).is_file()]
-    run_dirs.sort(key=lambda child: run_record_path(child).stat().st_mtime, reverse=True)
-    return run_dirs
+    stamped: list[tuple[float, Path]] = []
+    try:
+        children = list(base_dir.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        record = run_record_path(child)
+        try:
+            if not record.is_file():
+                continue
+            modified = record.stat().st_mtime
+        except OSError:
+            # The run was deleted, or its record replaced, between the check and
+            # the stat. It is simply not listed; the next request sees the result.
+            continue
+        stamped.append((modified, child))
+    stamped.sort(key=lambda item: item[0], reverse=True)
+    return [child for _, child in stamped]
 
 
 def _latest_run_dir(base_dir: Path) -> Path | None:
@@ -148,6 +163,23 @@ _PASSWORD_POLICY_MESSAGES = {
     "password_too_long": "That password is too long.",
     "password_unchanged": "Choose a password other than the default.",
 }
+
+
+def _remote_config_disabled() -> bool:
+    """True when the operator opted out of editing config over the network.
+
+    Set ``STRIX_VIEWER_REMOTE_CONFIG`` to off/0/false/no to keep settings,
+    profiles and notifications read-only on any non-loopback bind, matching the
+    original loopback-only behaviour. Any other value (or unset) leaves remote
+    editing enabled for authenticated users.
+    """
+    return os.environ.get("STRIX_VIEWER_REMOTE_CONFIG", "").strip().lower() in {
+        "off",
+        "0",
+        "false",
+        "no",
+    }
+
 
 # Types served with an explicit type because the platform's mimetypes table may
 # not know them (Windows reads the registry).
@@ -635,17 +667,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 "scan_limits": None,
                 # The settings page is available whenever the store was wired
                 # (launch and fixed-run mode). ``editable`` tells the SPA whether
-                # to render the write controls; a non-loopback bind shows them
-                # read-only (BR-2). Unauthenticated, like the rest of this body.
+                # to render the write controls; it is true on a loopback bind and,
+                # off-loopback, when sign-in protects writes (unless remote config
+                # is disabled). Unauthenticated, like the rest of this body.
                 "llm_settings": {
                     "available": state.settings_store is not None,
-                    "editable": self._is_loopback_bind(),
+                    "editable": self._config_editable(),
                 },
-                # Scan notifications (Slack / Teams / Telegram): same read-only
-                # rule as the LLM settings on a non-loopback bind.
+                # Scan notifications (Slack / Teams / Telegram): same editability
+                # rule as the LLM settings.
                 "notifications": {
                     "available": state.notifier is not None,
-                    "editable": self._is_loopback_bind(),
+                    "editable": self._config_editable(),
                 },
             }
             if launch_available:
@@ -711,17 +744,55 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             return value if value >= 0 else None
 
         def _origin_ok(self) -> bool:
-            """Enforce the Origin/Host rule (BR-2).
+            """Enforce the Origin/Host rule (BR-2), a CSRF guard.
 
-            When ``Origin`` is present it must equal the viewer's own origin (with
-            loopback aliases accepted only when the viewer is bound to loopback).
-            When absent, ``Host`` must equal the bound ``host:port``.
+            When ``Origin`` is present its scheme+host+port must match the host
+            the browser actually reached us on. For a fixed bind that is the
+            bound ``host:port`` (with loopback aliases). For a wildcard bind
+            (``0.0.0.0`` / ``::``) the viewer is reachable on many addresses, so
+            we accept any address as long as the request's ``Origin`` and
+            ``Host`` agree on it and the port matches the bound port -- a
+            cross-site page's Origin still would not match the Host, so the CSRF
+            guard holds. When ``Origin`` is absent, ``Host`` must be acceptable.
             """
             origin = self.headers.get("Origin")
             if origin is not None:
-                return origin in self._acceptable_origins()
+                if origin in self._acceptable_origins():
+                    return True
+                return self._wildcard_origin_matches_host(origin)
             host = (self.headers.get("Host") or "").strip()
-            return host in self._acceptable_hosts()
+            if host in self._acceptable_hosts():
+                return True
+            return self._is_wildcard_bind() and self._host_port_matches(host)
+
+        def _is_wildcard_bind(self) -> bool:
+            return state.bound_host in ("0.0.0.0", "::", "")
+
+        def _bound_port(self) -> str:
+            _, _, port = self._bound_hostport().partition(":")
+            return port
+
+        def _host_port_matches(self, hostport: str) -> bool:
+            """True when ``hostport`` names a non-empty host on the bound port."""
+            host, _, port = hostport.strip().partition(":")
+            return bool(host) and port == self._bound_port()
+
+        def _wildcard_origin_matches_host(self, origin: str) -> bool:
+            """For a wildcard bind, accept when Origin == the request's own Host.
+
+            The browser sends both; if a real cross-site page forged the request
+            its ``Origin`` would be its own site, which cannot equal the ``Host``
+            of this server, so this stays a valid CSRF check.
+            """
+            if not self._is_wildcard_bind():
+                return False
+            origin_hostport = origin.split("://", 1)[-1] if "://" in origin else ""
+            host = (self.headers.get("Host") or "").strip()
+            return (
+                bool(origin_hostport)
+                and origin_hostport == host
+                and self._host_port_matches(origin_hostport)
+            )
 
         def _bound_hostport(self) -> str:
             """The viewer's bound ``host:port`` parsed from its origin."""
@@ -729,6 +800,26 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
         def _is_loopback_bind(self) -> bool:
             return state.bound_host in ("127.0.0.1", "localhost", "::1")
+
+        def _config_editable(self) -> bool:
+            """Whether settings / profiles / notifications may be WRITTEN now.
+
+            These panels hold secrets (LLM keys) and control scan cost, so a
+            viewer exposed to the network historically served them read-only.
+            Now that sign-in is a real factor, an authenticated user may edit
+            them remotely too: editing is allowed on a loopback bind, or when
+            login is on (so only a signed-in caller reaches a write), or when
+            remote config is explicitly enabled. Set
+            ``STRIX_VIEWER_REMOTE_CONFIG=off`` to restore the strict
+            loopback-only rule even with login on.
+            """
+            if self._is_loopback_bind():
+                return True
+            if _remote_config_disabled():
+                return False
+            # Off-loopback: only a sign-in-protected viewer may be edited
+            # remotely, so an exposed port without login stays read-only.
+            return state.login is not None
 
         def _acceptable_origins(self) -> set[str]:
             origins = {state.origin}
@@ -838,7 +929,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             # active-scan flag first, then build the view.
             scan_active = state.launcher is not None and state.launcher.active_run() is not None
             view = state.settings_store.view(
-                editable=self._is_loopback_bind(), scan_active=scan_active
+                editable=self._config_editable(), scan_active=scan_active
             )
             self._send_json(HTTPStatus.OK, view)
 
@@ -854,7 +945,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return HTTPStatus.FORBIDDEN, "forbidden"
             if state.settings_store is None:
                 return HTTPStatus.FORBIDDEN, "settings_unavailable"
-            if not self._is_loopback_bind():
+            if not self._config_editable():
                 return HTTPStatus.FORBIDDEN, "settings_read_only"
             if not self._origin_ok():
                 return HTTPStatus.FORBIDDEN, "bad_origin"
@@ -928,8 +1019,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_launch_error(exc)
                 return
             # ``apply`` returns the view with ``editable=True``; override with the
-            # real bind so a race on the toggle cannot mislead the SPA.
-            view["editable"] = self._is_loopback_bind()
+            # real editability so a race on the toggle cannot mislead the SPA.
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_settings_reset(self) -> None:
@@ -954,7 +1045,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_settings_test(self) -> None:
@@ -1012,7 +1103,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
             scan_active = state.launcher is not None and state.launcher.active_run() is not None
             try:
-                view = profiles.view(editable=self._is_loopback_bind(), scan_active=scan_active)
+                view = profiles.view(editable=self._config_editable(), scan_active=scan_active)
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
@@ -1047,7 +1138,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_profiles_save(self) -> None:
@@ -1307,7 +1398,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return HTTPStatus.FORBIDDEN, "forbidden"
             if state.notifier is None:
                 return HTTPStatus.FORBIDDEN, "notifications_unavailable"
-            if not self._is_loopback_bind():
+            if not self._config_editable():
                 return HTTPStatus.FORBIDDEN, "notifications_read_only"
             if not self._origin_ok():
                 return HTTPStatus.FORBIDDEN, "bad_origin"
@@ -1332,7 +1423,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             if state.notifier is None:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "notifications_unavailable"})
                 return
-            view = state.notifier.store.view(editable=self._is_loopback_bind())
+            view = state.notifier.store.view(editable=self._config_editable())
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_notifications_put(self) -> None:
@@ -1355,7 +1446,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             except LaunchError as exc:
                 self._send_launch_error(exc)
                 return
-            view["editable"] = self._is_loopback_bind()
+            view["editable"] = self._config_editable()
             self._send_json(HTTPStatus.OK, view)
 
         def _handle_notifications_test(self) -> None:
