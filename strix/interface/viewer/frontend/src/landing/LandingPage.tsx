@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { CodeBlock } from "./CodeBlock";
 import { Penguin } from "./Penguin";
 import { Showcase } from "./Showcase";
 import { makeGroundTextures } from "./pixel";
@@ -10,8 +9,8 @@ import "./lp.css";
 /**
  * The public landing page, shown before sign-in. It has one job: get a new user to
  * their first scan. It is a short deck of full-height slides (scroll, arrow keys or
- * the dots to move) that says what Strix does, shows a real scan, walks through the
- * first scan in the browser, and states plainly what stays on this machine and what
+ * the dots to move) that says what Strix does, introduces the agent team, shows a real
+ * scan and the overview video, and states plainly what stays on this machine and what
  * does not.
  *
  * Everything on this page is static and public; nothing here touches the API. Every
@@ -20,8 +19,6 @@ import "./lp.css";
  *
  * Copy is checked against the repository, not against older pages:
  *  - telemetry (PostHog, Scarf) is on by default and is disclosed with its opt-out;
- *  - the browser form scans web targets; source folders and repositories go through
- *    the command line, which mounts a local folder writable;
  *  - the viewer listens on 127.0.0.1 by default and sign-in is the access control.
  */
 
@@ -46,12 +43,6 @@ const POSTER_SRC = "./strix-landing-poster.jpg";
 /** Entrance-animation order for an element inside a slide. */
 const d = (n: number): CSSProperties => ({ "--i": n }) as CSSProperties;
 const pad = (n: number) => (n < 10 ? `0${n}` : String(n));
-
-const CHECK = (
-  <svg viewBox="0 0 24 24" aria-hidden="true">
-    <path d="M5 12l4 4 10-10" />
-  </svg>
-);
 
 export function LandingPage({ onScan }: LandingPageProps) {
   const { rootRef, slides, active, seen, go } = useDeck();
@@ -85,9 +76,9 @@ export function LandingPage({ onScan }: LandingPageProps) {
       .join(" ");
   };
 
-  const total = slides.length || 10;
+  const total = slides.length || 7;
   // Until the slides are measured, name the first one (the page opens on it).
-  const crumb = slides[active]?.name ?? "The agents";
+  const crumb = slides[active]?.name ?? "Introduction";
 
   return (
     <div className="lp" ref={rootRef} data-testid="landing-page">
@@ -140,8 +131,73 @@ export function LandingPage({ onScan }: LandingPageProps) {
       </nav>
 
       <main>
-        {/* ================= 1. AGENTS ================= */}
-        <section className={slideClass()} id="s1" data-slide data-name="The agents">
+        {/* ================= 1. INTRO ================= */}
+        <section className={slideClass("s-title")} id="s1" data-slide data-name="Introduction">
+          <div className="wrap">
+            <span className="eyebrow rv">Local AI pentesting · runs on your machine</span>
+            <h1 className="title rv" style={d(1)}>
+              Find the security bugs in your web app <span className="grad-text">before attackers do.</span>
+            </h1>
+            <p className="lead rv" style={d(2)}>
+              Strix is an AI pentester. Give it the address of your app and a team of AI agents tries to break in,
+              proves every problem with a working exploit, and shows you the results right here.
+            </p>
+            <div className="start-hint rv" style={d(3)}>
+              <button type="button" className="btn btn-primary" data-testid="landing-scan-cta" onClick={onScan}>
+                Scan your project
+              </button>
+              <button type="button" className="btn btn-ghost" onClick={() => go(active + 1)}>
+                Take the tour
+              </button>
+            </div>
+            <p className="kbd-hint rv" style={d(4)}>
+              or press <kbd>→</kbd> / <kbd>Space</kbd>
+            </p>
+          </div>
+          <div className="world" aria-hidden="true">
+            <div className="cloud" style={{ width: 110, top: "10%", animationDelay: "-12s" }} />
+            <div className="cloud" style={{ width: 80, top: "28%", animationDelay: "-40s", animationDuration: "80s" }} />
+
+            <div className="actor" style={{ left: "6%" }}>
+              <Penguin />
+            </div>
+            <div className="bubble talk first" style={{ left: "5%", bottom: 200, animationDelay: "0s" }}>
+              Surface mapped <span className="ok">✓</span>
+            </div>
+
+            <div className="actor" style={{ left: "20%" }}>
+              <Penguin motion="hop" />
+            </div>
+            <div className="rock" style={{ left: "calc(20% + 104px)" }} />
+            <div className="bubble talk" style={{ left: "19%", bottom: 200, animationDelay: "4s" }}>
+              Trying injection
+            </div>
+
+            <div className="walker hide-sm hide-short">
+              <div className="flip">
+                <Penguin motion="waddle" style={{ width: 92 }} />
+              </div>
+            </div>
+            <div className="bubble talk hide-sm hide-short" style={{ left: "42%", bottom: 200, animationDelay: "8s" }}>
+              Exploit <span className="ok">VALIDATED</span>
+            </div>
+
+            <div className="actor hide-sm" style={{ right: "22%" }}>
+              <Penguin />
+            </div>
+            <div className="actor" style={{ right: "6%" }}>
+              <Penguin />
+            </div>
+            <div className="bubble talk" style={{ right: "4%", bottom: 200, animationDelay: "12s" }}>
+              Sandbox <span className="ok">ON</span>
+            </div>
+
+            <div className="ground" />
+          </div>
+        </section>
+
+        {/* ================= 2. AGENTS ================= */}
+        <section className={slideClass()} id="s2" data-slide data-name="The agents">
           <div className="wrap">
             <span className="eyebrow rv">The agent team</span>
             <h2 className="title rv" style={d(1)}>
@@ -206,122 +262,8 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 2. INTRO ================= */}
-        <section className={slideClass("s-title")} id="s2" data-slide data-name="Introduction">
-          <div className="wrap">
-            <span className="eyebrow rv">Local AI pentesting · runs on your machine</span>
-            <h1 className="title rv" style={d(1)}>
-              Find the security bugs in your web app <span className="grad-text">before attackers do.</span>
-            </h1>
-            <p className="lead rv" style={d(2)}>
-              Strix is an AI pentester. Give it the address of your app and a team of AI agents tries to break in,
-              proves every problem with a working exploit, and shows you the results right here.
-            </p>
-            <div className="start-hint rv" style={d(3)}>
-              <button type="button" className="btn btn-primary" data-testid="landing-scan-cta" onClick={onScan}>
-                Scan your project
-              </button>
-              <button type="button" className="btn btn-ghost" onClick={() => go(active + 1)}>
-                Take the tour
-              </button>
-            </div>
-            <p className="kbd-hint rv" style={d(4)}>
-              or press <kbd>→</kbd> / <kbd>Space</kbd>
-            </p>
-          </div>
-          <div className="world" aria-hidden="true">
-            <div className="cloud" style={{ width: 110, top: "10%", animationDelay: "-12s" }} />
-            <div className="cloud" style={{ width: 80, top: "28%", animationDelay: "-40s", animationDuration: "80s" }} />
-
-            <div className="actor" style={{ left: "6%" }}>
-              <Penguin />
-            </div>
-            <div className="bubble talk first" style={{ left: "5%", bottom: 200, animationDelay: "0s" }}>
-              Surface mapped <span className="ok">✓</span>
-            </div>
-
-            <div className="actor" style={{ left: "20%" }}>
-              <Penguin motion="hop" />
-            </div>
-            <div className="rock" style={{ left: "calc(20% + 104px)" }} />
-            <div className="bubble talk" style={{ left: "19%", bottom: 200, animationDelay: "4s" }}>
-              Trying injection
-            </div>
-
-            <div className="walker hide-sm hide-short">
-              <div className="flip">
-                <Penguin motion="waddle" style={{ width: 92 }} />
-              </div>
-            </div>
-            <div className="bubble talk hide-sm hide-short" style={{ left: "42%", bottom: 200, animationDelay: "8s" }}>
-              Exploit <span className="ok">VALIDATED</span>
-            </div>
-
-            <div className="actor hide-sm" style={{ right: "22%" }}>
-              <Penguin />
-            </div>
-            <div className="actor" style={{ right: "6%" }}>
-              <Penguin />
-            </div>
-            <div className="bubble talk" style={{ right: "4%", bottom: 200, animationDelay: "12s" }}>
-              Sandbox <span className="ok">ON</span>
-            </div>
-
-            <div className="ground" />
-          </div>
-        </section>
-
-        {/* ================= 3. WHY PROOF ================= */}
-        <section className={slideClass()} id="s3" data-slide data-name="Why proof">
-          <div className="wrap">
-            <span className="eyebrow r rv">Why proof matters</span>
-            <h2 className="title rv" style={d(1)}>
-              Skip the list of maybes.
-            </h2>
-            <p className="lead rv" style={d(2)}>
-              A flagged pattern costs triage time and proves nothing. Strix reports a finding only after its agents have
-              exploited it, and keeps the request and response to show it.
-            </p>
-            <div className="versus mt">
-              <div className="card vs bad rv" style={d(2)}>
-                <h3>
-                  <span className="tag">a list of maybes</span>Pattern matches
-                </h3>
-                <ul className="dl">
-                  <li>A flagged pattern with no proof</li>
-                  <li>Triage time lost to false positives</li>
-                  <li>No request you can replay</li>
-                  <li>Findings you have to take on trust</li>
-                </ul>
-                <span className="qmark" aria-hidden="true">
-                  ?
-                </span>
-                <div className="who" aria-hidden="true">
-                  <Penguin />
-                </div>
-              </div>
-              <div className="card vs good rv" style={d(3)}>
-                <h3>
-                  <span className="tag">with Strix</span>Proven findings
-                </h3>
-                <ul className="dl">
-                  <li>A working exploit behind every finding</li>
-                  <li>Request and response saved to disk</li>
-                  <li>Runs against your own app, on your machine</li>
-                  <li>An exit code that can gate a merge</li>
-                </ul>
-                <div className="who" aria-hidden="true">
-                  <Penguin motion="wiggle" />
-                  <Penguin />
-                  <Penguin />
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* ================= 4. WHAT YOU GET ================= */}
-        <section className={slideClass()} id="s4" data-slide data-name="What you get">
+        {/* ================= 3. WHAT YOU GET ================= */}
+        <section className={slideClass()} id="s3" data-slide data-name="What you get">
           <div className="wrap">
             <span className="eyebrow v rv">What you get</span>
             <h2 className="title rv" style={d(1)}>
@@ -387,137 +329,18 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 5. WHAT A SCAN LOOKS LIKE ================= */}
-        <section className={slideClass()} id="s5" data-slide data-name="What a scan looks like">
+        {/* ================= 4. WHAT A SCAN LOOKS LIKE ================= */}
+        <section className={slideClass()} id="s4" data-slide data-name="What a scan looks like">
           <Showcase />
         </section>
 
-        {/* ================= 6. FIRST SCAN ================= */}
-        <section className={slideClass()} id="s6" data-slide data-name="Your first scan">
-          <div className="wrap">
-            <span className="eyebrow rv">Your first scan</span>
-            <h2 className="title rv" style={d(1)}>
-              Four steps, from setup to proof.
-            </h2>
-            <p className="lead rv" style={d(2)}>
-              You point Strix at something you own. It does the attacking. You read what it proved.
-            </p>
-            <div className="stairs rv" style={d(3)} role="img" aria-label="Four steps: get ready, enter the address, start the scan, read the results">
-              <div className="step-block" style={{ left: 0, height: 70 }}>
-                <div className="ground" />
-                <span className="lbl">1 Get ready</span>
-              </div>
-              <div className="step-block" style={{ left: "25%", height: 135 }}>
-                <div className="ground" />
-                <span className="lbl">2 Address</span>
-              </div>
-              <div className="step-block" style={{ left: "50%", height: 200 }}>
-                <div className="ground" />
-                <span className="lbl">3 Start</span>
-              </div>
-              <div className="step-block" style={{ left: "75%", height: 265 }}>
-                <div className="ground" />
-                <span className="lbl">4 Results</span>
-              </div>
-              <div className="flagpole" aria-hidden="true" />
-              <div className="climber" aria-hidden="true">
-                <Penguin motion="waddle" />
-              </div>
-            </div>
-            <div className="stage-notes">
-              <p className="rv" style={d(4)}>
-                Docker running, a model set up under <b>Settings</b>, and permission to test the app.
-              </p>
-              <p className="rv" style={d(5)}>
-                Sign in, then type the address of the app, for example <code>https://staging.example.com</code>. Leave the
-                mode on <b>Quick</b> for a first run.
-              </p>
-              <p className="rv" style={d(6)}>
-                Tick “I am authorized to test this target”, then press <b>Start scan</b>.
-              </p>
-              <p className="rv" style={d(7)}>
-                Follow the agents live. When it ends, open <b>Last scan</b> and <b>Issues</b> for proof and a suggested fix.
-              </p>
-            </div>
-          </div>
-        </section>
-
-        {/* ================= 7. VIDEO ================= */}
-        <section className={slideClass()} id="s7" data-slide data-name="Overview video">
+        {/* ================= 5. VIDEO ================= */}
+        <section className={slideClass()} id="s5" data-slide data-name="Overview video">
           <VideoStage />
         </section>
 
-        {/* ================= 8. BEFORE YOU START ================= */}
-        <section className={slideClass()} id="s8" data-slide data-name="Before you start">
-          <div className="wrap split">
-            <div>
-              <span className="eyebrow rv">Before you start</span>
-              <h2 className="title rv" style={d(1)}>
-                Three things to have ready.
-              </h2>
-              <p className="lead rv" style={d(2)}>
-                The first scan downloads the sandbox image, so allow a few minutes.
-              </p>
-              <ul className="checks">
-                <li style={d(0)}>
-                  <span className="mk">{CHECK}</span>
-                  <div>
-                    <b>Docker is running</b>
-                    <span>The agents work inside a Docker sandbox on your machine.</span>
-                  </div>
-                </li>
-                <li style={d(1)}>
-                  <span className="mk">{CHECK}</span>
-                  <div>
-                    <b>A model is set up</b>
-                    <span>
-                      Open <b>Settings</b> in the sidebar, choose your AI provider (or a local model), add the key if it
-                      needs one, and run the connection test.
-                    </span>
-                  </div>
-                </li>
-                <li style={d(2)}>
-                  <span className="mk">{CHECK}</span>
-                  <div>
-                    <b>You have permission</b>
-                    <span>Only test apps you own or have written permission to test. Prefer a staging copy and a test account.</span>
-                  </div>
-                </li>
-              </ul>
-              <div className="cta-row rv" style={{ ...d(5), justifyContent: "flex-start" }}>
-                <button type="button" className="btn btn-primary" onClick={onScan}>
-                  Scan your project
-                </button>
-              </div>
-            </div>
-            <div className="card vault rv" style={d(3)}>
-              <div className="bar">
-                <span className="tdot" />
-                <span className="tdot" />
-                <span className="tdot" />
-                <span className="t">source code? use the command line</span>
-              </div>
-              <div className="steps-pad">
-                <p className="step-l">The browser form scans web apps and APIs (a URL, domain or IP address)</p>
-                <p className="step-l">A source folder</p>
-                <CodeBlock text="strix --target ./app-directory">strix --target ./app-directory</CodeBlock>
-                <p className="step-l">A Git repository</p>
-                <CodeBlock text="strix --target https://github.com/org/repo">strix --target https://github.com/org/repo</CodeBlock>
-                <p className="step-l">Only what changed, headless, for CI</p>
-                <CodeBlock text="strix -n --target ./ --scan-mode quick --scope-mode diff --diff-base origin/main">
-                  strix <span className="flag">-n</span> --target ./ <span className="flag">--scan-mode</span> quick{" "}
-                  <span className="flag">--scope-mode</span> diff <span className="flag">--diff-base</span> origin/main
-                </CodeBlock>
-                <p className="step-n">
-                  A local folder is mounted into the sandbox <b>writable</b>, so commit or stash first.
-                </p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        {/* ================= 9. DATA & SAFETY ================= */}
-        <section className={slideClass("safety")} id="s9" data-slide data-name="Data and safety">
+        {/* ================= 6. DATA & SAFETY ================= */}
+        <section className={slideClass("safety")} id="s6" data-slide data-name="Data and safety">
           <div className="wrap">
             <span className="eyebrow r rv">Data and safety</span>
             <h2 className="title rv" style={d(1)}>
@@ -576,8 +399,8 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 10. NEXT STEP ================= */}
-        <section className={slideClass("s-close")} id="s10" data-slide data-name="Next step">
+        {/* ================= 7. NEXT STEP ================= */}
+        <section className={slideClass("s-close")} id="s7" data-slide data-name="Next step">
           <div className="wrap">
             <div className="lineup rv" aria-hidden="true">
               <Penguin motion="wiggle" />

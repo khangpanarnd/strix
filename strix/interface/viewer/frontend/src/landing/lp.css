@@ -32,7 +32,6 @@ body:has(.lp) { background: var(--bg); }
 .lp button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
 .lp button:disabled { cursor: default; opacity: .4; }
 .lp img, .lp svg, .lp video { display: block; max-width: 100%; }
-.lp .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
 /* buttons here are <button>, not <a> */
 .lp .btn { font-family: var(--sans); }
@@ -59,8 +58,7 @@ body:has(.lp) { background: var(--bg); }
   padding: 1px 6px; border-radius: 6px; color: var(--fg); white-space: nowrap;
 }
 .lp .vs .dl code { font-size: .82em; white-space: normal; overflow-wrap: anywhere; }
-.lp .stage-notes code { font-size: .8em; }
-.lp .stage-notes b, .lp .lead b { color: var(--fg); font-weight: 650; }
+.lp .lead b { color: var(--fg); font-weight: 650; }
 
 /* ---------- screenshots (kept: tabs, numbered callouts, enlarge dialog) ---------- */
 .lp .showcase { width: 100%; max-width: 1180px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 1; }
@@ -133,16 +131,6 @@ body:has(.lp) { background: var(--bg); }
 .lp .chapters time { font: 500 11.5px/1 var(--mono); color: var(--faint); }
 
 /* ---------- command blocks ---------- */
-.lp .steps-pad { padding: 16px 18px 18px; }
-.lp .step-l { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--violet); margin: 14px 0 6px; line-height: 1.5; }
-.lp .step-l:first-child { margin-top: 0; color: var(--muted); }
-.lp .step-n { color: var(--muted); font-size: 13.5px; line-height: 1.5; margin-top: 14px; }
-.lp .code { display: flex; align-items: flex-start; gap: 8px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 5px 5px 5px 12px; }
-.lp .code .cm { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; line-height: 1.55; padding-top: 6px; overflow-wrap: anywhere; color: var(--fg); }
-.lp .code .cm::before { content: "$ "; color: var(--faint); }
-.lp .code .flag { color: var(--violet); white-space: nowrap; }
-.lp .copy-btn { flex: none; }
-.lp .copy-btn.done { color: var(--ok); border-color: var(--green-line); background: var(--green-bg); }
 
 /* ---------- data & safety slide ---------- */
 .lp .safety .dl { padding-right: 84px; gap: 9px; }
@@ -159,7 +147,6 @@ body:has(.lp) { background: var(--bg); }
 .lp .sign { max-width: 60ch; margin-left: auto; margin-right: auto; line-height: 1.6; }
 
 /* inline emphasis inside a checklist description must stay inline (the base styles every <b> there as a heading) */
-.lp .checks span b { display: inline; font-size: inherit; font-weight: 650; color: var(--fg); }
 
 /* On short windows the centred walker and its bubble would sit on the buttons; the side actors stay. */
 @media (max-height: 800px) { .lp .world .hide-short { display: none; } }
@@ -172,8 +159,6 @@ body:has(.lp) { background: var(--bg); }
   .lp h2.title { font-size: clamp(26px, 3.2vw, 36px); }
   .lp .lead { margin-top: 10px; font-size: 16px; }
   .lp .mt { margin-top: 20px; }
-  .lp .stairs { margin-top: 20px; }
-  .lp .stage-notes { margin-top: 12px; }
   .lp .fw-grid { margin-top: 22px; }
   .lp .relay-card { margin-top: 20px; }
   .lp .principles { margin-top: 12px; }
