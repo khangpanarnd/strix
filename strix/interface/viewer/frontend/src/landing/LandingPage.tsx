@@ -75,11 +75,19 @@ export function LandingPage({ onScan }: LandingPageProps) {
     root.style.setProperty("--t-stone", textures.stone);
   }, [rootRef]);
 
-  const slideClass = (index: number, extra = "") =>
-    ["slide", extra, active === index ? "active" : "", seen.has(index) ? "seen" : ""].filter(Boolean).join(" ");
+  // A slide's number is its position on the page: each call takes the next one, in the
+  // order the sections are written below. Moving a section therefore needs no renumbering.
+  let slideNumber = 0;
+  const slideClass = (extra = "") => {
+    const index = slideNumber++;
+    return ["slide", extra, active === index ? "active" : "", seen.has(index) ? "seen" : ""]
+      .filter(Boolean)
+      .join(" ");
+  };
 
   const total = slides.length || 10;
-  const crumb = slides[active]?.name ?? "Introduction";
+  // Until the slides are measured, name the first one (the page opens on it).
+  const crumb = slides[active]?.name ?? "The agents";
 
   return (
     <div className="lp" ref={rootRef} data-testid="landing-page">
@@ -132,8 +140,74 @@ export function LandingPage({ onScan }: LandingPageProps) {
       </nav>
 
       <main>
-        {/* ================= 1. INTRO ================= */}
-        <section className={slideClass(0, "s-title")} id="s1" data-slide data-name="Introduction">
+        {/* ================= 1. AGENTS ================= */}
+        <section className={slideClass()} id="s1" data-slide data-name="The agents">
+          <div className="wrap">
+            <span className="eyebrow rv">The agent team</span>
+            <h2 className="title rv" style={d(1)}>
+              A root agent and its specialists.
+            </h2>
+            <p className="lead rv" style={d(2)}>
+              The root agent maps the attack surface and starts focused sub-agents: a recon pass, a CVE hunter, an
+              injection prober. Each keeps its own transcript you can open and read.
+            </p>
+            <div className="card relay-card rv" style={d(3)}>
+              <div className="relay-scroll">
+                <div
+                  className="relay"
+                  role="img"
+                  aria-label="Animated flow from the root agent through recon, CVE hunter and injection prober to validation and the report"
+                >
+                  <div className="belt" aria-hidden="true" />
+                  <div className="parcel-track" aria-hidden="true">
+                    <div className="parcel" />
+                  </div>
+                  <div className="stations">
+                    {(
+                      [
+                        ["Root agent", "Attack map", "0.4s"],
+                        ["Recon", "Routes & inputs", "2.4s"],
+                        ["CVE hunter", "CVE leads", "4.4s"],
+                        ["Injection prober", "Candidate bugs", "6.4s"],
+                        ["Validate", "Working PoC", "8.4s"],
+                        ["Report", "SARIF & HTML", "10.4s"],
+                      ] as const
+                    ).map(([name, artifact, delay]) => (
+                      <div className="station" key={name} style={{ "--d": delay } as CSSProperties}>
+                        <Penguin />
+                        <b>{name}</b>
+                        <span className="art">{artifact}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="principles">
+              <div className="card pr rv" style={d(4)}>
+                <b>Proof over patterns</b>
+                <span>A finding is reported with the exploit that worked.</span>
+              </div>
+              <div className="card pr rv" style={d(5)}>
+                <b>Every agent leaves a transcript</b>
+                <span>Open any agent in the viewer to read its reasoning.</span>
+              </div>
+              <div className="card pr rv" style={d(6)}>
+                <b>Specialists work in parallel</b>
+                <span>Sub-agents cover different parts of the target at once.</span>
+              </div>
+              <div className="card pr rv" style={d(7)}>
+                <b>You set the limits</b>
+                <span>
+                  Scan modes and <code>--max-budget-usd</code> cap time and spend.
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ================= 2. INTRO ================= */}
+        <section className={slideClass("s-title")} id="s2" data-slide data-name="Introduction">
           <div className="wrap">
             <span className="eyebrow rv">Local AI pentesting · runs on your machine</span>
             <h1 className="title rv" style={d(1)}>
@@ -147,7 +221,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
               <button type="button" className="btn btn-primary" data-testid="landing-scan-cta" onClick={onScan}>
                 Scan your project
               </button>
-              <button type="button" className="btn btn-ghost" onClick={() => go(1)}>
+              <button type="button" className="btn btn-ghost" onClick={() => go(active + 1)}>
                 Take the tour
               </button>
             </div>
@@ -197,8 +271,8 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 2. WHY PROOF ================= */}
-        <section className={slideClass(1)} id="s2" data-slide data-name="Why proof">
+        {/* ================= 3. WHY PROOF ================= */}
+        <section className={slideClass()} id="s3" data-slide data-name="Why proof">
           <div className="wrap">
             <span className="eyebrow r rv">Why proof matters</span>
             <h2 className="title rv" style={d(1)}>
@@ -246,8 +320,8 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 3. WHAT YOU GET ================= */}
-        <section className={slideClass(2)} id="s3" data-slide data-name="What you get">
+        {/* ================= 4. WHAT YOU GET ================= */}
+        <section className={slideClass()} id="s4" data-slide data-name="What you get">
           <div className="wrap">
             <span className="eyebrow v rv">What you get</span>
             <h2 className="title rv" style={d(1)}>
@@ -313,13 +387,13 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 4. WHAT A SCAN LOOKS LIKE ================= */}
-        <section className={slideClass(3)} id="s4" data-slide data-name="What a scan looks like">
+        {/* ================= 5. WHAT A SCAN LOOKS LIKE ================= */}
+        <section className={slideClass()} id="s5" data-slide data-name="What a scan looks like">
           <Showcase />
         </section>
 
-        {/* ================= 5. FIRST SCAN ================= */}
-        <section className={slideClass(4)} id="s5" data-slide data-name="Your first scan">
+        {/* ================= 6. FIRST SCAN ================= */}
+        <section className={slideClass()} id="s6" data-slide data-name="Your first scan">
           <div className="wrap">
             <span className="eyebrow rv">Your first scan</span>
             <h2 className="title rv" style={d(1)}>
@@ -368,79 +442,13 @@ export function LandingPage({ onScan }: LandingPageProps) {
           </div>
         </section>
 
-        {/* ================= 6. AGENTS ================= */}
-        <section className={slideClass(5)} id="s6" data-slide data-name="The agents">
-          <div className="wrap">
-            <span className="eyebrow rv">The agent team</span>
-            <h2 className="title rv" style={d(1)}>
-              A root agent and its specialists.
-            </h2>
-            <p className="lead rv" style={d(2)}>
-              The root agent maps the attack surface and starts focused sub-agents: a recon pass, a CVE hunter, an
-              injection prober. Each keeps its own transcript you can open and read.
-            </p>
-            <div className="card relay-card rv" style={d(3)}>
-              <div className="relay-scroll">
-                <div
-                  className="relay"
-                  role="img"
-                  aria-label="Animated flow from the root agent through recon, CVE hunter and injection prober to validation and the report"
-                >
-                  <div className="belt" aria-hidden="true" />
-                  <div className="parcel-track" aria-hidden="true">
-                    <div className="parcel" />
-                  </div>
-                  <div className="stations">
-                    {(
-                      [
-                        ["Root agent", "Attack map", "0.4s"],
-                        ["Recon", "Routes & inputs", "2.4s"],
-                        ["CVE hunter", "CVE leads", "4.4s"],
-                        ["Injection prober", "Candidate bugs", "6.4s"],
-                        ["Validate", "Working PoC", "8.4s"],
-                        ["Report", "SARIF & HTML", "10.4s"],
-                      ] as const
-                    ).map(([name, artifact, delay]) => (
-                      <div className="station" key={name} style={{ "--d": delay } as CSSProperties}>
-                        <Penguin />
-                        <b>{name}</b>
-                        <span className="art">{artifact}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="principles">
-              <div className="card pr rv" style={d(4)}>
-                <b>Proof over patterns</b>
-                <span>A finding is reported with the exploit that worked.</span>
-              </div>
-              <div className="card pr rv" style={d(5)}>
-                <b>Every agent leaves a transcript</b>
-                <span>Open any agent in the viewer to read its reasoning.</span>
-              </div>
-              <div className="card pr rv" style={d(6)}>
-                <b>Specialists work in parallel</b>
-                <span>Sub-agents cover different parts of the target at once.</span>
-              </div>
-              <div className="card pr rv" style={d(7)}>
-                <b>You set the limits</b>
-                <span>
-                  Scan modes and <code>--max-budget-usd</code> cap time and spend.
-                </span>
-              </div>
-            </div>
-          </div>
-        </section>
-
         {/* ================= 7. VIDEO ================= */}
-        <section className={slideClass(6)} id="s7" data-slide data-name="Overview video">
+        <section className={slideClass()} id="s7" data-slide data-name="Overview video">
           <VideoStage />
         </section>
 
         {/* ================= 8. BEFORE YOU START ================= */}
-        <section className={slideClass(7)} id="s8" data-slide data-name="Before you start">
+        <section className={slideClass()} id="s8" data-slide data-name="Before you start">
           <div className="wrap split">
             <div>
               <span className="eyebrow rv">Before you start</span>
@@ -509,7 +517,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
         </section>
 
         {/* ================= 9. DATA & SAFETY ================= */}
-        <section className={slideClass(8, "safety")} id="s9" data-slide data-name="Data and safety">
+        <section className={slideClass("safety")} id="s9" data-slide data-name="Data and safety">
           <div className="wrap">
             <span className="eyebrow r rv">Data and safety</span>
             <h2 className="title rv" style={d(1)}>
@@ -569,7 +577,7 @@ export function LandingPage({ onScan }: LandingPageProps) {
         </section>
 
         {/* ================= 10. NEXT STEP ================= */}
-        <section className={slideClass(9, "s-close")} id="s10" data-slide data-name="Next step">
+        <section className={slideClass("s-close")} id="s10" data-slide data-name="Next step">
           <div className="wrap">
             <div className="lineup rv" aria-hidden="true">
               <Penguin motion="wiggle" />
